@@ -1,0 +1,83 @@
+# Git hooks. Deliberately fast: a hook slow enough to notice is a hook
+# contributors learn to skip with --no-verify, so pre-commit formats staged Rust
+# and nothing else, and the heavier gates (clippy, the test tiers) run on push
+# where a minute is affordable.
+#
+# Nothing here installs itself. There is no package.json in this repository, so
+# no `pnpm install` runs `lefthook install` for you — run it once yourself, or
+# work without hooks. Nothing in CI depends on a hook having run.
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: "*.rs"
+      # A check, never a rewrite, and deliberately not `cargo fmt -- {staged_files}`:
+      # `cargo fmt` with file arguments formats the whole crate (every target, staged
+      # or not), and `rustfmt` on `src/lib.rs` or `src/main.rs` walks that file's
+      # module tree. Either way the hook would rewrite files the contributor did not
+      # stage — the opposite of what a fast local gate should do. Checking is safe;
+      # the fix is `cargo fmt --all`, named in the failure message.
+      run: |
+        rustfmt --edition 2024 --check {staged_files} || {
+          echo "rustfmt: an unformatted file is listed above — run 'cargo fmt --all'"
+          exit 1
+        }
+
+commit-msg:
+  commands:
+    commitlint:
+      # commitlint if the toolchain is there, and a POSIX-shell check of the same
+      # rules if it is not. The rules live in commitlint.config.mjs; this keeps
+      # the two in step and is the only place either list is duplicated.
+      run: |
+        MSG_FILE={1}
+
+        if command -v pnpm >/dev/null 2>&1 && pnpm exec commitlint --version >/dev/null 2>&1; then
+          pnpm exec commitlint --edit "$MSG_FILE"
+          exit $?
+        fi
+        if command -v npx >/dev/null 2>&1 && npx --no-install commitlint --version >/dev/null 2>&1; then
+          npx --no-install commitlint --edit "$MSG_FILE"
+          exit $?
+        fi
+
+        # ---- fallback: no commitlint available ----
+        MSG=$(head -n 1 "$MSG_FILE")
+
+        # Commits git generates or that no one reads on merge are exempt, the
+        # same way commitlint's defaultIgnores treats them.
+        case "$MSG" in
+          "Merge "*|"Revert "*|fixup!*|squash!*|amend!*) exit 0 ;;
+        esac
+
+        TYPES='feat|fix|docs|chore|refactor|test|perf|build|ci|revert'
+        SCOPES='proxy ledger auth dashboard admin web config telemetry dashboard-ui deploy docs deps ci release repo'
+
+        if ! printf '%s' "$MSG" | grep -Eq "^($TYPES)(\([a-z0-9._/-]+\))?!?: .+"; then
+          printf 'commit-msg: not a Conventional Commit:\n  %s\nexpected: <type>(<scope>): <subject>\ntypes: %s\n' "$MSG" "$TYPES" >&2
+          exit 1
+        fi
+
+        SCOPE=$(printf '%s' "$MSG" | grep -oE '^[a-z]+\([^)]+\)' | sed 's/.*(//; s/)$//')
+        if [ -n "$SCOPE" ]; then
+          case " $SCOPES " in
+            *" $SCOPE "*) ;;
+            *) printf 'commit-msg: unknown scope "%s"\nscopes: %s\n' "$SCOPE" "$SCOPES" >&2; exit 1 ;;
+          esac
+        fi
+
+        if [ "${#MSG}" -gt 100 ]; then
+          printf 'commit-msg: subject line is %d characters, the limit is 100\n' "${#MSG}" >&2
+          exit 1
+        fi
+
+        exit 0
+
+pre-push:
+  commands:
+    clippy:
+      run: cargo clippy --all-targets -- -D warnings
+    unit:
+      run: cargo test --lib
+    integration:
+      run: cargo test --test integration

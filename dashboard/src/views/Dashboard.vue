@@ -1,13 +1,11 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useDashboardStore } from '@/stores/dashboard'
 
 const store = useDashboardStore()
-const { summary, timeseries, requests, loading, error, range, model, streamState, hasMore } =
+const { me, summary, timeseries, requests, loading, error, range, model, streamState, hasMore, models } =
   storeToRefs(store)
-
-const models = ['gpt-4', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
 
 const rangeOptions = [
   { value: 'today', label: 'Today' },
@@ -17,7 +15,9 @@ const rangeOptions = [
   { value: '30d', label: 'Last 30 days' },
 ]
 
-/** Label and styling for the invalidation stream's current state. */
+/**
+ * Label and styling for the invalidation stream's current state.
+ */
 const streamBadge = computed(() => {
   switch (streamState.value) {
     case 'live':
@@ -37,24 +37,31 @@ const streamBadge = computed(() => {
   }
 })
 
+const isMobile = ref(isNarrow())
+
+function isNarrow() {
+  return typeof window !== 'undefined' && window.innerWidth < 700
+}
+
 onMounted(async () => {
-  await store.fetchMe()
+  window.addEventListener('resize', onResize)
   await store.refresh()
   store.connect()
 })
 
-onUnmounted(() => {
+onBeforeUnmount(() => {
+  window.removeEventListener('resize', onResize)
   store.disconnect()
 })
+
+function onResize() {
+  isMobile.value = isNarrow()
+}
 
 watch([range, model], () => {
   store.refresh()
 })
 
-/**
- * Render a count, or "—" when it is unknown. A missing value is never shown as
- * zero: in this product an absent number means the provider did not report it.
- */
 function formatNumber(n: number | null | undefined): string {
   if (n === null || n === undefined) return '—'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
@@ -94,6 +101,10 @@ function statusColor(status: string): string {
 async function loadMore() {
   await store.fetchRequests(true)
 }
+
+function signOut() {
+  store.signOut()
+}
 </script>
 
 <template>
@@ -105,27 +116,35 @@ async function loadMore() {
           {{ streamBadge.text }}
         </span>
       </div>
-      <div class="header-filters">
-        <select v-model="range">
-          <option v-for="opt in rangeOptions" :key="opt.value" :value="opt.value">
-            {{ opt.label }}
-          </option>
-        </select>
-        <select v-model="model">
-          <option value="all">All models</option>
-          <option v-for="m in models" :key="m" :value="m">
-            {{ m }}
-          </option>
-        </select>
+      <div class="header-controls">
+        <div class="header-filters">
+          <select v-model="range" aria-label="Time range">
+            <option v-for="opt in rangeOptions" :key="opt.value" :value="opt.value">
+              {{ opt.label }}
+            </option>
+          </select>
+          <select v-model="model" aria-label="Model">
+            <option value="all">All models</option>
+            <option v-for="m in models" :key="m" :value="m">
+              {{ m }}
+            </option>
+          </select>
+        </div>
+        <span v-if="me" class="whoami" :title="`key: ${me.key_name}`">
+          {{ me.key_name }} · {{ me.consumer_id }}
+        </span>
+        <button class="signout" @click="signOut" title="Forget the stored key and return to the login screen">
+          Sign out
+        </button>
       </div>
     </header>
 
-    <div v-if="error" class="error-banner">
+    <div v-if="error" class="error-banner" role="alert">
       {{ error }}
     </div>
 
     <!-- Summary Cards -->
-    <section class="summary">
+    <section class="summary" aria-label="Usage summary">
       <div class="card summary-card">
         <div class="summary-label">Requests</div>
         <div class="summary-value">{{ formatNumber(summary?.total_requests) }}</div>
@@ -164,10 +183,10 @@ async function loadMore() {
       </div>
     </section>
 
-    <!-- Timeseries Chart (simplified - would use chart library in production) -->
+    <!-- Timeseries Chart -->
     <section class="card timeseries-section">
       <h2>Requests Over Time</h2>
-      <div class="timeseries-chart">
+      <div class="timeseries-chart" role="img" aria-label="Requests per hour over the selected range">
         <div
           v-for="point in timeseries"
           :key="point.hour"
@@ -175,16 +194,17 @@ async function loadMore() {
           :style="{ height: `${(point.requests / Math.max(...timeseries.map(t => t.requests), 1)) * 100}%` }"
           :title="`${point.hour}: ${point.requests} requests, ${point.failure_count} failed`"
         ></div>
+        <p v-if="timeseries.length === 0" class="timeseries-empty">No data for the selected range</p>
       </div>
     </section>
 
-    <!-- Requests Table -->
+    <!-- Requests Table: the table for wide screens, cards for narrow ones. -->
     <section class="card requests-section">
       <h2>Recent Requests</h2>
       <div v-if="requests.length === 0 && !loading" class="empty-state">
         No requests in the selected time range
       </div>
-      <table v-else class="requests-table">
+      <table v-else-if="!isMobile" class="requests-table">
         <thead>
           <tr>
             <th>Time</th>
@@ -212,10 +232,6 @@ async function loadMore() {
               </span>
             </td>
             <td class="tokens">
-              <!--
-                Absence is shown as "—", never as 0. A token count of 0 that the
-                provider actually reported still renders as "0".
-              -->
               <span v-if="req.input_tokens !== null || req.output_tokens !== null">
                 {{ formatNumber(req.input_tokens) }} / {{ formatNumber(req.output_tokens) }}
                 <span v-if="req.cached_tokens !== null && req.cached_tokens > 0" class="cached">
@@ -242,6 +258,66 @@ async function loadMore() {
           </tr>
         </tbody>
       </table>
+      <ul v-else class="requests-cards" aria-label="Recent requests">
+        <li v-for="req in requests" :key="req.request_id" class="request-card">
+          <div class="request-card-row">
+            <span class="request-card-label">Time</span>
+            <span class="request-card-value time">{{ formatDate(req.created_at) }}</span>
+          </div>
+          <div class="request-card-row">
+            <span class="request-card-label">Model</span>
+            <span class="request-card-value model">{{ req.model }}</span>
+          </div>
+          <div class="request-card-row">
+            <span class="request-card-label">Endpoint</span>
+            <span class="request-card-value endpoint">
+              <span :class="['badge', req.endpoint]">{{ req.endpoint }}</span>
+              <span v-if="req.streaming" class="badge streaming">streaming</span>
+            </span>
+          </div>
+          <div class="request-card-row">
+            <span class="request-card-label">Status</span>
+            <span class="request-card-value status">
+              <span
+                :style="{ color: statusColor(req.request_status) }"
+                :title="req.error_message ?? undefined"
+              >
+                {{ req.http_status ?? '—' }} {{ req.request_status }}
+              </span>
+            </span>
+          </div>
+          <div class="request-card-row">
+            <span class="request-card-label">Tokens</span>
+            <span class="request-card-value tokens">
+              <span v-if="req.input_tokens !== null || req.output_tokens !== null">
+                {{ formatNumber(req.input_tokens) }} / {{ formatNumber(req.output_tokens) }}
+                <span v-if="req.cached_tokens !== null && req.cached_tokens > 0" class="cached">
+                  (+{{ formatNumber(req.cached_tokens) }} cached)
+                </span>
+              </span>
+              <span v-else class="muted">—</span>
+              <span
+                v-if="req.usage_status === 'unavailable'"
+                class="usage-flag"
+                title="The provider reported no usage for this request; its tokens are unknown, not zero"
+              >
+                usage unavailable
+              </span>
+              <span
+                v-else-if="req.usage_status === 'partial'"
+                class="usage-flag"
+                title="The provider reported only part of this request's usage; the missing part is unknown, not zero"
+              >
+                usage partial
+              </span>
+            </span>
+          </div>
+          <div class="request-card-row">
+            <span class="request-card-label">Duration</span>
+            <span class="request-card-value duration">{{ formatDuration(req.duration_ms) }}</span>
+          </div>
+        </li>
+      </ul>
       <div v-if="hasMore" class="load-more">
         <button @click="loadMore" :disabled="loading">
           {{ loading ? 'Loading...' : 'Load More' }}
@@ -262,6 +338,8 @@ async function loadMore() {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
   margin-bottom: 2rem;
 }
 
@@ -274,6 +352,18 @@ async function loadMore() {
 .header h1 {
   font-size: 1.5rem;
   font-weight: 600;
+}
+
+.header-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.header-filters {
+  display: flex;
+  gap: 0.75rem;
 }
 
 .sse-badge {
@@ -292,19 +382,10 @@ async function loadMore() {
   color: var(--warning);
 }
 
-.sse-badge.unauthenticated {
+.sse-badge.unauthenticated,
+.sse-badge.idle {
   background: rgba(234, 179, 8, 0.1);
   color: var(--warning);
-}
-
-.sse-badge.idle {
-  background: rgba(239, 68, 68, 0.1);
-  color: var(--error);
-}
-
-.header-filters {
-  display: flex;
-  gap: 0.75rem;
 }
 
 .error-banner {
@@ -356,6 +437,7 @@ async function loadMore() {
 }
 
 .timeseries-chart {
+  position: relative;
   display: flex;
   align-items: flex-end;
   gap: 2px;
@@ -374,6 +456,16 @@ async function loadMore() {
 
 .timeseries-bar:hover {
   background: var(--accent-hover);
+}
+
+.timeseries-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 0.875rem;
 }
 
 .requests-section h2 {
@@ -409,6 +501,43 @@ async function loadMore() {
 
 .requests-table tbody tr:hover {
   background: rgba(255, 255, 255, 0.02);
+}
+
+/* Card list for narrow screens: the table becomes vertical rows that read
+   like a definition list. */
+.requests-cards {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  padding: 0;
+  margin: 0;
+}
+
+.request-card {
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  padding: 0.75rem;
+  background: var(--bg);
+}
+
+.request-card-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.3rem 0;
+}
+
+.request-card-label {
+  color: var(--muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  min-width: 5rem;
+}
+
+.request-card-value {
+  text-align: right;
+  word-break: break-word;
 }
 
 .badge {
@@ -447,5 +576,63 @@ async function loadMore() {
 .load-more {
   text-align: center;
   margin-top: 1rem;
+}
+
+.whoami {
+  color: var(--muted);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.signout {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  padding: 0.5rem 0.75rem;
+}
+
+.signout:hover {
+  color: var(--fg);
+  border-color: var(--fg);
+}
+
+/* ------------------------------------------------------------------ */
+/* Narrow screens                                                       */
+/* ------------------------------------------------------------------ */
+@media (max-width: 700px) {
+  .dashboard {
+    padding: 1rem;
+  }
+
+  .header {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
+
+  .header-left {
+    justify-content: space-between;
+  }
+
+  .header-controls {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.5rem;
+  }
+
+  .header-filters {
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.75rem;
+  }
+
+  .summary-value {
+    font-size: 1.5rem;
+  }
 }
 </style>

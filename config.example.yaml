@@ -1,0 +1,258 @@
+# Partner Portal — reference configuration.
+#
+# Every field the binary understands is present below, commented with its type,
+# its default, and what it does. Copy this file to `config.yaml` and edit it:
+#
+#   cp config.example.yaml config.yaml
+#   PARTNER_PORTAL_CONFIG=config.yaml ./target/release/partner-portal
+#
+# The path is taken from `PARTNER_PORTAL_CONFIG`, falling back to `config.yaml`
+# in the working directory (src/main.rs).
+#
+# The file is re-read once per second. A change that parses and validates is
+# swapped in atomically; a change that does not is logged and the previous
+# configuration stays in force (src/config/hot_reload.rs). An unknown key is a
+# parse error rather than something to ignore, so a typo is refused instead of
+# being silently replaced by the default.
+#
+# A reload is not uniform, and the watcher says which is which on every change.
+# Fields marked "Live" below are read per request from the new snapshot. Every
+# other field was captured when the process started — the listener is bound
+# once, and the router, the upstream connector, the SSE poller and the ledger
+# writer are each built once — so changing one of those logs a warning saying
+# explicitly that the new value is NOT in force until restart.
+#
+# No keys are logged: the reloader reports *that* a credential changed and which
+# entry changed, never the value (src/config/hot_reload.rs::report_changes).
+
+# ---------------------------------------------------------------------------
+# server — HTTP listener behaviour.
+#
+# Optional as a block: omit it entirely and every default below applies.
+# ---------------------------------------------------------------------------
+server:
+  # Listen address, parsed as a SocketAddr. Must be `host:port`.
+  # Default: "0.0.0.0:8080". Restart required to change.
+  listen: "0.0.0.0:8080"
+
+  # Wait for already-accepted requests to finish on SIGTERM/SIGINT.
+  #
+  # This controls only the listener. Draining the metering pipeline is *not*
+  # optional and happens either way — no setting lets a shutdown drop
+  # accepted-but-unwritten usage (src/main.rs, drain sequence).
+  # Read once, when the signal handler is installed. Restart required to change.
+  # Default: true.
+  graceful_shutdown: true
+
+  # How long readiness keeps failing before the listener stops accepting.
+  #
+  # An instance sets `shutting_down` first, waits this long, then closes the
+  # listener. A load balancer polls readiness on an interval, so closing the
+  # listener at the same instant readiness flips produces connection errors at
+  # the balancer. Too short is a visible error, so err generous.
+  # Read once, when the signal handler is installed. Restart required to change.
+  # Default: 5.
+  shutdown_grace_secs: 5
+
+  # Maximum request body size in bytes, enforced by RequestBodyLimitLayer.
+  # Inference requests are small JSON documents; the response, where the size
+  # actually is, is streamed and never buffered against this limit.
+  # Partly live: the per-request read follows the snapshot, so a *smaller* limit
+  # takes effect on reload, but the layer that rejects an oversized body at the
+  # edge is built at startup — raising this value needs a restart.
+  # Default: 10485760 (10 MiB).
+  max_body_size: 10485760
+
+  # Browser origins allowed to call this server, as an explicit allow-list.
+  #
+  # Empty (the default) means no CORS headers at all, which is correct for the
+  # intended deployment: server-side clients and the dashboard's own same-origin
+  # UI need none. A wildcard would let any page on the internet spend the
+  # upstream credential this proxy holds, so there is deliberately no "*"
+  # short-hand. An entry that fails to parse as a header value is logged and
+  # skipped. Restart required to change.
+  # Default: [] (nothing allowed).
+  cors_allow_origins: []
+  # cors_allow_origins:
+  #   - "https://partners.example.com"
+
+  # How often the dashboard's SSE poller reads `PRAGMA data_version` to detect
+  # writes from another connection or another process. Values below 1 are
+  # clamped to 1 (a zero interval would spin).
+  # Passed to the poller when it is constructed. Restart required to change.
+  # Default: 500.
+  sse_poll_interval_ms: 500
+
+# ---------------------------------------------------------------------------
+# upstream — the single OpenAI-compatible API this proxy forwards to.
+#
+# Required, and singular by design: one base URL, one credential. There is no
+# routing, no failover, no request transformation (docs/adr/0001).
+# ---------------------------------------------------------------------------
+upstream:
+  # Base URL, `http://` or `https://` with a host. A trailing slash is trimmed
+  # before the request path is appended, so "https://api.openai.com/" and
+  # "https://api.openai.com" both produce ".../v1/chat/completions".
+  # A base *path* is preserved: "https://gw.internal/openai/v1" + "/v1/responses"
+  # becomes "https://gw.internal/openai/v1/v1/responses" — this proxy does not
+  # rewrite paths, it appends them.
+  #
+  # Parsed at load: a URL with no host ("http://"), no scheme ("not-a-url"), or
+  # a scheme other than http/https is a startup failure, because it cannot serve
+  # a request and would otherwise surface as a 502 per request.
+  # Live: read per request, so a reload repoints the upstream immediately.
+  base_url: "https://api.openai.com"
+
+  # Credential sent upstream as `Authorization: Bearer <api_key>`.
+  #
+  # The client's own Authorization header is removed before this is set; the
+  # local key never reaches the upstream. Read per request, so rotating it via
+  # hot reload takes effect on the next request.
+  api_key: "sk-replace-me"
+
+  # Timeout in seconds for the whole upstream exchange. Applied twice, because
+  # the two failure modes differ: as a cap on time-to-response-headers, and as
+  # an *idle* timeout between frames mid-stream. An upstream that goes silent
+  # mid-stream is failed rather than held open indefinitely.
+  # Values below 1 are clamped to 1.
+  # Live: read per request.
+  # Default: 120.
+  timeout_secs: 120
+
+  # TCP connect timeout in seconds, and the only upstream setting fixed at
+  # startup: it configures the connector and its connection pool. Values below 1
+  # are clamped to 1. Happy Eyeballs is enabled with a 300 ms delay so a DNS
+  # name with a blackholed first address does not stall for the full timeout.
+  # Restart required to change.
+  # Default: 10.
+  connect_timeout_secs: 10
+
+# ---------------------------------------------------------------------------
+# keys — local API keys accepted by this proxy.
+#
+# Required and non-empty: the server refuses to start with no keys, with a
+# duplicate key value, with an empty key, or with an empty name
+# (src/config/loader.rs::validate). Comparison is exact string equality against
+# the presented Bearer token — these are plaintext secrets in a file, so the
+# file's permissions are the security boundary.
+#
+# An error about a key names it by position and by `name`, never by value: a
+# credential must not reach a log line, and this file's errors are logged by the
+# reload watcher (src/config/loader.rs).
+#
+# The dashboard login accepts one of these keys and shows the usage of the
+# CONSUMER the key belongs to — the isolation boundary is the consumer, not the
+# key:
+#
+#   * Two keys with DIFFERENT `consumer_id`s (or with `consumer_id` omitted, so
+#     `name` becomes the identity) can never observe each other's data. This is
+#     the default, and it is proven by tests/e2e/dashboard_isolation.rs.
+#   * Two keys with the SAME `consumer_id` deliberately share one usage view —
+#     the rotation pattern (revoke the old key, add a replacement under the same
+#     consumer, and the partner's history continues). Granting that share is an
+#     explicit operator decision; no request can assert it.
+#
+# Live: adding or revoking a key takes effect on the next request, with no
+# restart.
+# ---------------------------------------------------------------------------
+keys:
+  - # The credential a client presents as `Authorization: Bearer <key>`.
+    key: "pp-local-key-replace-me"
+
+    # Human-readable label. Also used to identify the key in logs.
+    name: "acme-production"
+
+    # Consumer identity written to the ledger and used to scope every dashboard
+    # query. Optional; when omitted it defaults to `name`.
+    #
+    # Identity is *always* derived server-side from this config — never from a
+    # request header, body field or query parameter (src/auth/middleware.rs).
+    # Two keys that share a `consumer_id` share a usage view; one key can never
+    # observe another's.
+    consumer_id: "acme"
+
+    # Free-form string map carried on the consumer context. Not metered and not
+    # exposed by the dashboard API; available to code that reads
+    # `ConsumerContext`.
+    #
+    # Any number of entries may be used: it is stored in a `BTreeMap` so that
+    # the content hash — which decides whether a reload happened at all — does
+    # not depend on the order the entries happen to be in (src/config/types.rs).
+    # Default: {}.
+    metadata:
+      plan: "partner"
+
+  - # A second key for the same consumer: same usage view, separate credential,
+  # so one can be revoked without disturbing the other.
+    key: "pp-local-key-staging-replace-me"
+    name: "acme-staging"
+    consumer_id: "acme"
+    metadata: {}
+
+# ---------------------------------------------------------------------------
+# database — the durable usage ledger.
+#
+# Optional as a block. The database is opened, its schema created, and crash
+# recovery run before the listener binds; a failure in any of those is a startup
+# failure, not a degraded mode (src/main.rs).
+# ---------------------------------------------------------------------------
+database:
+  # Path to the SQLite file. The directory must exist and be writable. `-wal`
+  # and `-shm` sidecar files appear alongside it. Place it on local disk: WAL
+  # mode requires shared memory, so a network filesystem is not supported.
+  # Opened once at startup. Restart required to change.
+  # Default: "partner-portal.db".
+  path: "./partner-portal.db"
+
+  # How long usage is kept. A sweep every `retention_interval_secs` deletes raw
+  # rows with `created_at` strictly older than this many days, and the rollups
+  # whose hour bucket is older than the same cutoff. Values below 1 are clamped
+  # to 1, so `0` cannot wipe the ledger (src/ledger/retention.rs::cutoff_for).
+  # Partly live: the dashboard validates a query window against the new value,
+  # but the sweep runs on the value read at startup. Restart to change the sweep.
+  # Default: 60.
+  retention_days: 60
+
+  # Capacity of the metering queue, in records. Minimum 1: a zero-capacity queue
+  # cannot be built at all, so it is refused when the file is loaded.
+  #
+  # This bounds memory. When it is full, producers *wait* rather than dropping —
+  # backpressure, never loss — and readiness fails once more than half of it is
+  # outstanding, so a load balancer stops sending before requests start to queue
+  # (src/ledger/writer.rs). Raising it absorbs longer database stalls at the
+  # cost of memory and a longer drain at shutdown.
+  # Passed to the writer when it is constructed. Restart required to change.
+  # Default: 10000.
+  queue_size: 10000
+
+  # Records pulled per commit. A batch is one transaction, so this trades commit
+  # latency against throughput. The writer holds at most this many records
+  # outside the channel. Minimum 1: the writer only pulls while its batch is
+  # below this size, so `0` never takes a record off the queue — the process
+  # would look healthy and meter nothing. Refused at load.
+  # Passed to the writer when it is constructed. Restart required to change.
+  # Default: 100.
+  batch_size: 100
+
+  # How long the writer waits to fill a batch before committing what it has.
+  # A closed channel (shutdown) flushes immediately rather than waiting this
+  # out. `0` is accepted and means "commit as soon as anything is queued".
+  # Passed to the writer when it is constructed. Restart required to change.
+  # Default: 1000.
+  batch_timeout_ms: 1000
+
+  # How often the retention sweep runs. Values below 60 are clamped to 60.
+  # Read when the sweep task is spawned. Restart required to change.
+  # Default: 3600.
+  retention_interval_secs: 3600
+
+  # Rows deleted per retention slice.
+  #
+  # Retention is sliced so the write lock is released between slices; a single
+  # DELETE over 60 days of records would hold it for the whole sweep and stall
+  # metering. Each slice commits on its own, so a crash mid-sweep leaves the
+  # database consistent and the next sweep continues. Values below 1 are
+  # clamped to 1.
+  # Read when the sweep task is spawned. Restart required to change.
+  # Default: 2000.
+  retention_batch_size: 2000

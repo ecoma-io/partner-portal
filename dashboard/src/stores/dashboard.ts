@@ -105,6 +105,16 @@ function httpMessage(res: Response, what: string): string {
 
 export const useDashboardStore = defineStore('dashboard', () => {
   const me = ref<Me | null>(null)
+  /**
+   * Whether the API key is known to be valid. `false` while discovering (or in
+   * the login screen); `true` once `/api/me` has answered with this key.
+   *
+   * This is the distinction that gives the login screen its teeth: a rejected
+   * key must NOT make the store silently carry on as if it were valid. Every
+   * authenticated request fails. We only surface the view after the backend
+   * accepts the key.
+   */
+  const authenticated = ref(false)
   const summary = ref<Summary | null>(null)
   const timeseries = ref<TimeseriesPoint[]>([])
   const requests = ref<RequestItem[]>([])
@@ -124,6 +134,18 @@ export const useDashboardStore = defineStore('dashboard', () => {
    */
   const seq = { me: 0, summary: 0, timeseries: 0, requests: 0 }
 
+  /**
+   * Tear down any live stream run so a new key starts clean. The stream is
+   * read with `fetch` + an AbortController; aborting it is the disconnect.
+   */
+  function closeStream() {
+    cancelReconnect()
+    if (streamRun !== null) {
+      streamRun.abort()
+      streamRun = null
+    }
+  }
+
   function authHeaders(): HeadersInit {
     // The key is supplied by the embedding context. It is only ever sent in the
     // Authorization header — never a URL, a query parameter or a cookie.
@@ -134,14 +156,17 @@ export const useDashboardStore = defineStore('dashboard', () => {
     return {}
   }
 
-  async function fetchMe() {
+  async function fetchMe(withKey?: string) {
     const ticket = ++seq.me
     try {
-      const res = await fetch(`${BASE_URL}/me`, { headers: authHeaders() })
+      const res = await fetch(`${BASE_URL}/me`, {
+        headers: withKey ? { Authorization: `Bearer ${withKey}` } : authHeaders(),
+      })
       if (!res.ok) throw new Error(httpMessage(res, 'the account'))
       const data: Me = await res.json()
       if (ticket !== seq.me) return
       me.value = data
+      authenticated.value = true
       error.value = null
     } catch (e) {
       if (ticket === seq.me) error.value = messageOf(e)
@@ -164,6 +189,31 @@ export const useDashboardStore = defineStore('dashboard', () => {
       error.value = null
     } catch (e) {
       if (ticket === seq.summary) error.value = messageOf(e)
+    }
+  }
+
+  const models = ref<string[]>([])
+
+  /**
+   * The models this key has actually used, from the backend. The filter must
+   * only ever show what the authenticated consumer really touched — a
+   * hardcoded list would claim models that were never used. The endpoint is
+   * consumer-scoped server-side (`consumer_id = ?1`), so a key sees only its
+   * own model activity.
+   */
+  async function fetchModels() {
+    try {
+      const params = new URLSearchParams({ range: range.value })
+      if (model.value !== 'all') params.set('model', model.value)
+      const res = await fetch(`${BASE_URL}/dashboard/models?${params}`, {
+        headers: authHeaders(),
+      })
+      if (!res.ok) throw new Error(httpMessage(res, 'the model list'))
+      const data: { models: string[] } = await res.json()
+      models.value = data.models
+    } catch {
+      // The model filter is a convenience; the summary and table still load.
+      models.value = []
     }
   }
 
@@ -237,6 +287,40 @@ export const useDashboardStore = defineStore('dashboard', () => {
   let refreshing = false
   let refreshQueued = false
 
+  /**
+   * Sign in with a key the user typed. The key is validated against the backend
+   * before anything else happens: a 401 here is the whole point of the login
+   * screen, and it must show a message rather than pretend the key worked.
+   */
+  async function signIn(key: string) {
+    const trimmed = key.trim()
+    if (!trimmed) {
+      error.value = 'Enter an API key to continue'
+      return false
+    }
+    error.value = null
+    await fetchMe(trimmed)
+    if (!authenticated.value) return false
+    closeStream()
+    localStorage.setItem('api_key', trimmed)
+    await refresh()
+    connect()
+    return true
+  }
+
+  /** Sign out: drop the stored key, tear down the stream, return to login. */
+  function signOut() {
+    disconnect()
+    localStorage.removeItem('api_key')
+    me.value = null
+    authenticated.value = false
+    summary.value = null
+    timeseries.value = []
+    requests.value = []
+    nextCursor.value = null
+    error.value = null
+  }
+
   async function refresh() {
     if (refreshing) {
       refreshQueued = true
@@ -246,7 +330,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     try {
       do {
         refreshQueued = false
-        await Promise.all([fetchSummary(), fetchTimeseries(), fetchRequests()])
+        await Promise.all([fetchSummary(), fetchTimeseries(), fetchRequests(), fetchModels()])
       } while (refreshQueued)
     } finally {
       refreshing = false
@@ -450,6 +534,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
 
   return {
     me,
+    authenticated,
     summary,
     timeseries,
     requests,
@@ -460,10 +545,14 @@ export const useDashboardStore = defineStore('dashboard', () => {
     model,
     streamState,
     hasMore,
+    models,
     fetchMe,
+    signIn,
+    signOut,
     fetchSummary,
     fetchTimeseries,
     fetchRequests,
+    fetchModels,
     connect,
     disconnect,
     refresh,
