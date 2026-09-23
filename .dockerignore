@@ -1,0 +1,77 @@
+# Build context for the three-stage image. The image is built from source, so
+# the context only needs Cargo.toml/Cargo.lock/build.rs/src plus the dashboard's
+# own sources; everything below is either rebuilt inside the build or has no
+# business in an image layer.
+#
+# Note the two exclusions that matter most:
+#   * dashboard/dist and dashboard/node_modules — the dashboard stage builds
+#     these itself; copying them in would bake a stale bundle from the developer's
+#     working tree into an artifact that is supposed to be reproducible from the
+#     commit.
+#   * .git — the revision is passed as the GIT_COMMIT build argument instead, so
+#     the context stays small and the image metadata is explicit rather than
+#     inferred from whatever the checkout happened to contain.
+
+# --- VCS -------------------------------------------------------------------
+.git
+.gitignore
+.github
+
+# --- Rust build tree -------------------------------------------------------
+# `benches/` is *not* excluded: Cargo.toml declares a [[bench]] target, so the
+# manifest cannot even be parsed without the file present.
+target
+**/*.rs.bk
+
+# --- Dashboard build tree --------------------------------------------------
+dashboard/dist
+dashboard/node_modules
+dashboard/.vite
+**/node_modules
+**/.pnpm-store
+
+# --- Local state: never ship a database or a log into an image -------------
+# A copy of the ledger inside the image would be a second, forkable source of
+# truth for usage accounting.
+*.db
+*.db-wal
+*.db-shm
+deploy/data
+logs
+*.log
+
+# --- Local configuration and secrets --------------------------------------
+# The image takes its configuration from a mounted file. A config or a key
+# committed into a layer is a credential that cannot be revoked by rotating the
+# config, only by rebuilding every image that ever copied it.
+.env
+.env.*
+!.env.example
+config.yaml
+config.local.yaml
+deploy/config/partner-portal.local.yaml
+
+# --- Deployment and CI (referenced by the operator, not by the build) ------
+deploy
+docker-compose.yml
+docker-compose.*.yml
+deny.toml
+CODEOWNERS
+
+# --- Docs, licence and editor noise (LICENSE is copied into release tarballs
+# by the release workflow from the git checkout, not from the image context) --
+docs
+*.md
+!README.md
+.idea
+.vscode
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Test scratch ----------------------------------------------------------
+coverage
+test-output
+tmp

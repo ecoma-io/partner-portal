@@ -1,0 +1,68 @@
+# One instance, one ledger, no edge — the compose file for running the proxy on
+# a machine that has no orchestrator and does not need a rolling update.
+#
+# For the two-instance rolling update stack, see deploy/docker-compose.yml.
+#
+#   docker build -t partner-portal:local .
+#   docker compose up -d
+#   curl -fsS http://127.0.0.1:8080/healthz
+#
+# Configuration comes from deploy/config/partner-portal.yaml, which is committed
+# with placeholder credentials. Edit it (or add a config of your own next to it
+# and set PARTNER_PORTAL_CONFIG_FILE) before pointing this at a real upstream.
+
+name: partner-portal
+
+services:
+  portal:
+    image: ${PARTNER_PORTAL_IMAGE:-partner-portal:local}
+    build:
+      context: .
+      args:
+        # Surfaced by GET /version, so an operator can confirm which revision is
+        # actually running without shelling into the container.
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+        VERSION: ${VERSION:-0.0.0}
+    container_name: partner-portal
+    restart: unless-stopped
+
+    # Docker's default stop grace of 10s can expire inside the metering drain on
+    # a busy instance, and the SIGKILL that follows discards accepted usage.
+    stop_grace_period: 30s
+
+    environment:
+      PARTNER_PORTAL_CONFIG: /etc/partner-portal/${PARTNER_PORTAL_CONFIG_FILE:-partner-portal.yaml}
+
+    ports:
+      # Bound to the loopback interface: this proxy holds an upstream credential
+      # and every request through it is billed. Reachable from the host, not
+      # from the network, until a front door is put in front of it deliberately.
+      - "127.0.0.1:8080:8080"
+
+    volumes:
+      - ./deploy/config:/etc/partner-portal:ro
+      - portal-data:/var/lib/partner-portal
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  portal-data:
+    name: partner-portal-data
