@@ -1,0 +1,356 @@
+name: CI
+
+# Runs on every pull request and on every push to the default branch. A push to
+# main is what the release tags are cut from, so it gets the same checks as a PR
+# rather than a subset.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One run per ref. A force-push supersedes the run it replaced: the older run's
+# result describes a commit nobody is looking at any more, and leaving it alive
+# only competes for runners with the run that matters.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only by default. `permissions:` is set per job where a job needs more, so
+# a compromised dependency in one step cannot inherit write access to the repo.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Trimmed backtraces: enough to locate a panic, not enough to fill a log page.
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The Rust workspace: formatting, lint, and the unit tests.
+  # ---------------------------------------------------------------------------
+  rust:
+    name: Rust (fmt, check, clippy, test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust
+
+      # Formatting is checked, never applied: a formatter that rewrites the
+      # working tree in CI turns "did you run fmt" into a silent commit.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo check
+        run: cargo check --locked --all-targets
+
+      - name: cargo clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # No service matrix is needed here, and that is a property of the design
+      # rather than an omission: the ledger is embedded SQLite (no database
+      # container) and the upstream is stubbed per test over a real socket (no
+      # upstream container). This runs every target, including the spawned-binary
+      # suites; the next job runs those same suites against the *release* build
+      # and the dashboard the frontend job just produced, which is what ships.
+      - name: cargo test
+        run: cargo test --locked --all-features
+
+  # ---------------------------------------------------------------------------
+  # The dashboard. Lint and typecheck are separate steps from the build so a
+  # failure says which one it was.
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: Dashboard (lint, typecheck, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v5
+
+      # The version is pinned here as well as in the Dockerfile: the image and CI
+      # must resolve the same dependency graph from the same lockfile.
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 12.3.4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+
+      # --frozen-lockfile is the whole point of committing the lockfile; without
+      # it a CI pass would not prove the tag installs.
+      - name: pnpm install --frozen-lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm lint
+        run: pnpm lint
+
+      - name: pnpm typecheck
+        run: pnpm typecheck
+
+      - name: pnpm build
+        run: pnpm build
+
+      # Handed to the integration job so the binary it builds is the artifact
+      # that ships — dashboard embedded — rather than a placeholder-page build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # The suites that drive the real binary as a child process.
+  # ---------------------------------------------------------------------------
+  integration:
+    name: Integration and fault suites
+    needs: [frontend]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dashboard-dist
+          path: dashboard/dist
+
+      # The suites spawn this binary, so it is built before they run — and built
+      # in release, because that is the profile the deploy artifacts use and the
+      # one whose timing behaviour the drain assertions were written against.
+      - name: Build the binary the suites drive
+        run: cargo build --locked --release --bin partner-portal
+
+      - name: Run the integration and fault suites
+        env:
+          # Convenience for a suite that wants the path explicitly; cargo also
+          # exports CARGO_BIN_EXE_partner-portal to integration tests.
+          PARTNER_PORTAL_BIN: ${{ github.workspace }}/target/release/partner-portal
+        run: |
+          set -euo pipefail
+          # A suite is a directory with a main.rs — cargo's rule for an
+          # integration-test target, which lets a suite keep its cases in
+          # separate files under tests/<name>/.
+          suites=()
+          while IFS= read -r dir; do
+            suites+=("$(basename "$dir")")
+          done < <(find tests -mindepth 2 -maxdepth 2 -name main.rs -printf '%h\n' 2>/dev/null | sort)
+
+          if [ "${#suites[@]}" -eq 0 ]; then
+            echo "::notice::no test suites under tests/<name>/main.rs; nothing to run"
+            exit 0
+          fi
+
+          args=()
+          for suite in "${suites[@]}"; do
+            args+=("--test" "$suite")
+          done
+
+          echo "running suites: ${suites[*]}"
+          cargo test --locked --release "${args[@]}"
+
+  # ---------------------------------------------------------------------------
+  # The image, built and then run.
+  # ---------------------------------------------------------------------------
+  container:
+    name: Container (build and smoke test)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v4
+
+      # The build metadata `GET /version` reports. Computed here rather than read
+      # from `github.run_started_at`, which actionlint's context data does not
+      # carry — a workflow that lints clean is a workflow whose next error is
+      # believed.
+      - name: Build metadata
+        run: echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_ENV"
+
+      - name: docker build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: partner-portal:ci
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_TIME=${{ env.BUILD_TIME }}
+            VERSION=0.0.0-ci
+          # The build is a full release compile of the dependency tree; without
+          # the layer cache every PR pays for it from scratch.
+          cache-from: type=gha,scope=partner-portal-image
+          cache-to: type=gha,mode=max,scope=partner-portal-image
+
+      # The same script an operator can run against a tag before promoting it:
+      # the image's runtime contract, liveness, readiness, auth, an end-to-end
+      # proxied request, the embedded dashboard, and the SIGTERM drain.
+      - name: Image smoke test
+        run: ./scripts/docker-smoke-test.sh partner-portal:ci
+
+      # The deployment shape, not just the image: two instances of this build
+      # over one SQLite ledger, behind the edge. It asserts what the pair exists
+      # for — every request reaches the upstream once and lands in the ledger
+      # once — and that taking a slot out of rotation moves the traffic rather
+      # than dropping it. Ports are passed explicitly so the job cannot collide
+      # with anything the runner already listens on.
+      - name: Deployment smoke test (two instances, one ledger)
+        env:
+          PARTNER_PORTAL_IMAGE: partner-portal:ci
+          EDGE_PORT: "18080"
+          PORTAL_A_PORT: "18081"
+          PORTAL_B_PORT: "18082"
+        run: ./deploy/smoke-test.sh
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker ps -a --format '{{.Names}}' | grep partner-portal | xargs -r -n1 docker logs || true
+
+  # ---------------------------------------------------------------------------
+  # Supply chain: what is in the build, and what is in the image.
+  # ---------------------------------------------------------------------------
+  security:
+    name: Security (deny, audit, secrets, SBOM, image scan)
+    needs: [container]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # gitleaks reads history, not just the working tree: the secret that
+          # matters is usually the one that was committed and then removed.
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust
+
+      # ---------------------------------------------------------------------
+      # Licences, bans, sources and advisories for the Rust dependency graph.
+      # ---------------------------------------------------------------------
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --all-features
+          # A vulnerability or a licence violation fails the job; an
+          # unmaintained-but-not-vulnerable advisory is reported and does not,
+          # which is the split deny.toml encodes.
+          log-level: warn
+
+      # ---------------------------------------------------------------------
+      # The RustSec advisory database, independently of deny.toml's policy.
+      # ---------------------------------------------------------------------
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo-audit
+        run: cargo audit --deny warnings
+
+      # ---------------------------------------------------------------------
+      # Secrets in the tree and in history.
+      # ---------------------------------------------------------------------
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: gitleaks
+
+      - name: gitleaks
+        # --redact so a real finding is not echoed into a public build log; the
+        # report file names the commit and the rule instead.
+        run: |
+          gitleaks detect \
+            --source . \
+            --report-format sarif \
+            --report-path gitleaks.sarif \
+            --redact \
+            --verbose
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-sarif
+          path: gitleaks.sarif
+          if-no-files-found: ignore
+
+      # ---------------------------------------------------------------------
+      # SBOM of the source tree — the dependency graph a release was built from.
+      # ---------------------------------------------------------------------
+      - name: SBOM (syft, SPDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: sbom.spdx.json
+          artifact-name: sbom-source.spdx.json
+          # Not a release job; the SBOM is evidence for this run, and the
+          # release workflow generates the one that ships.
+          upload-release-assets: false
+
+      # ---------------------------------------------------------------------
+      # The image, scanned. Rebuilt here rather than handed over from the
+      # container job (a loaded image does not survive a job boundary); the
+      # shared cache scope means this is a cache restore, not a second compile.
+      # ---------------------------------------------------------------------
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Rebuild the image for scanning
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: partner-portal:scan
+          cache-from: type=gha,scope=partner-portal-image
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: partner-portal:scan
+          format: sarif
+          output: trivy-image.sarif
+          severity: CRITICAL,HIGH
+          # The base image is debian-slim with ca-certificates and curl; ignoring
+          # unfixed findings keeps the signal on what can actually be acted on.
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Trivy filesystem scan (config and dependencies)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif
+          path: trivy-image.sarif
+          if-no-files-found: ignore

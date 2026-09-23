@@ -1,0 +1,115 @@
+# cargo-deny policy: what may be linked into the shipped binary.
+#
+# The proxy holds an upstream credential and commits a usage ledger that is the
+# product's whole output, so the dependency graph is not a private matter: a
+# yanked crate, an advisory or an unattributable licence is a defect in the
+# artifact, not a note for the backlog.
+#
+# Run: cargo deny check
+#
+# The split between `deny` and `warn` below is the point of the file. Anything
+# that means "this build must not ship" is denied and fails CI; anything that
+# means "someone should look at this" is a warning and does not, because a check
+# that is always red is a check that gets an `|| true` appended to it.
+
+[graph]
+# The targets that actually get built and deployed. Keeping this list to the two
+# release targets means a dependency that is only ever pulled in on, say, wasm
+# cannot fail the build for a platform this service does not run on.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+]
+all-features = true
+
+[advisories]
+version = 2
+
+# A known vulnerability in code we link is always denied in the version 2 schema
+# — there is no key for it, which is the point: it is not a policy choice.
+#
+# Unmaintained crates are reported for this workspace's own dependency choices
+# (`workspace`), not for every crate in the transitive graph — the transitive
+# graph is large, mostly out of our hands, and a wall of warnings from it is how
+# the one that matters gets missed.
+unmaintained = "workspace"
+# A soundness hole is different in kind: it is a defect in code we link, reachable
+# from safe code, so the whole graph is checked.
+unsound = "all"
+# A yanked release is an explicit "do not use this version" from the publisher,
+# which the lockfile would otherwise preserve forever.
+yanked = "deny"
+# Advisory *ignores* are deliberate omissions and must not accumulate silently:
+# each entry carries the reachability argument, so the next reader can check it
+# rather than trust it. Everything not listed here fails the build.
+ignore = [
+    { id = "RUSTSEC-2026-0009", reason = """
+      `time` 0.3.45: stack exhaustion when parsing RFC 2822 input.
+      Not reachable in this binary. The advisory is confined to the RFC 2822
+      parser, and partner-portal never parses RFC 2822: the only `time` parsing
+      it does is ISO 8601 with an explicit format description
+      (src/ledger/timefmt.rs, src/config parsing). No request field is ever fed
+      to an RFC 2822 parser, and no user input reaches `time`'s parser without a
+      format description.
+      The fix exists (0.3.47) but requires Rust 1.88, and Cargo.toml declares
+      rust-version = "1.85"; taking it would silently raise the project's MSRV.
+      Remove this entry — and allow the upgrade — when `rust-version` moves to
+      1.88 or later.
+    """ },
+]
+
+[licenses]
+version = 2
+# Deny first, then allow: a licence that is not on this list fails the build
+# rather than passing by default. For a binary that is distributed as an image
+# and a release tarball, an unattributed or incompatible licence is a legal
+# defect in the artifact.
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "BSL-1.0",
+]
+[[licenses.clarify]]
+# `ring` (via rustls/hyper) ships a licence file rather than SPDX metadata in its
+# manifest, so cargo-deny cannot classify it from the manifest alone. The
+# clarifications below are the ones that would otherwise show up as
+# "unlicensed".
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# A wildcard dependency means the version is resolved from outside the lockfile,
+# which defeats the one artifact this deployment is reproducible from — so it is
+# denied rather than warned about.
+highlight = "all"
+# `deny` would be wrong for this graph: two versions of the same crate are
+# common and often required (tokio 1.x alongside a transitive 1.x, two major
+# versions of `syn` used by proc-macro crates). It is reported, and it is the
+# reviewer's call.
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Every dependency is built from crates.io or a pinned git revision. Allowing an
+# unknown registry would mean the build could pull a crate from a host that is
+# not crates.io, and the resulting binary would not be reproducible from this
+# file and Cargo.lock alone.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
