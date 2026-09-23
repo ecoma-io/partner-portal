@@ -1,133 +1,363 @@
-//! Partner Portal - Lightweight OpenAI-compatible reverse proxy
+//! Partner Portal — a lightweight OpenAI-compatible reverse proxy.
+//!
+//! This binary is the composition root: it starts the ledger, the dashboard's
+//! change poller and the HTTP server, and it owns the shutdown sequence. The
+//! sequence is the part worth reading closely, because it is where the
+//! accounting guarantees either hold or quietly fail:
+//!
+//! ```text
+//!   SIGTERM / SIGINT
+//!     -> shutting_down = true          (readiness fails; the balancer stops routing)
+//!     -> wait the grace period         (time for the balancer to notice)
+//!     -> stop accepting connections    (axum drains requests already in flight)
+//!     -> drain the metering pipeline   (flush and COMMIT every queued record)
+//!     -> await detached finalizers     (stream drop guards that could not await)
+//!     -> close the writer task, drop connections
+//! ```
+//!
+//! The ordering is not stylistic. The metering producer is stopped before the
+//! consumer, because a writer closed underneath a live producer turns a
+//! completed request into an unrecorded one — the single failure this product
+//! exists to avoid.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use axum::{
     Router,
     body::Body,
     extract::Request,
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-    routing::{any, get},
+    http::{HeaderValue, StatusCode, header},
+    response::Response,
+    routing::any,
 };
-use parking_lot::RwLock;
 use tokio::signal;
+use tokio::sync::watch;
 use tower_http::{
-    cors::{Any, CorsLayer},
+    cors::{AllowOrigin, Any, CorsLayer},
     limit::RequestBodyLimitLayer,
     sensitive_headers::SetSensitiveHeadersLayer,
     trace::TraceLayer,
 };
-use tracing::info;
+use tracing::{error, info, warn};
 
 use partner_portal::{
     admin::create_admin_router,
     auth::Authenticated,
-    config::{ConfigLoader, ConfigSnapshot, HotReloader},
+    config::{ConfigLoader, HotReloader},
     dashboard::{SseBroadcaster, create_dashboard_router},
-    ledger::{LedgerPool, LedgerWriter, LedgerWriterConfig},
+    ledger::{LedgerPool, LedgerWriter, LedgerWriterConfig, recover_in_flight, retention},
     proxy::client::ProxyClient,
     proxy::handler::AppState,
-    telemetry,
+    telemetry, web,
 };
+
+/// Environment variable that overrides the configuration path.
+const CONFIG_ENV: &str = "PARTNER_PORTAL_CONFIG";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize telemetry
     telemetry::init_telemetry();
 
-    // Load configuration
-    let config_path = PathBuf::from("config.yaml");
+    let config_path = config_path();
     let config = ConfigLoader::from_file(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("failed to load {}: {e}", config_path.display()))?;
 
-    info!(path = %config_path.display(), "Configuration loaded");
+    info!(
+        path = %config_path.display(),
+        keys = config.keys.len(),
+        upstream = %config.upstream.base_url,
+        "configuration loaded"
+    );
 
-    // Initialize database
-    let db_path = config.database.path.clone();
-    let pool = Arc::new(LedgerPool::new(PathBuf::from(&db_path))?);
-    info!(path = %db_path, "Database initialized");
+    // --- Ledger -------------------------------------------------------------
 
-    // Initialize ledger writer
+    let db_path = PathBuf::from(&config.database.path);
+    let pool = Arc::new(
+        LedgerPool::new(db_path.clone())
+            .map_err(|e| anyhow::anyhow!("failed to open ledger at {}: {e}", db_path.display()))?,
+    );
+
+    // Crash recovery runs before the writer starts and before the listener opens.
+    // Any request that was `in_flight` when the previous process died will never
+    // reach a terminal state on its own, and a record that stays `in_flight`
+    // forever is indistinguishable from a request still running. Recovery resolves
+    // them here, once, so `in_flight` means what it says from the first request on.
+    match pool.write(recover_in_flight) {
+        Ok(report) if report.recovered > 0 => {
+            warn!(
+                recovered = report.recovered,
+                "resolved requests interrupted by a previous shutdown"
+            );
+        }
+        Ok(_) => {}
+        Err(e) => {
+            // Recovery is not best-effort: starting with an unknown set of
+            // orphaned records would silently corrupt every usage view until the
+            // next restart. Refuse to start.
+            return Err(anyhow::anyhow!("crash recovery failed: {e}"));
+        }
+    }
+
     let writer_config = LedgerWriterConfig::from(config.database.clone());
+    info!(
+        queue_size = writer_config.queue_size,
+        batch_size = writer_config.batch_size,
+        batch_timeout_ms = writer_config.batch_timeout_ms,
+        "metering pipeline configured"
+    );
     let ledger = Arc::new(LedgerWriter::new(pool.writer(), writer_config));
 
-    // Initialize hot reloader
-    let snapshot = ConfigSnapshot::new(config.clone());
-    let config_guard = Arc::new(RwLock::new(snapshot));
-    let reloader = HotReloader::new(config_path, config.clone());
+    // --- Configuration hot reload -------------------------------------------
+
+    let reloader = HotReloader::new(config_path.clone(), config.clone());
     reloader.start();
 
-    // Initialize proxy client
-    let client = Arc::new(ProxyClient::new(&config.upstream));
+    // --- Application state --------------------------------------------------
+    //
+    // `handle()` is the lock the watcher swaps. Taking it here is what makes hot
+    // reload observable: constructing a separate RwLock would swap a snapshot the
+    // server never reads, and every request would keep using the startup config.
 
-    // Initialize SSE broadcaster
-    let broadcaster = Arc::new(SseBroadcaster::new(&PathBuf::from(&db_path), 500)?);
+    let client = Arc::new(ProxyClient::new(&config.upstream));
+    let broadcaster = Arc::new(
+        SseBroadcaster::new(&db_path, config.server.sse_poll_interval_ms)
+            .map_err(|e| anyhow::anyhow!("failed to open the dashboard change poller: {e}"))?,
+    );
     broadcaster.start();
 
-    // Build app state
-    let app_state = Arc::new(AppState {
-        config: config_guard.clone(),
+    let shutting_down = Arc::new(AtomicBool::new(false));
+
+    let state = Arc::new(AppState {
+        config: reloader.handle(),
         client,
         ledger: ledger.clone(),
         pool: pool.clone(),
         broadcaster: broadcaster.clone(),
+        shutting_down: shutting_down.clone(),
     });
 
-    // Build router
+    // --- Retention ----------------------------------------------------------
+
+    let (retention_stop_tx, retention_stop_rx) = watch::channel(());
+    spawn_retention(pool.clone(), config.database.clone(), retention_stop_rx);
+
+    // --- Router -------------------------------------------------------------
+    //
+    // Order matters. The proxy and dashboard routes are matched first; `web`
+    // owns only the fallback, so it can serve the embedded SPA without ever
+    // shadowing a 404 from `/v1/*` or `/api/*`.
+
     let app = Router::new()
-        // Admin routes (no auth)
         .merge(create_admin_router())
-        // Dashboard routes (auth required via extractor in handlers)
         .merge(create_dashboard_router())
-        // Proxy routes (auth required)
         .route("/v1/chat/completions", any(proxy_handler))
         .route("/v1/responses", any(proxy_handler))
         .route("/v1/models", any(proxy_handler))
-        .route("/*path", any(catch_all_handler))
-        .route("/api/dashboard/events", get(sse_handler))
-        // Layers
+        .fallback(web::fallback);
+
+    // `cors_allow_origins` is read here and fixed for the process lifetime: it
+    // shapes the router, which is built once. Everything a reload can change is
+    // read per request from the config snapshot instead.
+    let app = match cors_layer(&config.server.cors_allow_origins) {
+        Some(cors) => app.layer(cors),
+        None => app,
+    };
+
+    let app = app
+        .layer(RequestBodyLimitLayer::new(config.server.max_body_size))
+        .layer(TraceLayer::new_for_http())
+        // Outermost, so the credential is marked unrenderable before anything
+        // inside the stack has a chance to log it.
         .layer(SetSensitiveHeadersLayer::new(std::iter::once(
             header::AUTHORIZATION,
         )))
-        .layer(RequestBodyLimitLayer::new(config.server.max_body_size))
-        .layer(TraceLayer::new_for_http())
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
-        .with_state(app_state.clone());
+        .with_state(state.clone());
 
-    // Bind address
-    let addr: SocketAddr = config.server.listen.parse()?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    info!(addr = %addr, "Server starting");
+    // --- Serve --------------------------------------------------------------
 
-    // Run with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let addr: SocketAddr =
+        config.server.listen.parse().map_err(|e| {
+            anyhow::anyhow!("invalid server.listen {:?}: {e}", config.server.listen)
+        })?;
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
 
-    info!("Server shutdown complete");
+    info!(addr = %addr, "listening");
+
+    let grace = if config.server.graceful_shutdown {
+        Duration::from_secs(config.server.shutdown_grace_secs)
+    } else {
+        Duration::ZERO
+    };
+
+    let serve_result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(state.clone(), grace))
+        .await;
+
+    // --- Drain --------------------------------------------------------------
+    //
+    // Reached once the listener has stopped and every in-flight request has
+    // finished. What remains is metering work: queued records and the detached
+    // finalizers written by stream drop guards, which cannot await.
+
+    info!("listener stopped; draining the metering pipeline");
+    retention_stop_tx.send(()).ok();
+    ledger.shutdown().await;
+    info!(
+        committed = ledger.committed_total(),
+        "metering pipeline drained and committed"
+    );
+
+    // Only now is it safe for the database to close. Dropping the pool while the
+    // writer still had queued records would discard accepted usage.
+    drop(state);
+
+    if let Err(e) = serve_result {
+        return Err(anyhow::anyhow!("server error: {e}"));
+    }
+
+    info!("shutdown complete");
     Ok(())
 }
 
-/// SSE handler for realtime dashboard updates
-async fn sse_handler(
-    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
-    Authenticated(consumer): Authenticated,
-) -> impl IntoResponse {
-    partner_portal::dashboard::sse::sse_response(
-        state.broadcaster.clone(),
-        consumer.consumer_id().to_string(),
+/// Configuration path: `PARTNER_PORTAL_CONFIG`, else `config.yaml`.
+fn config_path() -> PathBuf {
+    match std::env::var(CONFIG_ENV) {
+        Ok(path) => PathBuf::from(path),
+        Err(_) => PathBuf::from("config.yaml"),
+    }
+}
+
+/// Build the CORS layer, or `None` when no browser origins are allowed.
+///
+/// An invalid origin is a startup failure rather than a silently dropped entry:
+/// a typo in this list is otherwise discovered as a browser error in production.
+fn cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    if origins.is_empty() {
+        return None;
+    }
+
+    let mut allowed = Vec::with_capacity(origins.len());
+    for origin in origins {
+        match HeaderValue::from_str(origin) {
+            Ok(value) => allowed.push(value),
+            Err(_) => {
+                error!(origin = %origin, "ignoring invalid CORS origin");
+            }
+        }
+    }
+
+    if allowed.is_empty() {
+        return None;
+    }
+
+    info!(count = allowed.len(), "browser origins allowed");
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(allowed))
+            .allow_methods(Any)
+            .allow_headers(Any),
     )
 }
 
-/// Proxy handler for all /v1/* routes
+/// Run retention on a timer for the life of the process.
+///
+/// Deletion runs off the async runtime because it is blocking I/O against
+/// SQLite, and it releases the write lock between slices so a sweep never stalls
+/// the metering pipeline.
+fn spawn_retention(
+    pool: Arc<LedgerPool>,
+    db: partner_portal::config::DatabaseConfig,
+    mut stop_rx: watch::Receiver<()>,
+) {
+    let interval = Duration::from_secs(db.retention_interval_secs.max(60));
+
+    tokio::spawn(async move {
+        loop {
+            let run = tokio::task::spawn_blocking({
+                let pool = pool.clone();
+                let db = db.clone();
+                move || {
+                    retention::run_retention(
+                        &pool.writer(),
+                        db.retention_days,
+                        db.retention_batch_size,
+                        retention::DEFAULT_MAX_BATCHES,
+                    )
+                }
+            });
+
+            match run.await {
+                Ok(Ok(stats)) => {
+                    if stats.total_deleted() > 0 || stats.hit_budget {
+                        retention::report(&stats, db.retention_days);
+                    } else {
+                        tracing::debug!("retention found nothing to delete");
+                    }
+                }
+                Ok(Err(e)) => warn!(error = %e, "retention pass failed; will retry next interval"),
+                Err(e) => warn!(error = %e, "retention task panicked"),
+            }
+
+            tokio::select! {
+                _ = stop_rx.changed() => break,
+                _ = tokio::time::sleep(interval) => {}
+            }
+        }
+    });
+}
+
+/// Resolve when a termination signal arrives, after marking the process
+/// unready and giving the load balancer time to notice.
+async fn shutdown_signal(state: Arc<AppState>, grace: Duration) {
+    let ctrl_c = async {
+        if let Err(e) = signal::ctrl_c().await {
+            error!(error = %e, "failed to listen for Ctrl+C");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => info!("received Ctrl+C"),
+        _ = terminate => info!("received SIGTERM"),
+    }
+
+    // Readiness must fail before anything starts shedding load. An instance that
+    // closes its listener at the same moment its readiness flips produces
+    // connection errors at the balancer; this window is what prevents that.
+    state.shutting_down.store(true, Ordering::Release);
+    info!(
+        grace_secs = grace.as_secs(),
+        "shutting down: readiness now fails, waiting for the balancer to notice"
+    );
+
+    if !grace.is_zero() {
+        tokio::time::sleep(grace).await;
+    }
+}
+
+/// Proxy handler for the `/v1/*` routes.
 async fn proxy_handler(
     axum::extract::State(state): axum::extract::State<Arc<AppState>>,
     Authenticated(consumer): Authenticated,
@@ -137,14 +367,18 @@ async fn proxy_handler(
     let path = request.uri().path().to_string();
     let headers = request.headers().clone();
 
-    // Collect body
-    let body = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
-        Ok(b) => b,
+    // The body is read in full, bounded by `server.max_body_size` which
+    // `RequestBodyLimitLayer` has already enforced. Inference requests are small
+    // JSON documents; the response, which is where the size actually is, is
+    // streamed and never buffered.
+    let limit = state.max_body_size();
+    let body = match axum::body::to_bytes(request.into_body(), limit).await {
+        Ok(body) => body,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to read request body");
+            warn!(error = %e, %path, "failed to read the request body");
             return error_response(
-                StatusCode::BAD_REQUEST,
-                "Failed to read request body",
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Request body could not be read",
                 "invalid_request_error",
             );
         }
@@ -153,12 +387,7 @@ async fn proxy_handler(
     partner_portal::proxy::handler::handle_proxy(state, consumer, method, path, headers, body).await
 }
 
-/// Catch-all handler for unmatched routes
-async fn catch_all_handler() -> Response {
-    error_response(StatusCode::NOT_FOUND, "Not Found", "invalid_request_error")
-}
-
-/// Standard error response
+/// Standard OpenAI-style error response.
 fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
     let body = serde_json::json!({
         "error": {
@@ -167,36 +396,11 @@ fn error_response(status: StatusCode, message: &str, error_type: &str) -> Respon
         }
     });
 
+    let json = serde_json::to_string(&body).unwrap_or_else(|_| r#"{"error":{}}"#.to_string());
+
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(serde_json::to_string(&body).unwrap()))
-        .unwrap()
-}
-
-/// Graceful shutdown signal
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    info!("Shutdown signal received");
+        .body(Body::from(json))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }

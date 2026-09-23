@@ -69,9 +69,15 @@ pub fn extract_stream_chat_completions_usage(chunk: &Value) -> Option<Usage> {
     }
 }
 
-/// Extract usage from a streaming event (Responses API SSE)
+/// Extract usage from a streaming event (Responses API SSE).
+///
+/// The Responses API reports usage in the terminal `response.completed` /
+/// `response.incomplete` event, either at the top level or nested under
+/// `response`. Both shapes occur across providers, so both are accepted.
 pub fn extract_stream_responses_usage(event: &Value) -> Option<Usage> {
-    let usage = event.get("usage")?;
+    let usage = event
+        .get("usage")
+        .or_else(|| event.get("response").and_then(|r| r.get("usage")))?;
 
     let input_tokens = usage
         .get("input_tokens")
@@ -210,6 +216,57 @@ mod tests {
         let usage = extract_stream_responses_usage(&event).unwrap();
         assert_eq!(usage.input_tokens, Some(60));
         assert_eq!(usage.output_tokens, Some(40));
+    }
+
+    #[test]
+    fn test_extract_stream_responses_nested_usage() {
+        // The Responses API wraps the terminal event's payload under `response`.
+        let event = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "usage": { "input_tokens": 12, "output_tokens": 34 }
+            }
+        });
+        let usage = extract_stream_responses_usage(&event).unwrap();
+        assert_eq!(usage.input_tokens, Some(12));
+        assert_eq!(usage.output_tokens, Some(34));
+    }
+
+    #[test]
+    fn test_extract_stream_responses_no_usage_is_none() {
+        let event = json!({"type": "response.output_text.delta", "delta": "hi"});
+        assert!(extract_stream_responses_usage(&event).is_none());
+    }
+
+    #[test]
+    fn test_extract_responses_partial_usage_is_not_fabricated() {
+        // Only input tokens known: output must stay None (Partial), not 0.
+        let body = json!({"usage": {"input_tokens": 9}});
+        let usage = extract_responses_usage(&body);
+        assert_eq!(usage.input_tokens, Some(9));
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.status(), UsageStatus::Partial);
+    }
+
+    #[test]
+    fn test_usage_ignores_non_numeric_values() {
+        // A provider echoing strings must not be coerced into a number.
+        let body = json!({"usage": {"prompt_tokens": "100", "completion_tokens": null}});
+        let usage = extract_chat_completions_usage(&body);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.status(), UsageStatus::Unavailable);
+    }
+
+    #[test]
+    fn test_merge_usage_prefers_incoming_and_keeps_base() {
+        let base = Usage::new(Some(10), None, Some(3));
+        let incoming = Usage::new(None, Some(20), None);
+        let merged = merge_usage(&base, &incoming);
+        assert_eq!(merged.input_tokens, Some(10));
+        assert_eq!(merged.output_tokens, Some(20));
+        assert_eq!(merged.cached_tokens, Some(3));
     }
 
     #[test]

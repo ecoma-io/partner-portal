@@ -37,10 +37,16 @@ impl std::fmt::Display for Endpoint {
     }
 }
 
-/// Request status in the ledger
+/// Request status in the ledger.
+///
+/// `InFlight` is the *accepted* state: the record is durable before the proxy
+/// contacts the upstream, so a crash mid-request leaves a recoverable trace
+/// instead of a silently missing record. Only the three terminal states are
+/// ever rolled up into `usage_hourly`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestStatus {
+    InFlight,
     Completed,
     Failed,
     Interrupted,
@@ -49,9 +55,27 @@ pub enum RequestStatus {
 impl RequestStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
+            RequestStatus::InFlight => "in_flight",
             RequestStatus::Completed => "completed",
             RequestStatus::Failed => "failed",
             RequestStatus::Interrupted => "interrupted",
+        }
+    }
+
+    /// Whether this state is terminal (no further transition is possible).
+    pub fn is_terminal(&self) -> bool {
+        !matches!(self, RequestStatus::InFlight)
+    }
+
+    /// Parse a persisted status string. Unknown values are treated as
+    /// `Interrupted`, the conservative terminal state, rather than silently
+    /// mapping to a success-shaped value.
+    pub fn from_str_lossy(s: &str) -> Self {
+        match s {
+            "in_flight" => RequestStatus::InFlight,
+            "completed" => RequestStatus::Completed,
+            "failed" => RequestStatus::Failed,
+            _ => RequestStatus::Interrupted,
         }
     }
 }
@@ -88,7 +112,7 @@ impl std::fmt::Display for UsageStatus {
 }
 
 /// Token usage information
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
@@ -156,7 +180,7 @@ impl RequestRecord {
             endpoint,
             streaming,
             http_status: None,
-            request_status: RequestStatus::Completed,
+            request_status: RequestStatus::InFlight,
             usage: Usage::default(),
             ttft_ms: None,
             duration_ms: 0,
@@ -180,10 +204,19 @@ impl RequestRecord {
         self.duration_ms = duration_ms;
     }
 
-    /// Mark as interrupted
-    pub fn interrupt(&mut self, duration_ms: u64) {
+    /// Mark as interrupted (client disconnected, upstream stream broke, or the
+    /// process died while the request was in flight).
+    pub fn interrupt(&mut self, reason: &str, duration_ms: u64) {
         self.request_status = RequestStatus::Interrupted;
         self.duration_ms = duration_ms;
+        if self.error_message.is_none() {
+            self.error_message = Some(reason.to_string());
+        }
+    }
+
+    /// Whether this record has already reached a terminal state.
+    pub fn is_terminal(&self) -> bool {
+        self.request_status.is_terminal()
     }
 
     /// Set TTFT for streaming requests
@@ -194,6 +227,11 @@ impl RequestRecord {
     /// Get usage status
     pub fn usage_status(&self) -> UsageStatus {
         self.usage.status()
+    }
+
+    /// Update usage without changing lifecycle state (streaming path).
+    pub fn set_usage(&mut self, usage: Usage) {
+        self.usage = usage;
     }
 }
 
@@ -238,11 +276,61 @@ mod tests {
             true,
         );
 
+        // A freshly accepted request is in flight, not completed.
+        assert_eq!(record.request_status, RequestStatus::InFlight);
+        assert!(!record.is_terminal());
+
         record.complete(200, Usage::new(Some(100), Some(50), None), 1500);
         record.set_ttft(200);
 
         assert_eq!(record.request_status, RequestStatus::Completed);
+        assert!(record.is_terminal());
         assert_eq!(record.http_status, Some(200));
         assert_eq!(record.ttft_ms, Some(200));
+    }
+
+    #[test]
+    fn test_interrupt_preserves_first_reason() {
+        let mut record = RequestRecord::new(
+            "req-9".to_string(),
+            "c".to_string(),
+            "m".to_string(),
+            Endpoint::Responses,
+            true,
+        );
+        record.interrupt("client disconnected", 400);
+        record.interrupt("second reason", 500);
+        assert_eq!(record.request_status, RequestStatus::Interrupted);
+        assert_eq!(
+            record.error_message.as_deref(),
+            Some("client disconnected"),
+            "the first (root cause) reason must not be overwritten"
+        );
+        assert_eq!(record.duration_ms, 500);
+    }
+
+    #[test]
+    fn test_all_statuses_round_trip_as_str() {
+        for status in [
+            RequestStatus::InFlight,
+            RequestStatus::Completed,
+            RequestStatus::Failed,
+            RequestStatus::Interrupted,
+        ] {
+            assert_eq!(RequestStatus::from_str_lossy(status.as_str()), status);
+        }
+    }
+
+    #[test]
+    fn test_unknown_status_reads_as_interrupted_not_completed() {
+        // A status written by a newer schema must not be mistaken for success.
+        assert_eq!(
+            RequestStatus::from_str_lossy("weird"),
+            RequestStatus::Interrupted
+        );
+        assert_eq!(
+            RequestStatus::from_str_lossy(""),
+            RequestStatus::Interrupted
+        );
     }
 }

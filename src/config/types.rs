@@ -102,13 +102,42 @@ pub struct ServerConfig {
     #[serde(default = "default_listen_addr")]
     pub listen: String,
 
-    /// Enable graceful shutdown on SIGTERM
+    /// Wait for in-flight requests to finish on SIGTERM.
+    ///
+    /// This controls only whether the listener waits for work already accepted.
+    /// Draining the metering pipeline is not optional and happens either way —
+    /// there is no setting that lets a shutdown drop committed-but-unwritten
+    /// usage.
     #[serde(default = "default_true")]
     pub graceful_shutdown: bool,
+
+    /// How long readiness keeps failing before the listener stops accepting.
+    ///
+    /// A load balancer learns that an instance is leaving by polling readiness,
+    /// which takes at least one poll interval. Closing the listener at the same
+    /// instant readiness flips produces connection errors at the balancer;
+    /// waiting this long lets it stop sending first. Too short is a visible
+    /// error, so it errs on the generous side.
+    #[serde(default = "default_shutdown_grace_secs")]
+    pub shutdown_grace_secs: u64,
 
     /// Maximum request body size in bytes (default: 10MB)
     #[serde(default = "default_max_body_size")]
     pub max_body_size: usize,
+
+    /// Origins allowed to call this server from a browser.
+    ///
+    /// Empty means no CORS headers at all, which is correct for the intended
+    /// deployment: server-side clients and the dashboard's own same-origin UI.
+    /// Listing origins is an explicit opt-in for browser callers, and it stays
+    /// an allow-list because this proxy holds an upstream credential — a
+    /// wildcard would let any page on the internet use it.
+    #[serde(default)]
+    pub cors_allow_origins: Vec<String>,
+
+    /// How often the dashboard's SSE poller checks SQLite for changes.
+    #[serde(default = "default_sse_poll_interval_ms")]
+    pub sse_poll_interval_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -116,7 +145,10 @@ impl Default for ServerConfig {
         Self {
             listen: default_listen_addr(),
             graceful_shutdown: default_true(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
             max_body_size: default_max_body_size(),
+            cors_allow_origins: Vec::new(),
+            sse_poll_interval_ms: default_sse_poll_interval_ms(),
         }
     }
 }
@@ -127,9 +159,15 @@ fn default_listen_addr() -> String {
 fn default_true() -> bool {
     true
 }
+fn default_shutdown_grace_secs() -> u64 {
+    5
+}
 fn default_max_body_size() -> usize {
     10 * 1024 * 1024
 } // 10MB
+fn default_sse_poll_interval_ms() -> u64 {
+    500
+}
 
 /// Database configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +191,19 @@ pub struct DatabaseConfig {
     /// Batch timeout in milliseconds
     #[serde(default = "default_batch_timeout_ms")]
     pub batch_timeout_ms: u64,
+
+    /// How often retention runs, in seconds.
+    #[serde(default = "default_retention_interval_secs")]
+    pub retention_interval_secs: u64,
+
+    /// Rows deleted per retention slice.
+    ///
+    /// Retention is sliced so the write lock is released between slices. A single
+    /// `DELETE` over 60 days of records would hold the ledger's write lock for its
+    /// whole duration, and every request accepted during that window would wait
+    /// on the metering queue instead of being served.
+    #[serde(default = "default_retention_batch_size")]
+    pub retention_batch_size: usize,
 }
 
 impl Default for DatabaseConfig {
@@ -163,6 +214,8 @@ impl Default for DatabaseConfig {
             queue_size: default_queue_size(),
             batch_size: default_batch_size(),
             batch_timeout_ms: default_batch_timeout_ms(),
+            retention_interval_secs: default_retention_interval_secs(),
+            retention_batch_size: default_retention_batch_size(),
         }
     }
 }
@@ -181,6 +234,12 @@ fn default_batch_size() -> usize {
 }
 fn default_batch_timeout_ms() -> u64 {
     1000
+}
+fn default_retention_interval_secs() -> u64 {
+    3600
+}
+fn default_retention_batch_size() -> usize {
+    2_000
 }
 
 #[cfg(test)]

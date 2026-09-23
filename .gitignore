@@ -2,8 +2,8 @@
 /target/
 **/*.rs.bk
 
-# Dependencies
-Cargo.lock
+# Note: Cargo.lock is intentionally committed. This is a deployable binary,
+# not a library, so the lockfile is what makes a release reproducible.
 
 # IDE
 .idea/
