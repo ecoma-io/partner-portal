@@ -1,0 +1,22 @@
+# Dashboard-local pnpm settings.
+#
+# `install` refuses to run dependency build scripts unless a package is approved,
+# and — this is the part that bites — it *fails the install* rather than skipping
+# them quietly. A clean install therefore fails with ERR_PNPM_IGNORED_BUILDS in CI
+# and in the image build, where there is no interactive `pnpm approve-builds` to
+# answer and no developer's stored approvals to inherit.
+#
+# Exactly two packages are approved, and both need it:
+#
+#   esbuild   its postinstall links the platform-specific binary; without it Vite
+#             cannot build at all.
+#   vue-demi  its postinstall picks the Vue major it compiles against, so an
+#             unapproved install can silently target the wrong one.
+#
+# An allow-list rather than `dangerouslyAllowAllBuilds`: this way a new transitive
+# dependency cannot start running arbitrary scripts on a developer machine or in
+# CI without someone adding it here and saying why.
+
+allowBuilds:
+  esbuild: true
+  vue-demi: true

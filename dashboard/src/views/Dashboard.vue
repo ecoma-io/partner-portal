@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { onMounted, watch } from 'vue'
+import { computed, onMounted, onUnmounted, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { useDashboardStore } from '@/stores/dashboard'
 
 const store = useDashboardStore()
-const { summary, timeseries, requests, loading, error, range, model, sseConnected, hasMore } = storeToRefs(store)
+const { summary, timeseries, requests, loading, error, range, model, streamState, hasMore } =
+  storeToRefs(store)
 
 const models = ['gpt-4', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo']
 
@@ -16,26 +17,60 @@ const rangeOptions = [
   { value: '30d', label: 'Last 30 days' },
 ]
 
+/** Label and styling for the invalidation stream's current state. */
+const streamBadge = computed(() => {
+  switch (streamState.value) {
+    case 'live':
+      return { className: 'live', text: '● Live', title: 'Connected; the view refreshes on change' }
+    case 'connecting':
+      return { className: 'pending', text: '○ Connecting', title: 'Opening the invalidation stream' }
+    case 'retrying':
+      return { className: 'pending', text: '○ Reconnecting', title: 'The stream dropped; retrying with backoff' }
+    case 'unauthenticated':
+      return {
+        className: 'unauthenticated',
+        text: '⊘ Not authenticated',
+        title: 'The stream needs the same API key as the API; without one it will not retry',
+      }
+    default:
+      return { className: 'idle', text: '○ Disconnected', title: 'The invalidation stream is closed' }
+  }
+})
+
 onMounted(async () => {
   await store.fetchMe()
   await store.refresh()
-  store.connectSSE()
+  store.connect()
+})
+
+onUnmounted(() => {
+  store.disconnect()
 })
 
 watch([range, model], () => {
   store.refresh()
 })
 
-function formatNumber(n: number | null): string {
-  if (n === null) return '—'
+/**
+ * Render a count, or "—" when it is unknown. A missing value is never shown as
+ * zero: in this product an absent number means the provider did not report it.
+ */
+function formatNumber(n: number | null | undefined): string {
+  if (n === null || n === undefined) return '—'
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
   return n.toLocaleString()
 }
 
-function formatDuration(ms: number): string {
+function formatDuration(ms: number | null | undefined): string {
+  if (ms === null || ms === undefined) return '—'
   if (ms < 1000) return `${ms}ms`
   return `${(ms / 1000).toFixed(2)}s`
+}
+
+function formatPercent(rate: number | null | undefined): string {
+  if (rate === null || rate === undefined) return '—'
+  return `${(rate * 100).toFixed(1)}%`
 }
 
 function formatDate(iso: string): string {
@@ -66,8 +101,9 @@ async function loadMore() {
     <header class="header">
       <div class="header-left">
         <h1>Partner Portal</h1>
-        <span v-if="sseConnected" class="sse-badge connected">● Live</span>
-        <span v-else class="sse-badge disconnected">○ Disconnected</span>
+        <span :class="['sse-badge', streamBadge.className]" :title="streamBadge.title">
+          {{ streamBadge.text }}
+        </span>
       </div>
       <div class="header-filters">
         <select v-model="range">
@@ -92,26 +128,37 @@ async function loadMore() {
     <section class="summary">
       <div class="card summary-card">
         <div class="summary-label">Requests</div>
-        <div class="summary-value">{{ formatNumber(summary?.total_requests ?? 0) }}</div>
+        <div class="summary-value">{{ formatNumber(summary?.total_requests) }}</div>
         <div class="summary-sub">
-          <span :style="{ color: 'var(--success)' }">{{ ((summary?.success_rate ?? 0) * 100).toFixed(1) }}%</span> success
+          <span :style="{ color: 'var(--success)' }">{{ formatNumber(summary?.success_count) }}</span> succeeded
+          <template v-if="summary && summary.failure_count > 0">
+            · <span :style="{ color: 'var(--error)' }">{{ formatNumber(summary.failure_count) }}</span> failed
+          </template>
+        </div>
+        <div class="summary-sub">{{ formatPercent(summary?.success_rate) }} success rate</div>
+        <!--
+          A count of requests, not a token total: the provider never reported
+          usage for them, so there are no tokens to add. Never rendered as 0.
+        -->
+        <div v-if="summary && summary.unavailable_usage_count > 0" class="summary-sub unavailable">
+          {{ formatNumber(summary.unavailable_usage_count) }} usage unavailable
         </div>
       </div>
       <div class="card summary-card">
         <div class="summary-label">Input Tokens</div>
-        <div class="summary-value">{{ formatNumber(summary?.total_input_tokens ?? 0) }}</div>
-        <div v-if="summary?.total_cached_tokens" class="summary-sub">
+        <div class="summary-value">{{ formatNumber(summary?.total_input_tokens) }}</div>
+        <div v-if="summary" class="summary-sub">
           <span style="color: var(--accent)">{{ formatNumber(summary.total_cached_tokens) }}</span> cached
         </div>
       </div>
       <div class="card summary-card">
         <div class="summary-label">Output Tokens</div>
-        <div class="summary-value">{{ formatNumber(summary?.total_output_tokens ?? 0) }}</div>
+        <div class="summary-value">{{ formatNumber(summary?.total_output_tokens) }}</div>
       </div>
       <div class="card summary-card">
         <div class="summary-label">Avg Latency</div>
-        <div class="summary-value">{{ formatDuration(summary?.avg_latency_ms ?? 0) }}</div>
-        <div v-if="summary?.avg_ttft_ms" class="summary-sub">
+        <div class="summary-value">{{ formatDuration(summary?.avg_latency_ms) }}</div>
+        <div v-if="summary && summary.avg_ttft_ms !== null" class="summary-sub">
           TTFT: {{ formatDuration(summary.avg_ttft_ms) }}
         </div>
       </div>
@@ -126,7 +173,7 @@ async function loadMore() {
           :key="point.hour"
           class="timeseries-bar"
           :style="{ height: `${(point.requests / Math.max(...timeseries.map(t => t.requests), 1)) * 100}%` }"
-          :title="`${point.hour}: ${point.requests} requests`"
+          :title="`${point.hour}: ${point.requests} requests, ${point.failure_count} failed`"
         ></div>
       </div>
     </section>
@@ -157,16 +204,39 @@ async function loadMore() {
               <span v-if="req.streaming" class="badge streaming">streaming</span>
             </td>
             <td class="status">
-              <span :style="{ color: statusColor(req.request_status) }">
+              <span
+                :style="{ color: statusColor(req.request_status) }"
+                :title="req.error_message ?? undefined"
+              >
                 {{ req.http_status ?? '—' }} {{ req.request_status }}
               </span>
             </td>
             <td class="tokens">
-              <span v-if="req.input_tokens || req.output_tokens">
+              <!--
+                Absence is shown as "—", never as 0. A token count of 0 that the
+                provider actually reported still renders as "0".
+              -->
+              <span v-if="req.input_tokens !== null || req.output_tokens !== null">
                 {{ formatNumber(req.input_tokens) }} / {{ formatNumber(req.output_tokens) }}
-                <span v-if="req.cached_tokens" class="cached">(+{{ formatNumber(req.cached_tokens) }} cached)</span>
+                <span v-if="req.cached_tokens !== null && req.cached_tokens > 0" class="cached">
+                  (+{{ formatNumber(req.cached_tokens) }} cached)
+                </span>
               </span>
               <span v-else class="muted">—</span>
+              <span
+                v-if="req.usage_status === 'unavailable'"
+                class="usage-flag"
+                title="The provider reported no usage for this request; its tokens are unknown, not zero"
+              >
+                usage unavailable
+              </span>
+              <span
+                v-else-if="req.usage_status === 'partial'"
+                class="usage-flag"
+                title="The provider reported only part of this request's usage; the missing part is unknown, not zero"
+              >
+                usage partial
+              </span>
             </td>
             <td class="duration">{{ formatDuration(req.duration_ms) }}</td>
           </tr>
@@ -212,12 +282,22 @@ async function loadMore() {
   border-radius: 0.25rem;
 }
 
-.sse-badge.connected {
+.sse-badge.live {
   background: rgba(34, 197, 94, 0.1);
   color: var(--success);
 }
 
-.sse-badge.disconnected {
+.sse-badge.pending {
+  background: rgba(234, 179, 8, 0.1);
+  color: var(--warning);
+}
+
+.sse-badge.unauthenticated {
+  background: rgba(234, 179, 8, 0.1);
+  color: var(--warning);
+}
+
+.sse-badge.idle {
   background: rgba(239, 68, 68, 0.1);
   color: var(--error);
 }
@@ -348,6 +428,16 @@ async function loadMore() {
 .cached {
   color: var(--accent);
   font-size: 0.75rem;
+}
+
+.usage-flag {
+  display: block;
+  color: var(--warning);
+  font-size: 0.75rem;
+}
+
+.summary-sub.unavailable {
+  color: var(--warning);
 }
 
 .muted {
