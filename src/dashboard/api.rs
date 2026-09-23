@@ -22,6 +22,7 @@ use axum::{
     routing::get,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use time::Duration;
 
@@ -43,6 +44,23 @@ pub fn create_api_router() -> Router<Arc<AppState>> {
 const DEFAULT_LIMIT: usize = 50;
 /// Hard ceiling on page size, so one request cannot pull the whole ledger.
 const MAX_LIMIT: usize = 200;
+
+/// Output length of SHA-256, and therefore of the cursor's HMAC.
+const SHA256_OUTPUT: usize = 32;
+/// Input block size of SHA-256, used to pad the HMAC key.
+const SHA256_BLOCK: usize = 64;
+/// Separator between the signature and the payload of a cursor.
+///
+/// `.` is not in the URL-safe base64 alphabet, so it cannot occur inside either
+/// half and splitting on it is unambiguous.
+const CURSOR_SEPARATOR: char = '.';
+/// Separator between the timestamp and the row id *inside* the signed payload.
+///
+/// Chosen because it cannot occur in either part: ISO 8601 timestamps contain
+/// `:` and `-`, so a colon-separated payload would split inside the timestamp.
+const PAYLOAD_SEPARATOR: char = '|';
+/// URL-safe base64 alphabet (RFC 4648 §5), unpadded.
+const B64_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 /// Query parameters shared by the dashboard endpoints.
 #[derive(Debug, Deserialize)]
@@ -204,8 +222,13 @@ pub struct SummaryResponse {
     pub avg_ttft_ms: Option<f64>,
     /// Fraction of requests that reached `completed`, 0.0..=1.0.
     pub success_rate: f64,
-    /// Requests whose provider reported no usage; their tokens are excluded from
-    /// the totals above rather than counted as zero.
+    /// Requests whose provider reported **no** usage at all
+    /// (`usage_status = 'unavailable'`). Their tokens are absent from the totals
+    /// above rather than counted as zero.
+    ///
+    /// This is a count of requests, not tokens. Requests with `partial` usage
+    /// are not included: the part the provider did report is in the totals
+    /// above, and only the part it did not report is absent.
     pub unavailable_usage_count: u64,
 }
 
@@ -286,6 +309,12 @@ async fn get_summary(
 
     // Count of requests in the window whose usage the provider never reported.
     // Read from the raw ledger, where the distinction between NULL and 0 lives.
+    //
+    // The predicate is exactly `usage_status = 'unavailable'`, matching what the
+    // field documents. `partial` rows are deliberately excluded: their reported
+    // tokens *are* in the totals above, so counting them here would claim those
+    // tokens were left out. In-flight rows are excluded because they have no
+    // terminal state yet, and recovery resolves them either way.
     let pool = state.pool.clone();
     let consumer_id = consumer.consumer_id().to_string();
     let window_start = window.start_ts.clone();
@@ -299,7 +328,7 @@ async fn get_summary(
                   AND created_at >= ?2
                   AND created_at < ?3
                   AND (?4 IS NULL OR model = ?4)
-                  AND usage_status <> 'available'
+                  AND usage_status = 'unavailable'
                   AND request_status <> 'in_flight'
                 "#,
                 rusqlite::params![consumer_id, window_start, window_end, model],
@@ -427,15 +456,17 @@ async fn get_requests(
     let model = model_filter(&query).map(|m| m.to_string());
     let status = status_filter(&query);
     let consumer_id = consumer.consumer_id().to_string();
+    let pool = state.pool.clone();
 
-    // Parse the cursor before touching the database so a malformed one is a
-    // clean 400 rather than an empty page.
+    // Cursors are signed with the per-database key: an unsigned or edited one is
+    // rejected with a 400 rather than silently treated as a first page, and a
+    // key that cannot be read fails the request rather than ending the paging
+    // early, which the caller could only read as "no more data".
+    let key = signing_key(&pool)?;
     let cursor = match query.cursor.as_deref() {
-        Some(raw) => Some(parse_cursor(raw)?),
+        Some(raw) => Some(verify_cursor(&key, raw)?),
         None => None,
     };
-
-    let pool = state.pool.clone();
 
     let response = tokio::task::spawn_blocking(move || {
         pool.read(|conn| {
@@ -488,7 +519,7 @@ async fn get_requests(
                 items.truncate(limit);
                 items
                     .last()
-                    .map(|(id, item)| format_cursor(&item.created_at, *id))
+                    .map(|(id, item)| sign_cursor(&key, &item.created_at, *id))
             } else {
                 None
             };
@@ -567,27 +598,168 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<(i64, RequestItem)> {
     ))
 }
 
-/// Separator between timestamp and row id in a cursor.
-///
-/// Chosen because it cannot occur in either part: ISO 8601 timestamps contain
-/// `:` and `-`, so a colon-separated cursor would split inside the timestamp.
-const CURSOR_SEPARATOR: char = '|';
-
-fn format_cursor(created_at: &str, id: i64) -> String {
-    format!("{created_at}{CURSOR_SEPARATOR}{id}")
+fn malformed_cursor() -> DashboardError {
+    DashboardError::BadRequest("malformed cursor".into())
 }
 
-fn parse_cursor(raw: &str) -> Result<(String, i64), DashboardError> {
-    let (created_at, id) = raw
-        .rsplit_once(CURSOR_SEPARATOR)
-        .ok_or_else(|| DashboardError::BadRequest("malformed cursor".into()))?;
-    let id: i64 = id
-        .parse()
-        .map_err(|_| DashboardError::BadRequest("malformed cursor".into()))?;
+/// Read the per-database cursor signing key.
+///
+/// The key lives in `ledger_meta` so it is generated once and shared by every
+/// instance reading that database. A failure here is reported as a server error
+/// rather than worked around: signing with a substitute key would produce
+/// cursors this server cannot verify, and omitting `next_cursor` would make a
+/// truncated page look like the end of the data.
+fn signing_key(pool: &crate::ledger::LedgerPool) -> Result<Vec<u8>, DashboardError> {
+    pool.read(crate::ledger::cursor_key)
+        .map_err(|e| DashboardError::Internal(format!("cursor signing key unavailable: {e}")))
+}
+
+/// Build a cursor for the row a page ended on.
+///
+/// The cursor is `base64url(HMAC-SHA256(key, payload)) || "." || base64url(payload)`
+/// where the payload is `"<created_at>|<id>"`. Both halves are *unpadded*
+/// URL-safe base64 (alphabet `A-Z a-z 0-9 - _`, no `=` padding), so every
+/// character of a cursor is unreserved and a cursor never needs escaping in a
+/// query string.
+///
+/// The signature is what makes the cursor tamper-evident: the row id is a
+/// global `AUTOINCREMENT`, so a readable payload would let a partner estimate
+/// portal-wide request volume from an id it was handed. Signing does not widen
+/// or narrow access — the query is still scoped by the authenticated key — it
+/// only stops a cursor from being read as a number or edited.
+fn sign_cursor(key: &[u8], created_at: &str, id: i64) -> String {
+    let payload = format!("{created_at}{PAYLOAD_SEPARATOR}{id}");
+    let signature = hmac_sha256(key, payload.as_bytes());
+    format!(
+        "{}{CURSOR_SEPARATOR}{}",
+        base64url_encode(&signature),
+        base64url_encode(payload.as_bytes())
+    )
+}
+
+/// Verify and decode a cursor.
+///
+/// A cursor whose signature does not verify is a client error (400), never a
+/// silent fall-back to the first page: quietly ignoring it would turn a paging
+/// bug into what looks like missing data, and would make an edited cursor look
+/// accepted.
+fn verify_cursor(key: &[u8], raw: &str) -> Result<(String, i64), DashboardError> {
+    let (signature_b64, payload_b64) = raw
+        .split_once(CURSOR_SEPARATOR)
+        .ok_or_else(malformed_cursor)?;
+    let signature = base64url_decode(signature_b64).ok_or_else(malformed_cursor)?;
+    let payload = base64url_decode(payload_b64).ok_or_else(malformed_cursor)?;
+
+    let expected = hmac_sha256(key, &payload);
+    if !constant_time_eq(&signature, &expected) {
+        return Err(DashboardError::BadRequest(
+            "cursor signature does not verify".into(),
+        ));
+    }
+
+    // The payload is authentic past this point; these checks only guard against
+    // a cursor that is internally inconsistent.
+    let payload = String::from_utf8(payload).map_err(|_| malformed_cursor())?;
+    let (created_at, id) = payload
+        .rsplit_once(PAYLOAD_SEPARATOR)
+        .ok_or_else(malformed_cursor)?;
+    let id: i64 = id.parse().map_err(|_| malformed_cursor())?;
     if created_at.is_empty() {
-        return Err(DashboardError::BadRequest("malformed cursor".into()));
+        return Err(malformed_cursor());
     }
     Ok((created_at.to_string(), id))
+}
+
+/// HMAC-SHA256 (RFC 2104).
+///
+/// Written out rather than pulled from an `hmac` crate: `sha2` is already a
+/// dependency and the construction is the two padded hashes below (the
+/// `SHA256_BLOCK` test anchors it against the RFC 4231 vectors).
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; SHA256_OUTPUT] {
+    // A key longer than the block size is hashed down first; anything shorter is
+    // zero-padded to it.
+    let mut block = [0u8; SHA256_BLOCK];
+    if key.len() > SHA256_BLOCK {
+        block[..SHA256_OUTPUT].copy_from_slice(&Sha256::digest(key)[..]);
+    } else {
+        block[..key.len()].copy_from_slice(key);
+    }
+
+    let mut inner = Sha256::new();
+    inner.update(block.map(|b| b ^ 0x36));
+    inner.update(message);
+    let inner = inner.finalize();
+
+    let mut outer = Sha256::new();
+    outer.update(block.map(|b| b ^ 0x5c));
+    outer.update(inner);
+    let mut mac = [0u8; SHA256_OUTPUT];
+    mac.copy_from_slice(&outer.finalize());
+    mac
+}
+
+/// Compare two byte strings without an early exit, so a forger learns nothing
+/// from how far the comparison got.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Encode bytes as unpadded URL-safe base64.
+///
+/// Hand-written on purpose: it is a dozen readable lines, the alphabet is the
+/// whole format, and the alternative is a dependency for one function.
+fn base64url_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        // Read the group as one 24-bit big-endian number, zero-padded on the
+        // right; a group of 1 or 2 bytes then simply emits fewer sextets.
+        let mut padded = [0u8; 3];
+        padded[..chunk.len()].copy_from_slice(chunk);
+        let n = u32::from_be_bytes([0, padded[0], padded[1], padded[2]]);
+
+        for (index, shift) in [18u32, 12, 6, 0].into_iter().enumerate() {
+            if index < chunk.len() + 1 {
+                out.push(B64_ALPHABET[((n >> shift) & 0b11_1111) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+/// Decode unpadded URL-safe base64.
+///
+/// Returns `None` for anything that is not a canonical encoding: a stray `=`,
+/// a character outside the alphabet, a length that cannot carry whole bytes, or
+/// a final sextet with non-zero padding bits.
+fn base64url_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 2);
+    let mut accumulator: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for byte in text.bytes() {
+        let value = B64_ALPHABET.iter().position(|&a| a == byte)? as u32;
+        accumulator = (accumulator << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((accumulator >> bits) as u8);
+        }
+    }
+
+    // At most 4 leftover bits are meaningful; 6 or more means the last character
+    // contributed no byte at all, which no encoder produces. Whatever is left
+    // must be zero, or the encoding is non-canonical.
+    if bits >= 6 || (accumulator & ((1 << bits) - 1)) != 0 {
+        return None;
+    }
+    Some(out)
 }
 
 /// Dashboard error.
@@ -647,25 +819,255 @@ mod tests {
         }
     }
 
+    /// A fixed key, so the tests do not depend on a database.
+    const TEST_KEY: &[u8] = b"cursor-test-key";
+    /// A second key, standing in for another database's.
+    const OTHER_KEY: &[u8] = b"another-database-key";
+
     #[test]
     fn test_cursor_round_trip() {
         // Regression: a colon-separated cursor split inside the ISO timestamp,
         // because timestamps themselves contain colons.
         let created = "2026-09-24T07:12:33.123456789Z";
-        let cursor = format_cursor(created, 4242);
-        let (parsed_created, parsed_id) = parse_cursor(&cursor).unwrap();
+        let cursor = sign_cursor(TEST_KEY, created, 4242);
+        let (parsed_created, parsed_id) = verify_cursor(TEST_KEY, &cursor).unwrap();
         assert_eq!(parsed_created, created);
         assert_eq!(parsed_id, 4242);
     }
 
     #[test]
+    fn test_cursor_is_url_safe() {
+        // A cursor travels in a query string; anything that needs escaping there
+        // is a bug even when the signature is valid.
+        let cursor = sign_cursor(TEST_KEY, "2026-09-24T07:12:33.123456789Z", 4242);
+        assert!(
+            cursor
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.'),
+            "cursor {cursor:?} must contain only unreserved characters"
+        );
+    }
+
+    #[test]
+    fn test_cursor_payload_is_not_readable() {
+        // The row id is a global AUTOINCREMENT: an id a partner can read is an
+        // id the partner can use to size portal-wide traffic.
+        let created = "2026-09-24T07:12:33.123456789Z";
+        let cursor = sign_cursor(TEST_KEY, created, 987654);
+        assert!(
+            !cursor.contains(created),
+            "the timestamp must not appear in the clear"
+        );
+        assert!(
+            !cursor.contains("987654"),
+            "the row id must not appear in the clear"
+        );
+    }
+
+    #[test]
     fn test_cursor_rejects_malformed_input() {
-        for bad in ["", "no-separator", "2026-09-24T07:12:33Z|notanumber", "|5"] {
+        for bad in [
+            "",
+            "no-separator",
+            "2026-09-24T07:12:33Z|notanumber",
+            "|5",
+            "garbage",
+            // A padded encoding is not what `sign_cursor` emits.
+            "Zm9vYmFy==",
+            ".",
+            "AAAA.",
+        ] {
             assert!(
-                parse_cursor(bad).is_err(),
+                verify_cursor(TEST_KEY, bad).is_err(),
                 "{bad:?} must be rejected as a malformed cursor"
             );
         }
+    }
+
+    #[test]
+    fn test_unsigned_legacy_cursor_is_rejected() {
+        // The pre-signing cursor format was the payload in the clear. It must be
+        // refused, not honoured, or the signature would be optional.
+        let legacy = "2026-09-24T07:12:33.123456789Z|4242";
+        assert!(verify_cursor(TEST_KEY, legacy).is_err());
+    }
+
+    #[test]
+    fn test_cursor_rejects_tampered_payload() {
+        let created = "2026-09-24T07:12:33.123456789Z";
+        let cursor = sign_cursor(TEST_KEY, created, 4242);
+        let (signature, _) = cursor.split_once(CURSOR_SEPARATOR).unwrap();
+
+        // Keep the genuine signature, swap in a payload claiming a far larger
+        // id: the forgery must not verify.
+        let forged_payload = base64url_encode(format!("{created}|9999999999").as_bytes());
+        let forged = format!("{signature}{CURSOR_SEPARATOR}{forged_payload}");
+        let err = verify_cursor(TEST_KEY, &forged).unwrap_err();
+        assert!(
+            matches!(err, DashboardError::BadRequest(_)),
+            "a tampered payload must be a client error"
+        );
+    }
+
+    #[test]
+    fn test_cursor_rejects_tampered_signature() {
+        let cursor = sign_cursor(TEST_KEY, "2026-09-24T07:12:33.123456789Z", 4242);
+        let (signature, payload) = cursor.split_once(CURSOR_SEPARATOR).unwrap();
+
+        // Flip one character of the signature to another alphabet character, so
+        // the encoding stays valid and only the signature is wrong.
+        let mut flipped = String::from(signature);
+        let first = flipped.remove(0);
+        flipped.insert(0, if first == 'A' { 'B' } else { 'A' });
+        assert!(verify_cursor(TEST_KEY, &format!("{flipped}{CURSOR_SEPARATOR}{payload}")).is_err());
+    }
+
+    #[test]
+    fn test_cursor_from_a_different_key_is_rejected() {
+        let created = "2026-09-24T07:12:33.123456789Z";
+        let cursor = sign_cursor(TEST_KEY, created, 4242);
+        // Same payload, key this database does not have.
+        let err = verify_cursor(OTHER_KEY, &cursor).unwrap_err();
+        assert!(
+            matches!(err, DashboardError::BadRequest(_)),
+            "a cursor signed with another key must not verify"
+        );
+    }
+
+    #[test]
+    fn test_bad_cursor_is_a_client_error_not_a_server_error() {
+        // 400, not 500 — and never a silent page-1 fall-back, which would read
+        // as data loss.
+        let response = verify_cursor(TEST_KEY, "garbage")
+            .unwrap_err()
+            .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn test_base64url_matches_rfc4648_vectors() {
+        for (raw, encoded) in [
+            ("", ""),
+            ("f", "Zg"),
+            ("fo", "Zm8"),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg"),
+            ("fooba", "Zm9vYmE"),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64url_encode(raw.as_bytes()), encoded);
+            assert_eq!(base64url_decode(encoded).unwrap(), raw.as_bytes());
+        }
+
+        // The two characters that distinguish the URL-safe alphabet from the
+        // standard one: 0xfb 0xff 0xbf encodes to "-_-_" here, "+/+/" there.
+        let bytes = [0xfb, 0xff, 0xbf];
+        assert_eq!(base64url_encode(&bytes), "-_-_");
+    }
+
+    #[test]
+    fn test_base64url_round_trips_every_byte_value() {
+        let all: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(base64url_decode(&base64url_encode(&all)).unwrap(), all);
+
+        // Every length modulo 3, so the shortened final group is covered too.
+        for len in 0..=all.len() {
+            let slice = &all[..len];
+            assert_eq!(
+                base64url_decode(&base64url_encode(slice)).unwrap(),
+                slice,
+                "round trip failed at length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_base64url_rejects_non_canonical_input() {
+        for bad in [
+            // Padding is never emitted, so it is never accepted.
+            "=", "Zg=", "Zm9v=", "Zg==", "Zm9vYg==",
+            // A length that cannot carry a whole byte, or characters outside
+            // the alphabet (including the standard-alphabet `+` and `/`).
+            "a", "!!!!", "Zm9v\n", "Zm+v", "Zm/v",
+            // Non-zero padding bits: "Zh" and "ab" encode the same bytes as
+            // "Zg" and "aa", which is what a canonical encoder emits.
+            "Zh", "ab", "abd",
+        ] {
+            assert!(
+                base64url_decode(bad).is_none(),
+                "{bad:?} must not decode as unpadded URL-safe base64"
+            );
+        }
+
+        // The canonical spellings of the same bytes do decode, so the rejections
+        // above are about canonical form rather than the length alone.
+        assert_eq!(base64url_decode("Zg").unwrap(), b"f");
+        assert_eq!(base64url_decode("abc").unwrap(), b"i\xb7");
+    }
+
+    #[test]
+    fn test_hmac_sha256_matches_rfc4231_vectors() {
+        // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?".
+        assert_eq!(
+            hex::encode(hmac_sha256(b"Jefe", b"what do ya want for nothing?")),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+
+        // RFC 4231 test case 1, which also exercises a key of exactly the block
+        // size and the case below it.
+        assert_eq!(
+            hex::encode(hmac_sha256(&[0x0b; 20], b"Hi There")),
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
+
+        // RFC 4231 test case 6: a key longer than the block size, which must be
+        // hashed down first.
+        assert_eq!(
+            hex::encode(hmac_sha256(
+                &[0xaa; 131],
+                b"Test Using Larger Than Block-Size Key - Hash Key First"
+            )),
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54"
+        );
+    }
+
+    #[test]
+    fn test_cursor_key_is_stable_for_one_database_and_unique_per_database() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        crate::ledger::configure_sqlite(&conn).unwrap();
+        crate::ledger::init_schema(&conn).unwrap();
+
+        let key = crate::ledger::cursor_key(&conn).unwrap();
+        assert_eq!(key.len(), 32, "the cursor key is 32 random bytes");
+
+        let cursor = sign_cursor(&key, "2026-09-24T07:12:33.123456789Z", 7);
+        assert_eq!(verify_cursor(&key, &cursor).unwrap().1, 7);
+
+        // The key is stored, not regenerated: a cursor issued before a restart
+        // must still verify after one.
+        let reopened = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(crate::ledger::cursor_key(&reopened).unwrap(), key);
+
+        // A different database signs with a different key.
+        let other = rusqlite::Connection::open(dir.path().join("other.db")).unwrap();
+        crate::ledger::init_schema(&other).unwrap();
+        let other_key = crate::ledger::cursor_key(&other).unwrap();
+        assert_ne!(other_key, key);
+        assert!(verify_cursor(&other_key, &cursor).is_err());
+    }
+
+    /// The signing key is a secret: it must not be derivable from a cursor, and
+    /// two databases must not share one.
+    #[test]
+    fn test_distinct_keys_produce_distinct_signatures() {
+        let created = "2026-09-24T07:12:33.123456789Z";
+        assert_ne!(
+            sign_cursor(TEST_KEY, created, 1),
+            sign_cursor(OTHER_KEY, created, 1)
+        );
     }
 
     #[test]

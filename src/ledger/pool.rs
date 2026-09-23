@@ -2,7 +2,7 @@
 //!
 //! Single-writer, multiple-reader model with proper WAL configuration.
 
-use crate::ledger::{configure_sqlite, init_schema};
+use crate::ledger::{SchemaError, configure_sqlite, init_schema};
 use parking_lot::Mutex;
 use rusqlite::Connection;
 use std::path::PathBuf;
@@ -15,8 +15,15 @@ pub struct LedgerPool {
 }
 
 impl LedgerPool {
-    /// Create a new ledger pool at the given path
-    pub fn new(path: PathBuf) -> Result<Self, rusqlite::Error> {
+    /// Create a new ledger pool at the given path.
+    ///
+    /// Returns [`SchemaError`] rather than a bare `rusqlite::Error`, because
+    /// bringing the file up to the expected schema can also fail for reasons that
+    /// are not SQLite errors — most importantly a database written by a *newer*
+    /// build, which must be refused rather than relabelled. Those reasons must
+    /// reach the caller intact or an operator sees "the ledger did not open"
+    /// with no way to tell a corrupt file from a rollback.
+    pub fn new(path: PathBuf) -> Result<Self, SchemaError> {
         let conn = Connection::open(&path)?;
         configure_sqlite(&conn)?;
         init_schema(&conn)?;

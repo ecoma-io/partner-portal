@@ -21,7 +21,19 @@ impl Endpoint {
         }
     }
 
+    /// Classify a request target, tolerating a query string.
+    ///
+    /// The caller hands over `uri().path_and_query()` so the query is forwarded
+    /// to the upstream verbatim, which means the string arriving here may be
+    /// `/v1/chat/completions?beta=true`. Comparing the whole target against three
+    /// exact paths would answer every such request 404 — never forwarded, never
+    /// metered — so the query is stripped before matching. Only the path is
+    /// classified; the query stays request data, and is never read as identity.
     pub fn from_path(path: &str) -> Option<Self> {
+        let path = match path.find(['?', '#']) {
+            Some(cut) => &path[..cut],
+            None => path,
+        };
         match path {
             "/v1/chat/completions" => Some(Endpoint::ChatCompletions),
             "/v1/responses" => Some(Endpoint::Responses),
@@ -154,6 +166,14 @@ pub struct RequestRecord {
     pub consumer_id: String,
     pub model: String,
     pub endpoint: Endpoint,
+    /// Whether the response was actually streamed to the client.
+    ///
+    /// Set from the request's `stream` flag at accept, and corrected at finalize
+    /// to what really happened: a request that asked to stream but whose upstream
+    /// answered with a plain JSON body was not served as a stream, and a request
+    /// that did not ask but whose upstream answered `text/event-stream` was. The
+    /// hourly rollup buckets by this column, so `streaming = true` must mean
+    /// "there is a stream", not "there was a request for one".
     pub streaming: bool,
     pub http_status: Option<u16>,
     pub request_status: RequestStatus,
@@ -264,6 +284,31 @@ mod tests {
         );
         assert_eq!(Endpoint::from_path("/v1/models"), Some(Endpoint::Models));
         assert_eq!(Endpoint::from_path("/v1/unknown"), None);
+
+        // The caller passes `path_and_query`, so a query must not make a known
+        // endpoint unknown — that would turn a forwarded request into a 404.
+        assert_eq!(
+            Endpoint::from_path("/v1/chat/completions?beta=true"),
+            Some(Endpoint::ChatCompletions)
+        );
+        assert_eq!(
+            Endpoint::from_path("/v1/models?x=1"),
+            Some(Endpoint::Models)
+        );
+        assert_eq!(
+            Endpoint::from_path("/v1/responses?stream=true&trace=1"),
+            Some(Endpoint::Responses)
+        );
+        // A fragment is not sent by a client, but stripping it keeps the
+        // classification honest for any caller that hands over a full URI.
+        assert_eq!(
+            Endpoint::from_path("/v1/models#frag"),
+            Some(Endpoint::Models)
+        );
+        // An unknown path stays unknown, with or without a query.
+        assert_eq!(Endpoint::from_path("/v1/embeddings?x=1"), None);
+        // A prefix match on a longer path must not sneak through.
+        assert_eq!(Endpoint::from_path("/v1/chat/completions/x"), None);
     }
 
     #[test]

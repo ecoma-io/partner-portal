@@ -5,9 +5,15 @@
 -- transaction as its raw row (BEGIN -> raw -> rollup -> COMMIT).
 --
 -- Lifecycle: a request is INSERTed as 'in_flight' before the upstream is
--- contacted, then UPSERTed to a terminal state. A row still in 'in_flight' at
--- startup is a request whose process died mid-flight and is recovered to
--- 'interrupted' (see recovery.rs). Only terminal states are rolled up.
+-- contacted, then moved to a terminal state. A row still in 'in_flight' whose
+-- owning instance is gone is recovered to 'interrupted' (see recovery.rs). Only
+-- terminal states are ever rolled up.
+--
+-- Every statement here is additive and idempotent (`CREATE ... IF NOT EXISTS`,
+-- `INSERT OR IGNORE`), because this file is executed against both a fresh
+-- database and an existing one. Statements that cannot be idempotent in SQL —
+-- adding a column to a table that may already exist — live in `init_schema`,
+-- which applies them only when the recorded version says they are missing.
 
 CREATE TABLE IF NOT EXISTS usage_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -19,6 +25,11 @@ CREATE TABLE IF NOT EXISTS usage_records (
     streaming INTEGER NOT NULL DEFAULT 0,
     http_status INTEGER,
     request_status TEXT NOT NULL,
+    -- Owning instance, recorded so that recovery can tell "stranded by a dead
+    -- process" from "still running in a live one" (same-VPS rolling update).
+    -- NULL means the row predates instance ownership; those rows are only
+    -- recoverable once they are old enough to rule out a live owner.
+    instance_id TEXT,
     input_tokens INTEGER,
     output_tokens INTEGER,
     cached_tokens INTEGER,
@@ -37,18 +48,21 @@ CREATE TABLE IF NOT EXISTS usage_records (
     CHECK (cached_tokens IS NULL OR cached_tokens >= 0)
 );
 
--- Startup recovery scan: find rows left in flight by a dead process.
-CREATE INDEX IF NOT EXISTS idx_usage_records_in_flight
-    ON usage_records(request_status) WHERE request_status = 'in_flight';
-
--- Retention sweep: delete oldest rows by time.
 CREATE INDEX IF NOT EXISTS idx_usage_records_created_at ON usage_records(created_at);
 
--- Dashboard keyset pagination and per-consumer range scans. Ordering is
--- (created_at DESC, id DESC), so the index carries id to keep the sort
--- index-only and avoid a filesort.
 CREATE INDEX IF NOT EXISTS idx_usage_records_consumer_created_id
     ON usage_records(consumer_id, created_at, id);
+
+-- Registrations of running instances. A row here means "this instance booted
+-- against this database"; liveness is decided by the lock file named in
+-- `instance.rs`, not by this table, so a crashed instance leaves a row behind
+-- that the next recovery sweeps away.
+CREATE TABLE IF NOT EXISTS ledger_instances (
+    instance_id TEXT PRIMARY KEY,
+    booted_at TEXT NOT NULL,
+    pid INTEGER,
+    host TEXT
+);
 
 -- Hourly aggregates for efficient dashboard queries
 CREATE TABLE IF NOT EXISTS usage_hourly (
@@ -76,13 +90,23 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
 CREATE INDEX IF NOT EXISTS idx_usage_hourly_hour ON usage_hourly(hour);
 CREATE INDEX IF NOT EXISTS idx_usage_hourly_consumer_hour ON usage_hourly(consumer_id, hour);
 
--- Metadata table for tracking schema version and maintenance
+-- Metadata table for tracking schema version and maintenance.
+--
+-- `schema_version` is deliberately NOT seeded here. `init_schema` reads whatever
+-- is stored, compares it against the version it supports, and writes the new
+-- value only after the migration has actually been applied — so a database
+-- created by an older build can never be relabelled as current.
 CREATE TABLE IF NOT EXISTS ledger_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
 
+-- Signing key for opaque dashboard pagination cursors. Generated once per
+-- database, so it survives a rolling update (both instances must accept the
+-- other's cursors) and is never any process's configuration secret.
+INSERT OR IGNORE INTO ledger_meta (key, value)
+    VALUES ('cursor_key', hex(randomblob(32)));
+
 INSERT OR IGNORE INTO ledger_meta (key, value) VALUES
-    ('schema_version', '2'),
     ('last_retention_run', ''),
     ('last_recovery_run', '');

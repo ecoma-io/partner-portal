@@ -1,7 +1,9 @@
 //! Hot-reload mechanism with atomic config swaps
 
+use super::types::REDACTED;
 use crate::config::{Config, ConfigLoader};
 use parking_lot::RwLock;
+use std::fmt::Display;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -146,53 +148,220 @@ fn short(hash: &str) -> &str {
 /// difference between "I edited a key's display name" and "I repointed the
 /// upstream" is the difference between a no-op and every subsequent request
 /// changing destination. Secret values are never logged, only whether they moved.
+///
+/// The two classes below are reported differently and on purpose. A field the
+/// running process reads from the snapshot is in force from the next request on.
+/// A field that was captured when the process started is *not* in force, no
+/// matter what the file now says — and an operator who is not told so will
+/// believe a value the process is ignoring, which is the failure this whole
+/// path exists to avoid. Those are warnings, one per field. Which class a field
+/// belongs to is not a matter of taste: it follows from where the process reads
+/// it (src/main.rs, src/proxy/handler.rs, src/ledger/writer.rs).
 fn report_changes(old: &Config, new: &Config) {
+    report_live_changes(old, new);
+    report_restart_required_changes(old, new);
+}
+
+/// Fields the running process re-reads from the live snapshot.
+fn report_live_changes(old: &Config, new: &Config) {
     if old.upstream.base_url != new.upstream.base_url {
-        info!(
-            old = %old.upstream.base_url,
-            new = %new.upstream.base_url,
-            "upstream base_url changed"
+        applied(
+            "upstream.base_url",
+            &old.upstream.base_url,
+            &new.upstream.base_url,
         );
     }
     if old.upstream.api_key != new.upstream.api_key {
-        info!("upstream api_key changed");
+        // That the credential moved is the operational fact; its value is not.
+        applied("upstream.api_key", REDACTED, REDACTED);
     }
-    if old.upstream.timeout_secs != new.upstream.timeout_secs
-        || old.upstream.connect_timeout_secs != new.upstream.connect_timeout_secs
-    {
-        info!(
-            timeout_secs = new.upstream.timeout_secs,
-            connect_timeout_secs = new.upstream.connect_timeout_secs,
-            "upstream timeouts changed"
+    if old.upstream.timeout_secs != new.upstream.timeout_secs {
+        applied(
+            "upstream.timeout_secs",
+            old.upstream.timeout_secs,
+            new.upstream.timeout_secs,
         );
     }
 
+    report_key_changes(old, new);
+
+    if old.server.max_body_size != new.server.max_body_size {
+        // Half live, and saying so is the point: the per-request read follows
+        // the snapshot, but the layer that rejects an oversized body at the
+        // edge is built from the startup value, so a raise is capped by it.
+        warn!(
+            field = "server.max_body_size",
+            old = old.server.max_body_size,
+            new = new.server.max_body_size,
+            "partly applied on reload: a smaller limit takes effect now, a larger one is still capped by the body-limit layer built at startup"
+        );
+    }
+}
+
+/// Fields whose value was captured when the process started.
+fn report_restart_required_changes(old: &Config, new: &Config) {
+    if old.server.listen != new.server.listen {
+        needs_restart("server.listen", &old.server.listen, &new.server.listen);
+    }
+    if old.server.graceful_shutdown != new.server.graceful_shutdown {
+        needs_restart(
+            "server.graceful_shutdown",
+            old.server.graceful_shutdown,
+            new.server.graceful_shutdown,
+        );
+    }
+    if old.server.shutdown_grace_secs != new.server.shutdown_grace_secs {
+        needs_restart(
+            "server.shutdown_grace_secs",
+            old.server.shutdown_grace_secs,
+            new.server.shutdown_grace_secs,
+        );
+    }
+    if old.server.cors_allow_origins != new.server.cors_allow_origins {
+        needs_restart(
+            "server.cors_allow_origins",
+            old.server.cors_allow_origins.join(","),
+            new.server.cors_allow_origins.join(","),
+        );
+    }
+    if old.server.sse_poll_interval_ms != new.server.sse_poll_interval_ms {
+        needs_restart(
+            "server.sse_poll_interval_ms",
+            old.server.sse_poll_interval_ms,
+            new.server.sse_poll_interval_ms,
+        );
+    }
+    if old.upstream.connect_timeout_secs != new.upstream.connect_timeout_secs {
+        needs_restart(
+            "upstream.connect_timeout_secs",
+            old.upstream.connect_timeout_secs,
+            new.upstream.connect_timeout_secs,
+        );
+    }
+
+    if old.database.path != new.database.path {
+        needs_restart("database.path", &old.database.path, &new.database.path);
+    }
+    if old.database.retention_days != new.database.retention_days {
+        // The one field whose answer is not a flat no: the dashboard resolves a
+        // query window against the live snapshot, while the sweep that deletes
+        // rows runs on the interval cloned at startup.
+        warn!(
+            field = "database.retention_days",
+            old = old.database.retention_days,
+            new = new.database.retention_days,
+            "partly applied on reload: the dashboard's window validation follows the new value, the retention sweep keeps the startup value until restart"
+        );
+    }
+    if old.database.queue_size != new.database.queue_size {
+        needs_restart(
+            "database.queue_size",
+            old.database.queue_size,
+            new.database.queue_size,
+        );
+    }
+    if old.database.batch_size != new.database.batch_size {
+        needs_restart(
+            "database.batch_size",
+            old.database.batch_size,
+            new.database.batch_size,
+        );
+    }
+    if old.database.batch_timeout_ms != new.database.batch_timeout_ms {
+        needs_restart(
+            "database.batch_timeout_ms",
+            old.database.batch_timeout_ms,
+            new.database.batch_timeout_ms,
+        );
+    }
+    if old.database.retention_interval_secs != new.database.retention_interval_secs {
+        needs_restart(
+            "database.retention_interval_secs",
+            old.database.retention_interval_secs,
+            new.database.retention_interval_secs,
+        );
+    }
+    if old.database.retention_batch_size != new.database.retention_batch_size {
+        needs_restart(
+            "database.retention_batch_size",
+            old.database.retention_batch_size,
+            new.database.retention_batch_size,
+        );
+    }
+}
+
+/// Report the key set by position, never by value.
+///
+/// A local key value is a credential: which entry changed is operational
+/// information, what it changed to is not. The set follows the snapshot per
+/// request, so every line here is a live change.
+fn report_key_changes(old: &Config, new: &Config) {
     if old.keys.len() != new.keys.len() {
         info!(
+            field = "keys",
             old = old.keys.len(),
             new = new.keys.len(),
-            "key set changed"
+            "applied on reload: the key set changed size"
         );
-    } else {
-        let changed = old
-            .keys
-            .iter()
-            .zip(new.keys.iter())
-            .filter(|(a, b)| a.key != b.key || a.consumer_id() != b.consumer_id())
-            .count();
-        if changed > 0 {
-            info!(count = changed, "credential or consumer identity changed");
-        }
     }
 
-    if old.server.max_body_size != new.server.max_body_size
-        || old.server.shutdown_grace_secs != new.server.shutdown_grace_secs
-    {
-        // Worth calling out: these are read when the listener is built or when a
-        // request arrives, so the new value takes effect without a restart only
-        // where the reading path re-reads the snapshot.
-        info!("server limits changed");
+    for (index, (a, b)) in old.keys.iter().zip(new.keys.iter()).enumerate() {
+        if a.key != b.key {
+            info!(
+                field = "keys[].key",
+                index, "applied on reload: credential replaced (value not logged)"
+            );
+        }
+        if a.name != b.name {
+            applied_indexed("keys[].name", index, &a.name, &b.name);
+        }
+        if a.consumer_id() != b.consumer_id() {
+            applied_indexed(
+                "keys[].consumer_id",
+                index,
+                a.consumer_id(),
+                b.consumer_id(),
+            );
+        }
+        if a.metadata != b.metadata {
+            info!(
+                field = "keys[].metadata",
+                index, "applied on reload: metadata changed (values not logged)"
+            );
+        }
     }
+}
+
+/// A field the running process reads from the live snapshot.
+fn applied(field: &str, old: impl Display, new: impl Display) {
+    info!(
+        field,
+        old = %old,
+        new = %new,
+        "applied on reload: configuration field changed"
+    );
+}
+
+/// As [`applied`], for a field belonging to one entry of a list.
+fn applied_indexed(field: &str, index: usize, old: impl Display, new: impl Display) {
+    info!(
+        field,
+        index,
+        old = %old,
+        new = %new,
+        "applied on reload: configuration field changed"
+    );
+}
+
+/// A field whose value was captured at startup: the running process keeps the
+/// old one, so the change is reported as *not* in force rather than as a reload.
+fn needs_restart(field: &str, old: impl Display, new: impl Display) {
+    warn!(
+        field,
+        old = %old,
+        new = %new,
+        "configuration field changed but is NOT in force until restart"
+    );
 }
 
 impl Drop for HotReloader {
@@ -283,5 +452,243 @@ keys:
         assert_eq!(current.hash, initial_hash);
 
         reloader.stop();
+    }
+
+    /// Collects what a report wrote, so a test can assert on the lines rather
+    /// than on a human reading the journal.
+    #[derive(Clone, Default)]
+    struct LogCapture(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogCapture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `report_changes` with the log captured, returning everything it wrote.
+    fn capture_report(old: &Config, new: &Config) -> String {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer({
+                    let capture = capture.clone();
+                    move || capture.clone()
+                }),
+        );
+
+        tracing::subscriber::with_default(subscriber, || report_changes(old, new));
+
+        String::from_utf8(capture.0.lock().clone()).unwrap()
+    }
+
+    fn config_from(yaml: &str) -> Config {
+        ConfigLoader::parse_yaml(yaml).unwrap()
+    }
+
+    /// Every field is reported. The bug: a field with no branch at all gets a
+    /// config swap and no log line, so an operator editing it reasonably
+    /// believes the new value is in force while the process keeps the old one.
+    #[test]
+    fn test_every_changed_field_is_reported() {
+        const BASE: &str = r#"
+server:
+  listen: "0.0.0.0:8080"
+  graceful_shutdown: true
+  shutdown_grace_secs: 5
+  max_body_size: 10485760
+  cors_allow_origins: []
+  sse_poll_interval_ms: 500
+upstream:
+  base_url: https://api.openai.com
+  api_key: sk-test
+  timeout_secs: 120
+  connect_timeout_secs: 10
+keys:
+  - key: test-key
+    name: Test
+database:
+  path: "./partner-portal.db"
+  retention_days: 60
+  queue_size: 10000
+  batch_size: 100
+  batch_timeout_ms: 1000
+  retention_interval_secs: 3600
+  retention_batch_size: 2000
+"#;
+
+        // Each replacement carries its field name, so it can only match the
+        // field it names: a bare scalar would also rewrite every other field
+        // holding the same digits.
+        let changes = [
+            (
+                "server.listen",
+                "listen: \"0.0.0.0:8080\"",
+                "listen: \"0.0.0.0:9090\"",
+            ),
+            (
+                "server.graceful_shutdown",
+                "graceful_shutdown: true",
+                "graceful_shutdown: false",
+            ),
+            (
+                "server.shutdown_grace_secs",
+                "shutdown_grace_secs: 5",
+                "shutdown_grace_secs: 7",
+            ),
+            (
+                "server.max_body_size",
+                "max_body_size: 10485760",
+                "max_body_size: 1048576",
+            ),
+            (
+                "server.sse_poll_interval_ms",
+                "sse_poll_interval_ms: 500",
+                "sse_poll_interval_ms: 1000",
+            ),
+            (
+                "upstream.base_url",
+                "base_url: https://api.openai.com",
+                "base_url: https://other.example",
+            ),
+            (
+                "upstream.api_key",
+                "api_key: sk-test",
+                "api_key: sk-changed",
+            ),
+            (
+                "upstream.timeout_secs",
+                "timeout_secs: 120",
+                "timeout_secs: 30",
+            ),
+            (
+                "upstream.connect_timeout_secs",
+                "connect_timeout_secs: 10",
+                "connect_timeout_secs: 3",
+            ),
+            ("keys[].key", "key: test-key", "key: test-key-2"),
+            ("keys[].name", "name: Test", "name: Renamed"),
+            (
+                "database.path",
+                "path: \"./partner-portal.db\"",
+                "path: \"./other.db\"",
+            ),
+            (
+                "database.retention_days",
+                "retention_days: 60",
+                "retention_days: 30",
+            ),
+            (
+                "database.queue_size",
+                "queue_size: 10000",
+                "queue_size: 500",
+            ),
+            ("database.batch_size", "batch_size: 100", "batch_size: 50"),
+            (
+                "database.batch_timeout_ms",
+                "batch_timeout_ms: 1000",
+                "batch_timeout_ms: 2000",
+            ),
+            (
+                "database.retention_interval_secs",
+                "retention_interval_secs: 3600",
+                "retention_interval_secs: 600",
+            ),
+            (
+                "database.retention_batch_size",
+                "retention_batch_size: 2000",
+                "retention_batch_size: 100",
+            ),
+        ];
+
+        // `cors_allow_origins` is covered separately: it is a list, so the
+        // change is an insert rather than a scalar substitution.
+        let old = config_from(BASE);
+        let with_cors = config_from(&BASE.replace(
+            "  cors_allow_origins: []",
+            "  cors_allow_origins:\n    - \"https://partners.example.com\"",
+        ));
+        let rendered = capture_report(&old, &with_cors);
+        assert!(
+            rendered.contains("server.cors_allow_origins"),
+            "a change to server.cors_allow_origins must be reported:\n{rendered}"
+        );
+
+        for (field, from, to) in changes {
+            let new = config_from(&BASE.replace(from, to));
+            assert_ne!(
+                old.hash(),
+                new.hash(),
+                "the {field} case does not change the config, so it tests nothing"
+            );
+
+            let rendered = capture_report(&old, &new);
+            assert!(
+                rendered.contains(&format!("field=\"{field}\"")),
+                "a change to {field} must be reported by name:\n{rendered}"
+            );
+        }
+    }
+
+    /// A field captured at startup must say so, loudly. Silence, or an "applied"
+    /// line, would tell the operator to expect a value the process is ignoring.
+    #[test]
+    fn test_restart_required_fields_warn_that_they_are_not_in_force() {
+        const BASE: &str = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: test-key\n    name: Test\ndatabase:\n  batch_size: 100\n";
+        let old = config_from(BASE);
+        let new = config_from(&BASE.replace("batch_size: 100", "batch_size: 50"));
+
+        let rendered = capture_report(&old, &new);
+        assert!(rendered.contains("WARN"), "{rendered}");
+        assert!(
+            rendered.contains("field=\"database.batch_size\""),
+            "the warning must name the field:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("NOT in force until restart"),
+            "the warning must say the new value is not in force:\n{rendered}"
+        );
+    }
+
+    /// The hard contract for this path: the report must never carry a
+    /// credential, whether it moved or not.
+    #[test]
+    fn test_report_never_logs_a_credential() {
+        const SECRET_LOCAL: &str = "pp-local-do-not-log";
+        const SECRET_UPSTREAM: &str = "sk-upstream-do-not-log";
+
+        let old = config_from(&format!(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: {SECRET_UPSTREAM}\nkeys:\n  - key: {SECRET_LOCAL}\n    name: Test\n"
+        ));
+        let new = config_from(
+            "upstream:\n  base_url: https://other.example\n  api_key: sk-rotated-do-not-log\nkeys:\n  - key: pp-rotated-do-not-log\n    name: Test\n",
+        );
+
+        let rendered = capture_report(&old, &new);
+        for secret in [
+            SECRET_LOCAL,
+            SECRET_UPSTREAM,
+            "sk-rotated-do-not-log",
+            "pp-rotated-do-not-log",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "the report rendered a credential ({secret}):\n{rendered}"
+            );
+        }
+        // The change itself must still be reported: a silent rotation is worse
+        // than a redacted one.
+        assert!(
+            rendered.contains("field=\"upstream.api_key\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("field=\"keys[].key\""), "{rendered}");
+        assert!(rendered.contains(REDACTED), "{rendered}");
     }
 }

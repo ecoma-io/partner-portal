@@ -11,7 +11,7 @@ publish = false
 
 [dependencies]
 # Async runtime
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
@@ -52,6 +52,12 @@ http-body = "1.1.0"
 async-stream = "0.3.6"
 http = "1.5.0"
 
+# Advisory file locking for the instance-liveness probe (see
+# `src/ledger/instance.rs`). Unix-only: the probe degrades to a time-based
+# decision elsewhere, and so does the platform support for this product.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.20"
 criterion = "0.6"
@@ -60,6 +66,9 @@ tokio-test = "0.4"
 wiremock = "0.6"
 pretty_assertions = "1.4"
 fastrand = "2.3"
+# The integration/fault suites drive the real binary as a child process: signals
+# to kill it mid-request, and a process-wide view of the ledger it leaves behind.
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
@@ -69,3 +78,10 @@ codegen-units = 1
 [[bin]]
 name = "partner-portal"
 path = "src/main.rs"
+
+# The metering benchmarks drive the real LedgerWriter, so they need their own
+# `main` (criterion's `criterion_main!` is not used: the suite also prints a
+# p50/p95/p99 commit-ack latency table, which criterion's harness cannot emit).
+[[bench]]
+name = "ledger_write"
+harness = false

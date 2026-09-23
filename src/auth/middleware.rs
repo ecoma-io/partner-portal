@@ -186,6 +186,35 @@ mod tests {
         ));
     }
 
+    /// The hard contract on this surface: a rejection never renders the
+    /// credential it was shown, on either the `Debug` or the response path.
+    /// This is where a credential enters the process, so a variant that started
+    /// carrying the token would fail here.
+    #[tokio::test]
+    async fn test_rejections_never_render_the_presented_credential() {
+        const SECRET: &str = "super-secret-key";
+
+        // A credential offered under the wrong scheme is rejected *with* the
+        // credential in hand — the case where an echo would be reachable.
+        let parts = parts_with_auth(Some(&format!("Basic {SECRET}")));
+        let err = extract_bearer_token(&parts).unwrap_err();
+        assert!(
+            !format!("{err:?}").contains(SECRET),
+            "Debug rendered the presented credential: {err:?}"
+        );
+
+        // And what a client sees, which is also what any proxy log of the
+        // response would carry.
+        let response = AuthError::InvalidKey.into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        let rendered =
+            String::from_utf8_lossy(&axum::body::to_bytes(body, 64 * 1024).await.unwrap())
+                .into_owned();
+        assert!(!rendered.contains(SECRET), "{rendered}");
+        assert!(rendered.contains("Invalid API key"), "{rendered}");
+    }
+
     #[test]
     fn test_auth_error_never_leaks_the_credential() {
         let response = AuthError::InvalidKey.into_response();

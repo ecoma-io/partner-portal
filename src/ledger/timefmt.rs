@@ -44,6 +44,32 @@ pub fn format_hour(ts: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "1970-01-01T00".to_string())
 }
 
+/// Derive the hour bucket from a `created_at` value already stored in the
+/// database.
+///
+/// The rollup has to name the bucket a row was *actually* written into, which
+/// means working from the stored string rather than from a freshly parsed
+/// instant. The canonical form is fixed-width, so its first 13 bytes are the
+/// hour and a byte slice is exact — but only for that form. A row written by an
+/// older build, or by anything else sharing the file, could hold any ISO 8601
+/// spelling, and `substr(created_at, 1, 13)` would then quietly produce a
+/// nonsense bucket name that the retraction would fail to find. So the fast path
+/// is guarded by the shape of the string, and anything else is parsed.
+pub fn format_hour_str(stored: &str) -> String {
+    let canonical = stored.len() >= 20
+        && stored.as_bytes()[4] == b'-'
+        && stored.as_bytes()[7] == b'-'
+        && stored.as_bytes()[10] == b'T';
+
+    if canonical && let Some(hour) = stored.get(..13) {
+        return hour.to_string();
+    }
+
+    parse_ts(stored)
+        .map(format_hour)
+        .unwrap_or_else(|| stored.chars().take(13).collect())
+}
+
 /// Current time, truncated to whole microseconds.
 ///
 /// `OffsetDateTime::now_utc()` carries nanosecond precision that differs between

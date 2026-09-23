@@ -51,17 +51,36 @@ pub fn extract_responses_usage(body: &Value) -> Usage {
     }
 }
 
-/// Extract usage from a streaming chunk (Chat Completions SSE)
-pub fn extract_stream_chat_completions_usage(chunk: &Value) -> Option<Usage> {
-    let usage = chunk.get("usage")?;
+/// The places a streaming event may report usage, in the order they are tried.
+///
+/// Both the top level and `response.usage` occur across providers, so both are
+/// candidates for either endpoint. Only objects are yielded: an absent, `null`
+/// or non-object value falls through to the next candidate rather than
+/// short-circuiting it — a provider that emits `"usage": null` at the top level
+/// alongside the real numbers nested under `response` must still be metered.
+fn stream_usage_objects(event: &Value) -> impl Iterator<Item = &serde_json::Map<String, Value>> {
+    [
+        event.get("usage"),
+        event
+            .get("response")
+            .and_then(|response| response.get("usage")),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(Value::as_object)
+}
 
-    let input_tokens = usage.get("prompt_tokens").and_then(|v| v.as_u64());
-    let output_tokens = usage.get("completion_tokens").and_then(|v| v.as_u64());
-    let cached_tokens = usage
-        .get("prompt_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64());
-
+/// A usage object counts as observed only when at least one token count is a
+/// number.
+///
+/// An object that carries nothing usable — empty, or all values non-numeric —
+/// is not evidence and yields `None`, so it can neither be recorded as a real
+/// count nor replace one already recovered (invariant 3).
+fn observed_usage(
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_tokens: Option<u64>,
+) -> Option<Usage> {
     if input_tokens.is_some() || output_tokens.is_some() || cached_tokens.is_some() {
         Some(Usage::new(input_tokens, output_tokens, cached_tokens))
     } else {
@@ -69,34 +88,47 @@ pub fn extract_stream_chat_completions_usage(chunk: &Value) -> Option<Usage> {
     }
 }
 
+/// Extract usage from a streaming chunk (Chat Completions SSE).
+///
+/// Chat Completions reports usage in the final chunk at the top level; some
+/// OpenAI-compatible providers wrap the same object under `response`, so both
+/// shapes are tried. A candidate is skipped unless it carries a usable count.
+pub fn extract_stream_chat_completions_usage(chunk: &Value) -> Option<Usage> {
+    stream_usage_objects(chunk).find_map(|usage| {
+        observed_usage(
+            usage.get("prompt_tokens").and_then(Value::as_u64),
+            usage.get("completion_tokens").and_then(Value::as_u64),
+            usage
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+        )
+    })
+}
+
 /// Extract usage from a streaming event (Responses API SSE).
 ///
 /// The Responses API reports usage in the terminal `response.completed` /
 /// `response.incomplete` event, either at the top level or nested under
-/// `response`. Both shapes occur across providers, so both are accepted.
+/// `response`. Both shapes occur across providers, so both are accepted; a
+/// candidate that yields no usable count falls through to the next one.
 pub fn extract_stream_responses_usage(event: &Value) -> Option<Usage> {
-    let usage = event
-        .get("usage")
-        .or_else(|| event.get("response").and_then(|r| r.get("usage")))?;
-
-    let input_tokens = usage
-        .get("input_tokens")
-        .or_else(|| usage.get("prompt_tokens"))
-        .and_then(|v| v.as_u64());
-    let output_tokens = usage
-        .get("output_tokens")
-        .or_else(|| usage.get("completion_tokens"))
-        .and_then(|v| v.as_u64());
-    let cached_tokens = usage
-        .get("input_tokens_details")
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64());
-
-    if input_tokens.is_some() || output_tokens.is_some() || cached_tokens.is_some() {
-        Some(Usage::new(input_tokens, output_tokens, cached_tokens))
-    } else {
-        None
-    }
+    stream_usage_objects(event).find_map(|usage| {
+        observed_usage(
+            usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .and_then(Value::as_u64),
+            usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+                .and_then(Value::as_u64),
+            usage
+                .get("input_tokens_details")
+                .and_then(|details| details.get("cached_tokens"))
+                .and_then(Value::as_u64),
+        )
+    })
 }
 
 /// Extract model from a chat completions request
@@ -231,6 +263,106 @@ mod tests {
         let usage = extract_stream_responses_usage(&event).unwrap();
         assert_eq!(usage.input_tokens, Some(12));
         assert_eq!(usage.output_tokens, Some(34));
+    }
+
+    #[test]
+    fn test_extract_stream_responses_null_usage_does_not_mask_nested() {
+        // A present-but-null top-level key must fall through to the nested
+        // shape, not short-circuit it into `None`.
+        let event = json!({
+            "type": "response.completed",
+            "usage": null,
+            "response": {
+                "usage": { "input_tokens": 40, "output_tokens": 11 }
+            }
+        });
+        let usage =
+            extract_stream_responses_usage(&event).expect("nested usage must still be read");
+        assert_eq!(usage.input_tokens, Some(40));
+        assert_eq!(usage.output_tokens, Some(11));
+    }
+
+    #[test]
+    fn test_extract_stream_responses_non_object_usage_falls_through() {
+        // Same for any non-object: a string, an array, a number.
+        for masked in [json!("n/a"), json!([]), json!(0)] {
+            let event = json!({
+                "type": "response.completed",
+                "usage": masked,
+                "response": {
+                    "usage": { "input_tokens": 7, "output_tokens": 3 }
+                }
+            });
+            let usage = extract_stream_responses_usage(&event)
+                .expect("a non-object usage must not mask the nested one");
+            assert_eq!(usage.input_tokens, Some(7));
+            assert_eq!(usage.output_tokens, Some(3));
+        }
+    }
+
+    #[test]
+    fn test_extract_stream_responses_empty_usage_falls_through() {
+        // An object with nothing usable is not evidence either: fall through.
+        let event = json!({
+            "type": "response.completed",
+            "usage": {},
+            "response": {
+                "usage": { "input_tokens": 21, "output_tokens": 5 }
+            }
+        });
+        let usage = extract_stream_responses_usage(&event).expect("empty usage must fall through");
+        assert_eq!(usage.input_tokens, Some(21));
+        assert_eq!(usage.output_tokens, Some(5));
+    }
+
+    #[test]
+    fn test_extract_stream_chat_nested_usage() {
+        // Chat Completions normally reports usage at the top level, but the
+        // wrapped shape occurs too and must not be missed.
+        let chunk = json!({
+            "id": "chatcmpl-123",
+            "choices": [],
+            "response": {
+                "usage": { "prompt_tokens": 30, "completion_tokens": 12 }
+            }
+        });
+        let usage =
+            extract_stream_chat_completions_usage(&chunk).expect("nested usage must be read");
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn test_extract_stream_chat_null_usage_does_not_mask_nested() {
+        let chunk = json!({
+            "id": "chatcmpl-123",
+            "choices": [],
+            "usage": null,
+            "response": {
+                "usage": { "prompt_tokens": 30, "completion_tokens": 12 }
+            }
+        });
+        let usage = extract_stream_chat_completions_usage(&chunk)
+            .expect("null usage must not mask the nested one");
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn test_extract_stream_usage_with_no_usable_count_is_none() {
+        // Nothing usable at any level: `None`, so the caller keeps whatever it
+        // already had instead of overwriting it with nothing.
+        for masked in [
+            json!(null),
+            json!({}),
+            json!("none"),
+            json!({"prompt_tokens": "many"}),
+        ] {
+            let chat_event = json!({ "choices": [], "usage": masked });
+            assert!(extract_stream_chat_completions_usage(&chat_event).is_none());
+            let responses_event = json!({ "type": "response.completed", "usage": masked });
+            assert!(extract_stream_responses_usage(&responses_event).is_none());
+        }
     }
 
     #[test]

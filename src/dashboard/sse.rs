@@ -34,8 +34,8 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::broadcast;
-use tracing::{error, warn};
+use tokio::sync::{broadcast, watch};
+use tracing::{debug, error, warn};
 
 use crate::auth::Authenticated;
 use crate::proxy::handler::AppState;
@@ -53,6 +53,15 @@ pub struct SseBroadcaster {
     poll_conn: Arc<Mutex<Connection>>,
     tx: broadcast::Sender<()>,
     poll_interval_ms: u64,
+    /// Ends every open stream at shutdown.
+    ///
+    /// An SSE stream is an unbounded response body, and axum's graceful shutdown
+    /// waits for response bodies to finish. Without a signal to end them, a
+    /// single open dashboard stream keeps the server alive forever — and because
+    /// the metering drain runs *after* the server, the instance then has to be
+    /// killed, losing every queued record. That is not hypothetical: it was
+    /// reproduced, and it is the reason this field exists.
+    shutdown: watch::Sender<bool>,
 }
 
 impl SseBroadcaster {
@@ -72,7 +81,26 @@ impl SseBroadcaster {
             tx: broadcast::channel(SSE_BUFFER).0,
             // A zero interval would spin; one millisecond is the useful floor.
             poll_interval_ms: poll_interval_ms.max(1),
+            shutdown: watch::channel(false).0,
         })
+    }
+
+    /// End every open stream.
+    ///
+    /// Called once, when shutdown begins and the listener is about to stop
+    /// accepting. Streams already open end immediately; a client that reconnects
+    /// during the shutdown window is served by whichever instance is still up,
+    /// and one that reconnects after it comes back gets a fresh stream. Nothing
+    /// is lost by ending a stream early, because SSE here carries only
+    /// invalidation — the data is in SQLite.
+    pub fn shutdown(&self) {
+        // A send failure means no stream is open, which is the desired end state.
+        let _ = self.shutdown.send(true);
+    }
+
+    /// Observe shutdown, for a stream that must end when the server does.
+    fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown.subscribe()
     }
 
     /// Spawn the polling task.
@@ -86,6 +114,14 @@ impl SseBroadcaster {
                 tokio::time::sleep(interval).await;
                 let current = this.data_version();
                 if current != last_version {
+                    // Worth a line: a change event is what makes every open
+                    // dashboard refetch, so "who moved data_version" is the
+                    // first question when a dashboard reloads without cause.
+                    debug!(
+                        from = last_version,
+                        to = current,
+                        "ledger changed; notifying"
+                    );
                     last_version = current;
                     // `send` fails when nobody is subscribed, which is normal.
                     let _ = this.tx.send(());
@@ -136,6 +172,7 @@ pub async fn sse_handler(
 /// carries no usage data.
 pub fn sse_response(broadcaster: Arc<SseBroadcaster>) -> impl axum::response::IntoResponse {
     let mut rx = broadcaster.subscribe();
+    let mut shutdown = broadcaster.shutdown_signal();
 
     let stream: futures::stream::BoxStream<'static, Result<Event, axum::Error>> =
         Box::pin(async_stream::stream! {
@@ -147,18 +184,31 @@ pub fn sse_response(broadcaster: Arc<SseBroadcaster>) -> impl axum::response::In
                 .data(r#"{"type":"connected"}"#));
 
             loop {
-                match rx.recv().await {
-                    Ok(()) => {
-                        yield Ok(Event::default().data(r#"{"type":"data_changed"}"#));
+                // The shutdown arm is what lets the server stop at all: without
+                // it this body never completes, and axum's graceful shutdown
+                // waits for bodies. See `SseBroadcaster::shutdown`.
+                let event = tokio::select! {
+                    _ = shutdown.changed() => {
+                        // Closed on purpose, so name the reason rather than
+                        // letting the client see a bare disconnect.
+                        yield Ok(Event::default()
+                            .event("server_shutdown")
+                            .retry(Duration::from_millis(RETRY_HINT_MS))
+                            .data(r#"{"type":"server_shutdown"}"#));
+                        break;
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        // A lagged client has missed notifications but no data:
-                        // one change event restores correctness.
-                        warn!(missed = n, "SSE subscriber lagged; re-sending a change event");
-                        yield Ok(Event::default().data(r#"{"type":"data_changed"}"#));
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
+                    received = rx.recv() => match received {
+                        Ok(()) => Event::default().data(r#"{"type":"data_changed"}"#),
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // A lagged client has missed notifications but no
+                            // data: one change event restores correctness.
+                            warn!(missed = n, "SSE subscriber lagged; re-sending a change event");
+                            Event::default().data(r#"{"type":"data_changed"}"#)
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                };
+                yield Ok(event);
             }
         });
 

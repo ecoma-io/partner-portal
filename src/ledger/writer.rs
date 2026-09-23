@@ -24,6 +24,7 @@
 //! and a single INSERT is issued — the common case under load.
 
 use crate::config::DatabaseConfig;
+use crate::ledger::rollup::{BucketKey, Contribution, StoredRow};
 use crate::ledger::{RequestRecord, RequestStatus};
 use parking_lot::Mutex;
 use rusqlite::{Connection, TransactionBehavior};
@@ -85,6 +86,13 @@ pub struct LedgerWriterConfig {
     pub queue_size: usize,
     pub batch_size: usize,
     pub batch_timeout_ms: u64,
+    /// Owning instance, recorded on every accepted row so that recovery on
+    /// another instance can tell a stranded request from a live sibling's.
+    ///
+    /// `None` is the pre-ownership behaviour and is only appropriate for a
+    /// single-process database. A production instance always sets it — see
+    /// [`crate::ledger::instance`] for what a missing owner costs.
+    pub instance_id: Option<String>,
 }
 
 impl From<DatabaseConfig> for LedgerWriterConfig {
@@ -93,6 +101,7 @@ impl From<DatabaseConfig> for LedgerWriterConfig {
             queue_size: config.queue_size,
             batch_size: config.batch_size,
             batch_timeout_ms: config.batch_timeout_ms,
+            instance_id: None,
         }
     }
 }
@@ -103,6 +112,7 @@ impl Default for LedgerWriterConfig {
             queue_size: 10_000,
             batch_size: 100,
             batch_timeout_ms: 10,
+            instance_id: None,
         }
     }
 }
@@ -139,13 +149,14 @@ pub struct LedgerWriter {
 impl LedgerWriter {
     /// Create a new ledger writer and spawn its single background writer task.
     pub fn new(conn: Arc<Mutex<Connection>>, config: LedgerWriterConfig) -> Self {
-        let (tx, rx) = mpsc::channel(config.queue_size);
+        // `mpsc::channel(0)` panics, so the clamp has to happen before the
+        // channel is built, not just on the field we report.
+        let queue_size = config.queue_size.max(1);
+        let (tx, rx) = mpsc::channel(queue_size);
         let (ready_tx, ready_rx) = watch::channel(true);
         let committed = Arc::new(AtomicU64::new(0));
         let healthy = Arc::new(AtomicBool::new(true));
         let detached = Arc::new(AtomicUsize::new(0));
-
-        let queue_size = config.queue_size;
 
         let task = tokio::spawn(Self::writer_task(
             conn,
@@ -427,7 +438,15 @@ impl LedgerWriter {
         committed: Arc<AtomicU64>,
         health: Arc<AtomicBool>,
     ) {
-        let mut batch: Vec<PendingWrite> = Vec::with_capacity(config.batch_size.min(1024));
+        // Clamped, not trusted: the configuration validator rejects a zero
+        // batch size, and this is the belt to that pair of braces. A zero here
+        // would make the batched receive unreachable and stall every metering
+        // write for the life of the process — a deadlock that still reports
+        // itself as ready, which is the worst kind.
+        let batch_size = config.batch_size.max(1);
+        let queue_capacity = config.queue_size.max(1);
+        let instance_id = config.instance_id.as_deref();
+        let mut batch: Vec<PendingWrite> = Vec::with_capacity(batch_size.min(1024));
         let batch_timeout = Duration::from_millis(config.batch_timeout_ms);
         let mut last_flush = tokio::time::Instant::now();
         let mut commits_are_healthy = true;
@@ -450,7 +469,7 @@ impl LedgerWriter {
 
             tokio::select! {
                 biased;
-                maybe = rx.recv(), if batch.len() < config.batch_size => {
+                maybe = rx.recv(), if batch.len() < batch_size => {
                     match maybe {
                         Some(pending) => batch.push(pending),
                         None => closed = true,
@@ -461,7 +480,7 @@ impl LedgerWriter {
 
             if closed {
                 // Sender gone: take everything still buffered, then finish.
-                while batch.len() < config.batch_size {
+                while batch.len() < batch_size {
                     match rx.try_recv() {
                         Ok(pending) => batch.push(pending),
                         Err(_) => break,
@@ -474,11 +493,10 @@ impl LedgerWriter {
             // accumulate. Without this, shutdown would wait out the whole window
             // before committing the records it already holds.
             let due = !batch.is_empty()
-                && (closed
-                    || batch.len() >= config.batch_size
-                    || last_flush.elapsed() >= batch_timeout);
+                && (closed || batch.len() >= batch_size || last_flush.elapsed() >= batch_timeout);
             if due {
-                commits_are_healthy = Self::flush_with_retry(&conn, &mut batch, &committed);
+                commits_are_healthy =
+                    Self::flush_with_retry(&conn, &mut batch, &committed, instance_id);
                 if !commits_are_healthy {
                     // Latch the failure: a commit that could not be written means
                     // traffic is unaccounted for, which only a restart resolves.
@@ -490,8 +508,12 @@ impl LedgerWriter {
             // Readiness reflects real outstanding work: queued plus in-batch.
             // True while commits are succeeding and less than half the queue is
             // outstanding, so /readyz turns red before the queue is saturated.
+            // Integer division made this `0 < 0` for a queue of one, so a
+            // legitimately tiny configuration could never report ready. Doubling
+            // the depth expresses "less than half the queue" without the
+            // truncation.
             let depth = rx.len() + batch.len();
-            let is_ready = commits_are_healthy && depth < config.queue_size / 2;
+            let is_ready = commits_are_healthy && depth.saturating_mul(2) < queue_capacity;
             let _ = ready_tx.send(is_ready);
 
             if closed && batch.is_empty() {
@@ -501,7 +523,7 @@ impl LedgerWriter {
                     leftover.push(pending);
                 }
                 if !leftover.is_empty() {
-                    Self::flush_with_retry(&conn, &mut leftover, &committed);
+                    Self::flush_with_retry(&conn, &mut leftover, &committed, instance_id);
                 }
                 break;
             }
@@ -518,6 +540,7 @@ impl LedgerWriter {
         conn: &Arc<Mutex<Connection>>,
         batch: &mut Vec<PendingWrite>,
         committed: &Arc<AtomicU64>,
+        instance_id: Option<&str>,
     ) -> bool {
         if batch.is_empty() {
             return true;
@@ -525,7 +548,7 @@ impl LedgerWriter {
 
         let mut attempt = 0u32;
         loop {
-            match Self::try_flush(conn, batch) {
+            match Self::try_flush(conn, batch, instance_id) {
                 Ok(n) => {
                     committed.fetch_add(n as u64, Ordering::Relaxed);
                     for pending in batch.drain(..) {
@@ -567,6 +590,7 @@ impl LedgerWriter {
     fn try_flush(
         conn: &Arc<Mutex<Connection>>,
         batch: &[PendingWrite],
+        instance_id: Option<&str>,
     ) -> Result<usize, rusqlite::Error> {
         // Collapse accepts that are superseded by a finalize in the same batch:
         // the finalize upsert inserts the row directly, so writing the
@@ -596,10 +620,10 @@ impl LedgerWriter {
                     if finalized.contains(record.request_id.as_str()) {
                         continue;
                     }
-                    insert_accept(&tx, record)?;
+                    insert_accept(&tx, record, instance_id)?;
                 }
                 WriteOp::Finalize => {
-                    finalize_record(&tx, record)?;
+                    finalize_record(&tx, record, instance_id)?;
                 }
                 WriteOp::Barrier => continue,
             }
@@ -616,14 +640,15 @@ impl LedgerWriter {
 fn insert_accept(
     tx: &rusqlite::Transaction,
     record: &RequestRecord,
+    instance_id: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     tx.execute(
         r#"
         INSERT INTO usage_records (
             request_id, created_at, consumer_id, model, endpoint, streaming,
-            http_status, request_status, input_tokens, output_tokens,
+            http_status, request_status, instance_id, input_tokens, output_tokens,
             cached_tokens, ttft_ms, duration_ms, usage_status, error_message
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', NULL, NULL, NULL, NULL, 0, 'unavailable', NULL)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', ?7, NULL, NULL, NULL, NULL, 0, 'unavailable', NULL)
         ON CONFLICT(request_id) DO NOTHING
         "#,
         rusqlite::params![
@@ -633,56 +658,82 @@ fn insert_accept(
             record.model,
             record.endpoint.as_str(),
             record.streaming as i32,
+            instance_id,
         ],
     )?;
     Ok(())
 }
 
-/// Move a record to its terminal state and roll it up exactly once.
+/// Move a record to its terminal state, keeping the rollup in step with it.
 ///
-/// The rollup is applied only on the `in_flight -> terminal` transition, so a
-/// duplicate finalize cannot double-count. A finalize for a request with no
-/// accept row yet (single-batch fast path) inserts the terminal row directly.
+/// # Why this is a delta, not a one-shot upsert
+///
+/// The obvious implementation — roll up when the row transitions, and ignore any
+/// later finalize — is only correct if nothing ever writes the same request
+/// twice or writes it in the wrong state. Both happen: a rolling update's
+/// recovery can resolve a row its owner was still finishing, a drop guard races
+/// the normal path, a retry re-sends a batch. The one-shot version turns every
+/// one of those into either a double count or — worse — a silently discarded
+/// real usage figure, because the second finalize returns early.
+///
+/// So the rollup is stated as a *contribution* ([`crate::ledger::rollup`]) and
+/// each finalize does:
+///
+/// ```text
+///   retract what this row currently contributes  ->  add what it should
+/// ```
+///
+/// which is idempotent (applying it twice retracts and re-adds the same numbers,
+/// netting zero), self-correcting (a wrongly-terminal row is fixed rather than
+/// ignored), and immune to ordering. The raw row and the rollup delta commit in
+/// the caller's transaction, so the two can never disagree.
+///
+/// A finalize for a request with no accept row yet (the single-batch fast path,
+/// where an accept and its finalize collapse into one batch) inserts the
+/// terminal row directly and adds its contribution; there is nothing to
+/// retract.
 fn finalize_record(
     tx: &rusqlite::Transaction,
     record: &RequestRecord,
+    instance_id: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
-    let existing: Option<String> = tx
-        .query_row(
-            "SELECT request_status FROM usage_records WHERE request_id = ?1",
-            rusqlite::params![record.request_id],
-            |row| row.get(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(other),
-        })?;
+    let stored = StoredRow::load(tx, &record.request_id)?;
 
-    match existing.as_deref() {
-        Some(status) if RequestStatus::from_str_lossy(status).is_terminal() => {
-            // Already finalized: nothing to do, and critically no second rollup.
-            return Ok(());
-        }
-        Some(_) => {
+    // Two keys, deliberately. The *retraction* must name the bucket the row was
+    // actually written into, or it would leave the old bucket over-counted. The
+    // *addition* must name the bucket the record is now in, which can differ:
+    // `streaming` is decided at accept from the request body, but the response
+    // can turn out to be an SSE stream the client did not ask for. Deriving both
+    // from the stored row would silently keep such a request in the wrong
+    // bucket; deriving both from the record would silently over-count the old
+    // one. So the retract uses the stored key and the add uses the record's.
+    //
+    // Every other column of the bucket (hour, consumer, model, endpoint) is
+    // fixed at accept and never corrected, so the two keys agree on them and a
+    // retract/add pair can only ever move a row between buckets, never invent
+    // one.
+    match &stored {
+        Some(existing) => {
             tx.execute(
                 r#"
                 UPDATE usage_records SET
                     http_status = ?2,
                     request_status = ?3,
-                    input_tokens = ?4,
-                    output_tokens = ?5,
-                    cached_tokens = ?6,
-                    ttft_ms = ?7,
-                    duration_ms = ?8,
-                    usage_status = ?9,
-                    error_message = ?10
+                    streaming = ?4,
+                    input_tokens = ?5,
+                    output_tokens = ?6,
+                    cached_tokens = ?7,
+                    ttft_ms = ?8,
+                    duration_ms = ?9,
+                    usage_status = ?10,
+                    error_message = ?11
                 WHERE request_id = ?1
                 "#,
                 rusqlite::params![
                     record.request_id,
                     record.http_status,
                     record.request_status.as_str(),
+                    record.streaming as i32,
                     record.usage.input_tokens,
                     record.usage.output_tokens,
                     record.usage.cached_tokens,
@@ -692,15 +743,22 @@ fn finalize_record(
                     record.error_message,
                 ],
             )?;
+
+            // `None` for a row that was still in flight: nothing was ever rolled
+            // up for it, so the first finalize retracts nothing.
+            if let Some(previous) = existing.contribution() {
+                previous.retract(tx)?;
+            }
         }
         None => {
             tx.execute(
                 r#"
                 INSERT INTO usage_records (
                     request_id, created_at, consumer_id, model, endpoint, streaming,
-                    http_status, request_status, input_tokens, output_tokens,
-                    cached_tokens, ttft_ms, duration_ms, usage_status, error_message
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                    http_status, request_status, instance_id, input_tokens,
+                    output_tokens, cached_tokens, ttft_ms, duration_ms,
+                    usage_status, error_message
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
                 "#,
                 rusqlite::params![
                     record.request_id,
@@ -711,6 +769,7 @@ fn finalize_record(
                     record.streaming as i32,
                     record.http_status,
                     record.request_status.as_str(),
+                    instance_id,
                     record.usage.input_tokens,
                     record.usage.output_tokens,
                     record.usage.cached_tokens,
@@ -723,62 +782,7 @@ fn finalize_record(
         }
     }
 
-    upsert_hourly(tx, record)?;
-    Ok(())
-}
-
-/// Upsert the hourly rollup for a terminal record.
-///
-/// Token sums use `COALESCE(?, 0)` semantics deliberately: an unavailable usage
-/// contributes 0 to the *sum* while the raw row keeps `NULL` and
-/// `usage_status = 'unavailable'`, so no consumer can mistake it for a real
-/// zero-token request.
-fn upsert_hourly(
-    tx: &rusqlite::Transaction,
-    record: &RequestRecord,
-) -> Result<(), rusqlite::Error> {
-    let hour = format_hour(record.created_at);
-    let is_success = i32::from(record.request_status == RequestStatus::Completed);
-    let is_failure = i32::from(matches!(
-        record.request_status,
-        RequestStatus::Failed | RequestStatus::Interrupted
-    ));
-
-    tx.execute(
-        r#"
-        INSERT INTO usage_hourly (
-            hour, consumer_id, model, endpoint, streaming,
-            request_count, total_input_tokens, total_output_tokens,
-            total_cached_tokens, total_duration_ms, total_ttft_ms,
-            ttft_count, success_count, failure_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
-        ON CONFLICT(hour, consumer_id, model, endpoint, streaming) DO UPDATE SET
-            request_count = request_count + 1,
-            total_input_tokens = total_input_tokens + ?6,
-            total_output_tokens = total_output_tokens + ?7,
-            total_cached_tokens = total_cached_tokens + ?8,
-            total_duration_ms = total_duration_ms + ?9,
-            total_ttft_ms = total_ttft_ms + ?10,
-            ttft_count = ttft_count + ?11,
-            success_count = success_count + ?12,
-            failure_count = failure_count + ?13
-        "#,
-        rusqlite::params![
-            hour,
-            record.consumer_id,
-            record.model,
-            record.endpoint.as_str(),
-            record.streaming as i32,
-            record.usage.input_tokens.unwrap_or(0) as i64,
-            record.usage.output_tokens.unwrap_or(0) as i64,
-            record.usage.cached_tokens.unwrap_or(0) as i64,
-            record.duration_ms as i64,
-            record.ttft_ms.unwrap_or(0) as i64,
-            i32::from(record.ttft_ms.is_some()),
-            is_success,
-            is_failure,
-        ],
-    )?;
+    Contribution::terminal(record, BucketKey::from_record(record)).add(tx)?;
     Ok(())
 }
 
@@ -805,7 +809,7 @@ pub fn finalize_in_tx(
     tx: &rusqlite::Transaction,
     record: &RequestRecord,
 ) -> Result<(), rusqlite::Error> {
-    finalize_record(tx, record)
+    finalize_record(tx, record, None)
 }
 
 /// Whether a SQLite error indicates transient contention rather than a real fault.
@@ -833,6 +837,9 @@ mod tests {
         LedgerWriter::new(
             Arc::new(Mutex::new(conn)),
             LedgerWriterConfig {
+                // Single-instance tests: no ownership is claimed, so
+                // every row reads back with a `NULL` owner.
+                instance_id: None,
                 queue_size: 100,
                 batch_size,
                 batch_timeout_ms: timeout_ms,
@@ -1153,6 +1160,9 @@ mod tests {
         let writer = LedgerWriter::new(
             conn.clone(),
             LedgerWriterConfig {
+                // Single-instance tests: no ownership is claimed, so
+                // every row reads back with a `NULL` owner.
+                instance_id: None,
                 queue_size: 4,
                 batch_size: 4,
                 batch_timeout_ms: 10,

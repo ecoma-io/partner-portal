@@ -30,7 +30,7 @@ use axum::{
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use crate::auth::ConsumerContext;
@@ -77,6 +77,22 @@ impl AppState {
     pub fn max_body_size(&self) -> usize {
         self.config.read().config.server.max_body_size
     }
+
+    /// Every credential in the live configuration, as owned strings.
+    ///
+    /// Read fresh rather than cached: a reload can rotate a key, and a scrubber
+    /// still holding the previous one would stop recognising the current value.
+    /// Only taken on paths that build a recorded reason, so the read lock is not
+    /// on the hot path.
+    pub fn credentials(&self) -> Vec<String> {
+        self.config
+            .read()
+            .config
+            .credentials()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 /// Handle a proxied request end to end.
@@ -90,15 +106,28 @@ pub async fn handle_proxy(
 ) -> Response {
     let started = Instant::now();
 
+    // Minted before anything can answer, so that *every* exit from this function
+    // — the 404 below, a refused accept, a proxied failure, a stream — carries
+    // the same identity the ledger row uses. A client reporting a failure can
+    // then match its response to a log line and a row instead of guessing from a
+    // timestamp, and an operator answering "what happened to this request?"
+    // does not have to reconstruct the answer from the arrival time.
+    let request_id = uuid::Uuid::now_v7().to_string();
+
     let Some(endpoint) = Endpoint::from_path(&path) else {
-        return error_response(StatusCode::NOT_FOUND, "Not Found", "invalid_request_error");
+        return error_response(
+            &request_id,
+            StatusCode::NOT_FOUND,
+            "Not Found",
+            "invalid_request_error",
+        );
     };
 
     // `/v1/models` is discovery, not inference. It is authenticated and proxied,
     // but deliberately not metered: it consumes no tokens, and recording it
     // would add noise with zero usage to every usage view and rollup.
     if endpoint == Endpoint::Models {
-        return proxy_unmetered(&state, method, path, headers, body).await;
+        return proxy_unmetered(&state, method, path, headers, body, &request_id).await;
     }
 
     let request_value: Option<serde_json::Value> = if body.is_empty() {
@@ -122,7 +151,6 @@ pub async fn handle_proxy(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let request_id = uuid::Uuid::now_v7().to_string();
     let record = RequestRecord::new(
         request_id.clone(),
         consumer.consumer_id().to_string(),
@@ -141,6 +169,7 @@ pub async fn handle_proxy(
             "Refusing request: could not durably record its acceptance"
         );
         return error_response(
+            &request_id,
             StatusCode::SERVICE_UNAVAILABLE,
             "Metering unavailable; request not forwarded",
             "metering_error",
@@ -149,6 +178,14 @@ pub async fn handle_proxy(
 
     let upstream_cfg = state.upstream();
     let header_timeout = Duration::from_secs(upstream_cfg.timeout_secs.max(1));
+
+    // Read the live credentials only when a reason is about to be built: this is
+    // a failure-path cost, not a per-request one.
+    let scrub = |reason: String| -> String {
+        let credentials = state.credentials();
+        let credentials: Vec<&str> = credentials.iter().map(String::as_str).collect();
+        sanitize_reason(&reason, &credentials)
+    };
 
     let upstream_result = tokio::time::timeout(
         header_timeout,
@@ -160,39 +197,45 @@ pub async fn handle_proxy(
 
     let upstream_response = match upstream_result {
         Err(_) => {
-            let reason = format!(
+            let reason = scrub(format!(
                 "upstream did not respond within {}s",
                 header_timeout.as_secs()
-            );
+            ));
             return finalize_and_respond(
                 &state,
                 record,
                 Outcome::Failed {
                     http_status: Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
-                    reason: reason.clone(),
+                    reason,
                     usage: Usage::default(),
                 },
                 started,
-                StatusCode::GATEWAY_TIMEOUT,
-                "Upstream timeout",
-                "upstream_timeout",
+                error_response(
+                    &request_id,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "Upstream timeout",
+                    "upstream_timeout",
+                ),
             )
             .await;
         }
         Ok(Err(e)) => {
-            let reason = format!("upstream connection failed: {e}");
+            let reason = scrub(format!("upstream connection failed: {e}"));
             return finalize_and_respond(
                 &state,
                 record,
                 Outcome::Failed {
                     http_status: Some(StatusCode::BAD_GATEWAY.as_u16()),
-                    reason: reason.clone(),
+                    reason,
                     usage: Usage::default(),
                 },
                 started,
-                StatusCode::BAD_GATEWAY,
-                "Upstream connection failed",
-                "upstream_error",
+                error_response(
+                    &request_id,
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream connection failed",
+                    "upstream_error",
+                ),
             )
             .await;
         }
@@ -211,14 +254,24 @@ pub async fn handle_proxy(
     // An error status never streams a usage event, so it is always buffered and
     // recorded as a failure regardless of what the client asked for.
     if !status.is_success() {
-        let (body_bytes, truncated) = collect_capped(upstream_body).await;
+        let (body_bytes, fate) = collect_capped(upstream_body).await;
         let usage = extract_usage(&body_bytes, endpoint);
-        let reason = if truncated {
-            format!("upstream returned {status} (error body truncated)")
-        } else {
-            upstream_error_message(&body_bytes)
-                .unwrap_or_else(|| format!("upstream returned {status}"))
-        };
+        let reason = scrub(match &fate {
+            BodyFate::Complete => upstream_error_message(&body_bytes)
+                .unwrap_or_else(|| format!("upstream returned {status}")),
+            BodyFate::CapExceeded => format!(
+                "upstream returned {status} with an error body above {MAX_BUFFERED_RESPONSE} bytes"
+            ),
+            BodyFate::Broken(e) => {
+                format!("upstream returned {status} and its error body broke mid-read: {e}")
+            }
+        });
+
+        // The client is handed the upstream's own error document rather than a
+        // generic substitute. A reverse proxy that swallows it takes away the
+        // only explanation the caller will ever get — the provider's
+        // `error.message` is the actionable part of a failed inference call.
+        let response = forward_upstream_error(status, &parts.headers, &body_bytes, &request_id);
 
         return finalize_and_respond(
             &state,
@@ -229,9 +282,7 @@ pub async fn handle_proxy(
                 usage,
             },
             started,
-            status,
-            "Upstream error",
-            "upstream_error",
+            response,
         )
         .await;
     }
@@ -251,18 +302,50 @@ pub async fn handle_proxy(
     }
 
     // Non-streaming: buffer under a cap, extract usage, then respond.
-    let (body_bytes, truncated) = collect_capped(upstream_body).await;
-    if truncated {
-        tracing::warn!(
-            request_id = %request_id,
-            limit = MAX_BUFFERED_RESPONSE,
-            "Upstream response exceeded the buffering cap; usage recorded as unavailable"
-        );
+    let (body_bytes, fate) = collect_capped(upstream_body).await;
+
+    // A body that did not arrive whole cannot be passed off as the whole body.
+    // Sending what was read would hand the client a truncated document carrying
+    // the upstream's `Content-Length`, and recording it as `completed` would
+    // state in the ledger that a request succeeded which was in fact served
+    // incomplete. Neither is acceptable, and nothing has been sent yet, so the
+    // honest answer is a failure.
+    if !matches!(fate, BodyFate::Complete) {
+        let reason = match &fate {
+            BodyFate::Complete => unreachable!("guarded above"),
+            BodyFate::CapExceeded => {
+                format!("upstream response exceeded the {MAX_BUFFERED_RESPONSE}-byte buffering cap")
+            }
+            BodyFate::Broken(e) => format!("upstream response body broke mid-read: {e}"),
+        };
+        tracing::error!(request_id = %request_id, reason = %reason, "not forwarding a partial response");
+
+        return finalize_and_respond(
+            &state,
+            record,
+            Outcome::Failed {
+                http_status: Some(StatusCode::BAD_GATEWAY.as_u16()),
+                reason,
+                usage: Usage::default(),
+            },
+            started,
+            error_response(
+                &request_id,
+                StatusCode::BAD_GATEWAY,
+                "Upstream response could not be read in full",
+                "upstream_error",
+            ),
+        )
+        .await;
     }
+
     let usage = extract_usage(&body_bytes, endpoint);
 
     let mut record = record;
     let duration_ms = started.elapsed().as_millis() as u64;
+    // Truthful, not requested: this branch is the proof the response was not
+    // streamed, whatever the request body asked for.
+    record.streaming = false;
     record.complete(status.as_u16(), usage, duration_ms);
     if let Err(e) = state.ledger.finalize(record).await {
         state.ledger.mark_unhealthy();
@@ -277,10 +360,39 @@ pub async fn handle_proxy(
     {
         Ok(response) => response,
         Err(_) => error_response(
+            &request_id,
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to build response",
             "proxy_error",
         ),
+    }
+}
+
+/// Rebuild the client-facing response for an upstream error.
+///
+/// The upstream body is forwarded verbatim when there is one — headers included,
+/// so `Content-Type` and any provider-specific fields survive — and a generic
+/// error is substituted only when the body is empty or could not be read. The
+/// upstream status is preserved either way, because the classifier for a failure
+/// (`429` vs `400` vs `503`) is what a client retries on.
+fn forward_upstream_error(
+    status: StatusCode,
+    headers: &HeaderMap,
+    body: &Bytes,
+    request_id: &str,
+) -> Response {
+    if body.is_empty() {
+        return error_response(request_id, status, "Upstream error", "upstream_error");
+    }
+
+    let builder =
+        ProxyClient::forward_response_headers(Response::builder().status(status), headers);
+    match builder
+        .header("x-request-id", request_id)
+        .body(AxumBody::from(body.clone()))
+    {
+        Ok(response) => response,
+        Err(_) => error_response(request_id, status, "Upstream error", "upstream_error"),
     }
 }
 
@@ -291,6 +403,7 @@ async fn proxy_unmetered(
     path: String,
     headers: HeaderMap,
     body: Bytes,
+    request_id: &str,
 ) -> Response {
     let upstream_cfg = state.upstream();
     let timeout = Duration::from_secs(upstream_cfg.timeout_secs.max(1));
@@ -304,11 +417,13 @@ async fn proxy_unmetered(
     .await
     {
         Err(_) => error_response(
+            request_id,
             StatusCode::GATEWAY_TIMEOUT,
             "Upstream timeout",
             "upstream_timeout",
         ),
         Ok(Err(e)) => error_response(
+            request_id,
             StatusCode::BAD_GATEWAY,
             &format!("Upstream connection failed: {e}"),
             "upstream_error",
@@ -316,14 +431,28 @@ async fn proxy_unmetered(
         Ok(Ok(response)) => {
             let status = response.status();
             let (parts, body) = response.into_parts();
-            let (bytes, _) = collect_capped(body).await;
+            let (bytes, fate) = collect_capped(body).await;
+            if !matches!(fate, BodyFate::Complete) {
+                // Same rule as the metered path: a partially read body is never
+                // presented as if it were the whole one.
+                return error_response(
+                    request_id,
+                    StatusCode::BAD_GATEWAY,
+                    "Upstream response could not be read in full",
+                    "upstream_error",
+                );
+            }
             let builder = ProxyClient::forward_response_headers(
                 Response::builder().status(status),
                 &parts.headers,
             );
-            match builder.body(AxumBody::from(bytes)) {
+            match builder
+                .header("x-request-id", request_id)
+                .body(AxumBody::from(bytes))
+            {
                 Ok(response) => response,
                 Err(_) => error_response(
+                    request_id,
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to build response",
                     "proxy_error",
@@ -342,15 +471,18 @@ enum Outcome {
     },
 }
 
-/// Apply a terminal state, durably, then build a local error response.
+/// Apply a terminal state, durably, then return the response the client gets.
+///
+/// The response is built by the caller and passed in, because the two are not
+/// always the same object: a failure that the upstream already described must be
+/// forwarded as the upstream's own document. What the ledger records and what
+/// the client saw are then the same event, and only one of them is authoritative.
 async fn finalize_and_respond(
     state: &Arc<AppState>,
     mut record: RequestRecord,
     outcome: Outcome,
     started: Instant,
-    status: StatusCode,
-    message: &str,
-    error_type: &str,
+    response: Response,
 ) -> Response {
     let duration_ms = started.elapsed().as_millis() as u64;
     let request_id = record.request_id.clone();
@@ -366,19 +498,22 @@ async fn finalize_and_respond(
         }
     }
 
+    // This branch never streamed, whatever the request asked for.
+    record.streaming = false;
+
     if let Err(e) = state.ledger.finalize(record).await {
         state.ledger.mark_unhealthy();
         tracing::error!(request_id = %request_id, error = %e, "Failed to finalize metering record");
     }
 
-    error_response(status, message, error_type)
+    response
 }
 
 /// Forward a streaming response incrementally while metering it.
 #[allow(clippy::too_many_arguments)]
 fn stream_response(
     state: &Arc<AppState>,
-    record: RequestRecord,
+    mut record: RequestRecord,
     endpoint: Endpoint,
     started: Instant,
     http_status: u16,
@@ -387,12 +522,19 @@ fn stream_response(
     upstream_cfg: UpstreamConfig,
     request_id: String,
 ) -> Response {
+    // The record was accepted with the client's *request* for a stream; this is
+    // the branch where one is actually being served, so the ledger records that
+    // rather than the request body's wish. The two differ whenever an upstream
+    // answers `text/event-stream` to a request that did not ask to stream.
+    record.streaming = true;
+
     let meter = Arc::new(StreamMeter::new(
         record,
         state.ledger.clone(),
         endpoint,
         started,
         http_status,
+        state.credentials(),
     ));
 
     let idle_timeout = Duration::from_secs(upstream_cfg.timeout_secs.max(1));
@@ -431,8 +573,8 @@ fn stream_response(
         }
 
         match failure {
-            Some(reason) => stream_meter.finish_broken(reason).await,
-            None => stream_meter.finish_completed().await,
+            Some(reason) => stream_meter.finish_broken(reason),
+            None => stream_meter.finish_completed(),
         }
     });
 
@@ -447,6 +589,7 @@ fn stream_response(
             // The response could not be built, so the stream will be dropped and
             // the meter's guard records the request as interrupted.
             error_response(
+                &request_id,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Failed to build streaming response",
                 "proxy_error",
@@ -466,8 +609,23 @@ struct StreamMeter {
     ledger: Arc<LedgerWriter>,
     started: Instant,
     http_status: u16,
-    /// False once a terminal state has been written, so the guard stands down.
-    armed: AtomicBool,
+    /// Every configured credential, so a reason built from upstream text cannot
+    /// commit one to the ledger. See [`sanitize_reason`].
+    credentials: Vec<String>,
+}
+
+/// The meter's one-shot latch.
+///
+/// The armed/handed-off flag lives *inside* the same mutex as the state it
+/// guards, and the terminal record is built under that lock before the flag
+/// flips. That ordering is the whole point: an `AtomicBool` swapped before an
+/// `await` left a window in which a cancelled write had already disarmed the
+/// guard, so the record was never written by either path. Deciding and building
+/// under one lock, with the handoff itself being non-blocking, means a terminal
+/// state is always produced exactly once and is never cancellable.
+enum MeterLatch {
+    Armed,
+    HandedOff,
 }
 
 struct StreamMeterState {
@@ -475,6 +633,24 @@ struct StreamMeterState {
     scanner: SseUsageScanner,
     ttft_ms: Option<u64>,
     bytes: u64,
+    latch: MeterLatch,
+}
+
+impl StreamMeterState {
+    /// Claim the one terminal write this meter is allowed to make.
+    ///
+    /// Returns `false` for a caller that arrived second. Called with the state
+    /// lock held, and the caller builds the record before releasing it, so the
+    /// loser of this race can never observe a claimed-but-unbuilt state.
+    fn arm_once(&mut self) -> bool {
+        match self.latch {
+            MeterLatch::Armed => {
+                self.latch = MeterLatch::HandedOff;
+                true
+            }
+            MeterLatch::HandedOff => false,
+        }
+    }
 }
 
 impl StreamMeter {
@@ -484,6 +660,7 @@ impl StreamMeter {
         endpoint: Endpoint,
         started: Instant,
         http_status: u16,
+        credentials: Vec<String>,
     ) -> Self {
         Self {
             inner: parking_lot::Mutex::new(StreamMeterState {
@@ -491,11 +668,12 @@ impl StreamMeter {
                 scanner: SseUsageScanner::new(endpoint),
                 ttft_ms: None,
                 bytes: 0,
+                latch: MeterLatch::Armed,
             }),
             ledger,
             started,
             http_status,
-            armed: AtomicBool::new(true),
+            credentials,
         }
     }
 
@@ -510,10 +688,10 @@ impl StreamMeter {
     }
 
     /// The upstream stream ended normally.
-    async fn finish_completed(&self) {
+    fn finish_completed(&self) {
         let record = {
             let mut state = self.inner.lock();
-            if !self.armed.swap(false, Ordering::AcqRel) {
+            if !state.arm_once() {
                 return;
             }
             state.scanner.finish();
@@ -535,14 +713,14 @@ impl StreamMeter {
             record
         };
 
-        self.write_terminal(record).await;
+        self.write_terminal(record);
     }
 
     /// The upstream stream broke after the response was already sent.
-    async fn finish_broken(&self, reason: String) {
+    fn finish_broken(&self, reason: String) {
         let record = {
             let mut state = self.inner.lock();
-            if !self.armed.swap(false, Ordering::AcqRel) {
+            if !state.arm_once() {
                 return;
             }
             state.scanner.finish();
@@ -551,9 +729,13 @@ impl StreamMeter {
             let ttft = state.ttft_ms;
             let usage = state.scanner.usage();
             let mut record = state.record.clone();
+            let credentials: Vec<&str> = self.credentials.iter().map(String::as_str).collect();
             record.fail(
                 Some(self.http_status),
-                format!("{} (after {} bytes)", reason, state.bytes),
+                sanitize_reason(
+                    &format!("{} (after {} bytes)", reason, state.bytes),
+                    &credentials,
+                ),
                 duration_ms,
             );
             // Keep whatever usage was observed before the break; leave the rest
@@ -567,31 +749,33 @@ impl StreamMeter {
             record
         };
 
-        self.write_terminal(record).await;
+        self.write_terminal(record);
     }
 
-    async fn write_terminal(&self, record: RequestRecord) {
-        let request_id = record.request_id.clone();
-        if let Err(e) = self.ledger.finalize(record).await {
-            self.ledger.mark_unhealthy();
-            tracing::error!(
-                request_id = %request_id,
-                error = %e,
-                "Failed to finalize streaming metering record"
-            );
-        }
+    /// Hand the terminal record to the writer.
+    ///
+    /// Deliberately not `async`: the handoff must not sit on a suspension point
+    /// that the response body's own future can be dropped at. This code runs at
+    /// the *end* of the stream generator, and a client disconnecting in that
+    /// instant drops the generator — which, when the write was awaited inline,
+    /// cancelled it after the record had been built and after the guard had been
+    /// disarmed, losing the record entirely. The writer tracks detached writes
+    /// and its shutdown waits for them, so nothing is lost by returning here.
+    fn write_terminal(&self, record: RequestRecord) {
+        self.ledger.spawn_detached_finalize(record);
     }
 }
 
 impl Drop for StreamMeter {
     fn drop(&mut self) {
-        // Stand down if a terminal state was already written.
-        if !self.armed.swap(false, Ordering::AcqRel) {
-            return;
-        }
-
         let record = {
             let mut state = self.inner.lock();
+            // Stand down if a terminal state was already handed off. Taking the
+            // decision under the same lock the handoff used is what makes this
+            // race-free: the guard cannot observe a half-finished handoff.
+            if !state.arm_once() {
+                return;
+            }
             state.scanner.finish();
             let duration_ms = self.started.elapsed().as_millis() as u64;
             let ttft = state.ttft_ms;
@@ -614,10 +798,27 @@ impl Drop for StreamMeter {
     }
 }
 
-/// Collect a body under a cap. Returns `(bytes, truncated)`.
-async fn collect_capped(mut body: hyper::body::Incoming) -> (Bytes, bool) {
+/// How a buffered upstream body ended.
+///
+/// The three cases are kept apart rather than collapsed into a `truncated` flag
+/// because they call for different answers: a body cut off by the cap and a body
+/// cut off by a stream error both mean "this is not the whole response", but the
+/// reason a human reads later is not the same one. A boolean also has no way to
+/// say what went wrong, and a ledger row that says only "something was truncated"
+/// is not worth storing.
+enum BodyFate {
+    /// Read to the end.
+    Complete,
+    /// The buffering cap was reached; the remainder was not read.
+    CapExceeded,
+    /// The body failed mid-read.
+    Broken(String),
+}
+
+/// Collect a body under a cap, reporting how it ended.
+async fn collect_capped(mut body: hyper::body::Incoming) -> (Bytes, BodyFate) {
     let mut acc: Vec<u8> = Vec::new();
-    let mut truncated = false;
+    let mut fate = BodyFate::Complete;
 
     while let Some(frame) = body.frame().await {
         match frame {
@@ -626,20 +827,66 @@ async fn collect_capped(mut body: hyper::body::Incoming) -> (Bytes, bool) {
                     if acc.len() + data.len() > MAX_BUFFERED_RESPONSE {
                         let room = MAX_BUFFERED_RESPONSE.saturating_sub(acc.len());
                         acc.extend_from_slice(&data[..room]);
-                        truncated = true;
+                        fate = BodyFate::CapExceeded;
                         break;
                     }
                     acc.extend_from_slice(&data);
                 }
             }
-            Err(_) => {
-                truncated = true;
+            Err(e) => {
+                fate = BodyFate::Broken(e.to_string());
                 break;
             }
         }
     }
 
-    (Bytes::from(acc), truncated)
+    (Bytes::from(acc), fate)
+}
+
+/// Longest reason string persisted to the ledger.
+///
+/// The reason is upstream-influenced text (a provider's error document, a
+/// transport error). It is stored for an operator to read, not to be a copy of
+/// whatever the upstream chose to send, so it is capped — otherwise a 32 MiB
+/// error body becomes a 32 MiB row in every usage view.
+const MAX_REASON_CHARS: usize = 512;
+
+/// Make an upstream-influenced string safe to persist and to log.
+///
+/// Three problems, one function, and this is the only point where such text
+/// enters the ledger — which is why the credential scrub lives here rather than
+/// at each call site. Missing it once would mean a secret committed to a row and
+/// served back through the dashboard.
+///
+/// * **Credentials.** An upstream that echoes the key it was given — "Incorrect
+///   API key provided: sk-…" is a real provider behaviour — hands us a credential
+///   in its error document. Persisting it would let it outlive the request, so
+///   every configured credential is replaced with [`REDACTED`].
+/// * **Length.** Unbounded length is a storage and display problem (above).
+/// * **Control characters.** A *log* problem: a message containing a newline can
+///   forge a second log line, and one containing an ANSI escape can repaint a
+///   terminal reading the log.
+fn sanitize_reason(reason: &str, credentials: &[&str]) -> String {
+    let reason = crate::config::redact_credentials(reason, credentials);
+    let reason = reason.as_str();
+
+    let mut out = String::with_capacity(reason.len().min(MAX_REASON_CHARS));
+    for (i, c) in reason.chars().enumerate() {
+        if i >= MAX_REASON_CHARS {
+            out.push_str("… (truncated)");
+            break;
+        }
+        if c.is_control() {
+            // Whitespace control characters become a space so words do not run
+            // together; everything else is dropped.
+            if c == '\n' || c == '\r' || c == '\t' {
+                out.push(' ');
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Extract usage from a buffered non-streaming response body.
@@ -670,7 +917,18 @@ fn extract_responses_usage_model(body: &serde_json::Value) -> String {
 }
 
 /// Standard OpenAI-style error response.
-pub fn error_response(status: StatusCode, message: &str, error_type: &str) -> Response {
+/// Standard OpenAI-shaped error response, tagged with the request identity.
+///
+/// The id is a required argument rather than an optional header added by the
+/// caller: an error the proxy generated itself is exactly the kind a client has
+/// no other way to trace, and making it optional would mean the responses that
+/// need it most are the ones most likely to be built without it.
+pub fn error_response(
+    request_id: &str,
+    status: StatusCode,
+    message: &str,
+    error_type: &str,
+) -> Response {
     let body = serde_json::json!({
         "error": {
             "message": message,
@@ -683,6 +941,7 @@ pub fn error_response(status: StatusCode, message: &str, error_type: &str) -> Re
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
+        .header("x-request-id", request_id)
         .body(AxumBody::from(json))
         .unwrap_or_else(|_| Response::new(AxumBody::empty()))
 }
@@ -696,6 +955,10 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    /// The credential these tests pretend is configured upstream, so that a
+    /// meter built here has something a scrubber must recognise.
+    const TEST_UPSTREAM_KEY: &str = "sk-upstream-secret-1234";
+
     fn meter_with_db(path: &std::path::Path) -> (Arc<StreamMeter>, Arc<LedgerWriter>) {
         let conn = Connection::open(path).unwrap();
         crate::ledger::configure_sqlite(&conn).unwrap();
@@ -703,6 +966,9 @@ mod tests {
         let ledger = Arc::new(LedgerWriter::new(
             Arc::new(ParkingMutex::new(conn)),
             LedgerWriterConfig {
+                // Single-instance tests: no ownership is claimed, so
+                // every row reads back with a `NULL` owner.
+                instance_id: None,
                 queue_size: 100,
                 batch_size: 1,
                 batch_timeout_ms: 1,
@@ -721,6 +987,7 @@ mod tests {
             Endpoint::ChatCompletions,
             Instant::now(),
             200,
+            vec![TEST_UPSTREAM_KEY.to_string()],
         ));
         (meter, ledger)
     }
@@ -746,7 +1013,7 @@ mod tests {
         meter.observe(
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":11,\"completion_tokens\":22}}\n\n",
         );
-        meter.finish_completed().await;
+        meter.finish_completed();
         ledger.shutdown().await;
 
         let (status, input, output, ttft) = read_status(&path);
@@ -767,7 +1034,7 @@ mod tests {
 
         meter.observe(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
         meter.observe(b"data: [DONE]\n\n");
-        meter.finish_completed().await;
+        meter.finish_completed();
         ledger.shutdown().await;
 
         let conn = Connection::open(&path).unwrap();
@@ -813,9 +1080,7 @@ mod tests {
         meter.observe(
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":3}}\n\n",
         );
-        meter
-            .finish_broken("upstream stream broke: connection reset".into())
-            .await;
+        meter.finish_broken("upstream stream broke: connection reset".into());
         ledger.shutdown().await;
 
         let (status, input, output, _) = read_status(&path);
@@ -829,6 +1094,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_key_echoed_by_a_broken_upstream_never_reaches_the_database() {
+        // The whole point of scrubbing inside `sanitize_reason`: this value goes
+        // through `finish_broken` into a real SQLite row. Asserting on the
+        // function alone would not catch a call site that bypassed it.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let (meter, ledger) = meter_with_db(&path);
+
+        meter.finish_broken(format!(
+            "upstream rejected the request: Incorrect API key provided: {TEST_UPSTREAM_KEY}"
+        ));
+        ledger.shutdown().await;
+
+        let conn = Connection::open(&path).unwrap();
+        let stored: Option<String> = conn
+            .query_row("SELECT error_message FROM usage_records LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let stored = stored.expect("a broken stream records why it broke");
+        assert!(
+            !stored.contains(TEST_UPSTREAM_KEY),
+            "the credential was committed to the ledger: {stored}"
+        );
+        assert!(
+            stored.contains("<redacted>"),
+            "the reason should still say the key was rejected: {stored}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_finish_then_drop_does_not_double_record() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("t.db");
@@ -837,7 +1133,7 @@ mod tests {
         meter.observe(
             b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\n",
         );
-        meter.finish_completed().await;
+        meter.finish_completed();
         drop(meter);
         ledger.shutdown().await;
 
@@ -863,6 +1159,82 @@ mod tests {
     fn test_upstream_error_message_absent_is_none() {
         assert!(upstream_error_message(b"not json").is_none());
         assert!(upstream_error_message(b"{}").is_none());
+    }
+
+    #[test]
+    fn test_a_provider_echoing_the_key_does_not_get_it_persisted() {
+        // Real provider behaviour: the error document quotes the rejected key.
+        let reason =
+            "Incorrect API key provided: sk-upstream-secret-1234. You can find your key at ...";
+        let sanitized = sanitize_reason(reason, &["sk-upstream-secret-1234"]);
+        assert_eq!(
+            sanitized,
+            "Incorrect API key provided: <redacted>. You can find your key at ..."
+        );
+        assert!(!sanitized.contains("sk-upstream-secret-1234"));
+    }
+
+    #[test]
+    fn test_a_local_key_echoed_by_the_upstream_is_also_scrubbed() {
+        // The client's own key is a credential too: an upstream that echoes the
+        // forwarded Authorization header must not have it land in the ledger.
+        let reason = "rejected bearer sk-local-abcdef";
+        let sanitized = sanitize_reason(reason, &["sk-upstream-secret-1234", "sk-local-abcdef"]);
+        assert_eq!(sanitized, "rejected bearer <redacted>");
+    }
+
+    #[test]
+    fn test_a_credential_past_the_truncation_point_is_still_scrubbed() {
+        // Redaction runs over the whole string before the cap is applied, so a
+        // secret that would be cut off is still removed rather than half-kept.
+        let reason = format!(
+            "{}sk-upstream-secret-1234",
+            "x".repeat(MAX_REASON_CHARS + 64)
+        );
+        let sanitized = sanitize_reason(&reason, &["sk-upstream-secret-1234"]);
+        assert!(!sanitized.contains("sk-upstream-secret-1234"));
+        assert!(sanitized.ends_with("… (truncated)"));
+    }
+
+    #[test]
+    fn test_a_long_reason_is_capped() {
+        let reason = "a".repeat(MAX_REASON_CHARS * 4);
+        let sanitized = sanitize_reason(&reason, &[]);
+        assert_eq!(
+            sanitized.chars().count(),
+            MAX_REASON_CHARS + "… (truncated)".chars().count()
+        );
+        assert!(sanitized.ends_with("… (truncated)"));
+        assert_eq!(&sanitized[..MAX_REASON_CHARS], &reason[..MAX_REASON_CHARS]);
+    }
+
+    #[test]
+    fn test_a_reason_at_the_cap_is_not_marked_truncated() {
+        // The boundary matters: an exactly-capped message is complete, and
+        // claiming otherwise would send an operator looking for missing text.
+        let reason = "a".repeat(MAX_REASON_CHARS);
+        let sanitized = sanitize_reason(&reason, &[]);
+        assert_eq!(sanitized, reason);
+    }
+
+    #[test]
+    fn test_a_newline_cannot_forge_a_log_line_and_an_escape_cannot_repaint_one() {
+        // "\n" and "\r" would forge a second log line; an ANSI escape would
+        // repaint the terminal reading it. The escape introducer is dropped.
+        let sanitized = sanitize_reason("upstream said:\n\r\tsk-\u{1b}[31m bad", &[]);
+        assert_eq!(sanitized, "upstream said:   sk-[31m bad");
+        assert!(!sanitized.contains('\n'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn test_an_ordinary_reason_passes_through_unchanged() {
+        let reason = "upstream returned status 502: bad gateway";
+        assert_eq!(
+            sanitize_reason(reason, &["sk-upstream-secret-1234"]),
+            reason
+        );
     }
 
     #[test]

@@ -1128,6 +1128,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "memchr",
  "parking_lot",
  "pin-project-lite",

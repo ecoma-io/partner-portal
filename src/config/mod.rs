@@ -9,4 +9,6 @@ mod types;
 
 pub use hot_reload::{ConfigSnapshot, HotReloader};
 pub use loader::{ConfigError, ConfigLoader};
-pub use types::{Config, DatabaseConfig, KeyConfig, ServerConfig, UpstreamConfig};
+pub use types::{
+    Config, DatabaseConfig, KeyConfig, ServerConfig, UpstreamConfig, redact_credentials,
+};
