@@ -1,0 +1,68 @@
+[package]
+name = "partner-portal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["John Martin <john@ecoma-io>"]
+description = "Lightweight OpenAI-compatible reverse proxy with durable metering and embedded Vue dashboard"
+repository = "https://github.com/ecoma-io/partner-portal"
+publish = false
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs"] }
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+hyper = { version = "1.6", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace", "request-id", "sensitive-headers"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# SQLite
+rusqlite = { version = "0.37", features = ["bundled", "serde_json"] }
+
+# Time
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+
+# Utils
+thiserror = "2.0"
+anyhow = "1.0"
+uuid = { version = "1.18", features = ["v7", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+parking_lot = "0.12"
+dashmap = "6.1"
+tokio-stream = "0.1"
+futures = "0.3"
+pin-project-lite = "0.2"
+bytes = "1.10"
+memchr = "2.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[dev-dependencies]
+tempfile = "3.20"
+criterion = "0.6"
+proptest = "1.7"
+tokio-test = "0.4"
+wiremock = "0.6"
+pretty_assertions = "1.4"
+fastrand = "2.3"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[[bin]]
+name = "partner-portal"
+path = "src/main.rs"

@@ -1,0 +1,43 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Dependencies
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database (development)
+*.db
+*.db-wal
+*.db-shm
+
+# Logs
+logs/
+*.log
+
+# Test outputs
+/coverage/
+/test-output/
+
+# Dashboard build
+/dashboard/dist/
+/dashboard/node_modules/
+
+# Temporary
+/tmp/
+*.tmp
