@@ -2,10 +2,18 @@
 //!
 //! # Isolation
 //!
-//! Every query is scoped by `consumer_id` **taken from the authenticated key**,
-//! never from a request parameter. Combined with [`crate::auth::Authenticated`]
-//! this means one API key can only ever observe its own traffic: there is no
-//! parameter that widens the scope, so there is nothing to tamper with.
+//! Every query is scoped by `consumer_id` **taken from the authenticated
+//! credential**, never from a request parameter. Combined with
+//! [`crate::auth::Authenticated`] this means one API key can only ever observe
+//! its own traffic: there is no parameter that widens the scope, so there is
+//! nothing to tamper with.
+//!
+//! There is exactly one widening, and it is deliberate and in the schema rather
+//! than the API: a manager password (ADR 0008, ADR 0013) sees **every**
+//! consumer in the ledger. A manager can *narrow* its view with the `consumers`
+//! query parameter, but that parameter is a view filter, never a grant — for a
+//! key it is ignored outright, and for a manager it can only ever shrink what
+//! the credential already sees.
 //!
 //! # Two data sources, deliberately
 //!
@@ -26,7 +34,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use time::Duration;
 
-use crate::auth::Authenticated;
+use crate::auth::{Authenticated, ConsumerContext};
 use crate::ledger::timefmt;
 use crate::proxy::handler::AppState;
 
@@ -80,6 +88,12 @@ pub struct DashboardQuery {
     pub cursor: Option<String>,
     /// Page size for the request list.
     pub limit: usize,
+    /// Comma-separated consumer filter, **narrowing only**.
+    ///
+    /// Ignored for a consumer-key context. For a manager it names the consumers
+    /// to show; the names are taken verbatim, so an unknown name matches no
+    /// rows rather than falling back to everything (ADR 0013).
+    pub consumers: String,
 }
 
 impl Default for DashboardQuery {
@@ -92,6 +106,7 @@ impl Default for DashboardQuery {
             status: "all".to_string(),
             cursor: None,
             limit: DEFAULT_LIMIT,
+            consumers: String::new(),
         }
     }
 }
@@ -193,18 +208,127 @@ fn status_filter(query: &DashboardQuery) -> Option<&'static str> {
     }
 }
 
-/// `GET /api/me` — identify the authenticated key.
-#[derive(Serialize)]
-pub struct MeResponse {
-    pub consumer_id: String,
-    pub key_name: String,
+/// How far a request may scope, resolved once per query.
+///
+/// For a consumer key this is exactly the key's one consumer. For a manager it
+/// is every consumer, or the consumers the `consumers` query parameter names —
+/// the parameter narrows, never widens (ADR 0013).
+#[derive(Debug, Clone)]
+enum Scope {
+    /// A single consumer; `consumer_id = ?`.
+    One(String),
+    /// The consumers the manager asked to see, verbatim.
+    List(Vec<String>),
+    /// Every consumer.
+    All,
 }
 
-async fn get_me(Authenticated(consumer): Authenticated) -> Json<MeResponse> {
-    Json(MeResponse {
+/// Resolve the effective scope for an authenticated context and query.
+fn resolve_scope(consumer: &ConsumerContext, query: &DashboardQuery) -> Scope {
+    // A key context never consults the parameter: `consumers=acme` cannot
+    // widen a key into another consumer's data.
+    if !consumer.is_manager() {
+        return Scope::One(consumer.consumer_id().to_string());
+    }
+    let requested: Vec<String> = query
+        .consumers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if requested.is_empty() {
+        Scope::All
+    } else {
+        // Names are taken verbatim, so an unknown name is an empty result at
+        // query time — never a fall-back to everything.
+        Scope::List(requested)
+    }
+}
+
+/// Render a `Scope` into a `(WHERE fragment, params)` pair.
+///
+/// `One` yields `consumer_id = ?`; `List` yields `consumer_id IN (?,?,…)`; `All`
+/// yields `1 = 1` — a constant the planner folds away, kept explicit rather than
+/// omitting the `WHERE` entirely so the callers that always append
+/// `" AND …"` after the fragment never produce a dangling `AND`. An empty
+/// `List` yields `consumer_id IN ()` which SQLite evaluates to `FALSE` — the
+/// correct rendering of a filter nothing matches.
+fn scope_clause(scope: &Scope) -> (String, Vec<rusqlite::types::Value>) {
+    match scope {
+        Scope::One(id) => (
+            "consumer_id = ?".to_string(),
+            vec![rusqlite::types::Value::Text(id.clone())],
+        ),
+        Scope::List(list) => {
+            let placeholders = vec!["?"; list.len()].join(",");
+            let params = list
+                .iter()
+                .map(|c| rusqlite::types::Value::Text(c.clone()))
+                .collect();
+            (format!("consumer_id IN ({placeholders})"), params)
+        }
+        Scope::All => ("1 = 1".to_string(), Vec::new()),
+    }
+}
+
+/// `GET /api/me` — identify the authenticated credential.
+///
+/// `role` is `"manager"` for a password session, `"consumer"` otherwise. For a
+/// manager, `consumers` lists the consumer ids actually present in the ledger
+/// (ADR 0013), which the dashboard turns into its consumer selector; it is a
+/// report of what there is to see, not the definition of what may be seen — a
+/// manager may ask for any consumer whether or not it is listed.
+#[derive(Serialize)]
+pub struct MeResponse {
+    /// The consumer this key is scoped to, or `""` for a manager.
+    pub consumer_id: String,
+    /// The key's name, or `"manager"`.
+    pub key_name: String,
+    /// `"manager"` or `"consumer"`.
+    pub role: &'static str,
+    /// The distinct consumer ids in the ledger. Always empty for a consumer key.
+    pub consumers: Vec<String>,
+}
+
+/// The distinct consumer ids the ledger holds rows for, ordered.
+///
+/// Read from the hourly rollup — the same table the summary, timeseries and
+/// models tabs read, so the selector can never offer a consumer those tabs
+/// cannot show, and its consumer-leading index makes `DISTINCT` an ordered
+/// index scan. A consumer with no terminal row yet (zero traffic, or only
+/// `in_flight`) is not offered: it has no summary, no timeseries and no models
+/// to show, and the first terminal row puts it here.
+fn distinct_consumers(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt =
+        conn.prepare("SELECT DISTINCT consumer_id FROM usage_hourly ORDER BY consumer_id ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+async fn get_me(
+    State(state): State<Arc<AppState>>,
+    Authenticated(consumer): Authenticated,
+) -> Result<Json<MeResponse>, DashboardError> {
+    let (role, consumers) = if consumer.is_manager() {
+        let pool = state.pool.clone();
+        let consumers = tokio::task::spawn_blocking(move || pool.read(distinct_consumers))
+            .await
+            .map_err(|e| DashboardError::Internal(format!("consumer list task failed: {e}")))??;
+        ("manager", consumers)
+    } else {
+        ("consumer", Vec::new())
+    };
+    Ok(Json(MeResponse {
         consumer_id: consumer.consumer_id().to_string(),
         key_name: consumer.identity.key_name.clone(),
-    })
+        role,
+        consumers,
+    }))
 }
 
 /// `GET /api/dashboard/summary`
@@ -241,15 +365,20 @@ async fn get_summary(
     let window = TimeWindow::resolve(&query, retention_days)?;
     let model = model_filter(&query);
     let model_for_rollup = model.clone();
+    let scope = resolve_scope(&consumer, &query);
+    let (scope_sql, scope_params) = scope_clause(&scope);
 
     let pool = state.pool.clone();
-    let consumer_id = consumer.consumer_id().to_string();
+    let scope_params_for_unavailable = scope_params.clone();
+    let scope_sql_for_unavailable = scope_sql.clone();
 
     // Blocking SQLite reads run on a blocking thread so a slow query cannot
-    // stall the async runtime.
+    // stall the async runtime. `scope_sql` is a static-shaped fragment built
+    // from a trusted `Scope` (never from user input), so concatenation is safe;
+    // its parameters are bound positionally after it.
     let summary = tokio::task::spawn_blocking(move || {
         pool.read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT
                     COALESCE(SUM(request_count), 0),
@@ -271,37 +400,46 @@ async fn get_summary(
                          THEN SUM(success_count) * 1.0 / SUM(request_count)
                          ELSE 0.0 END
                 FROM usage_hourly
-                WHERE consumer_id = ?1
-                  AND hour >= ?2
-                  AND hour <= ?3
-                  AND (?4 IS NULL OR model = ?4)
+                WHERE {scope_sql}
+                  AND hour >= ?
+                  AND hour <= ?
+                  AND (? IS NULL OR model = ?)
                 "#,
-            )?;
+                scope_sql = scope_sql,
+            ))?;
 
-            stmt.query_row(
-                rusqlite::params![
-                    consumer_id,
-                    window.start_hour,
-                    window.end_hour,
-                    model_for_rollup
-                ],
-                |row| {
-                    let total_requests: i64 = row.get(0)?;
-                    let success_count: i64 = row.get(1)?;
-                    Ok(SummaryResponse {
-                        total_requests: total_requests as u64,
-                        success_count: success_count as u64,
-                        failure_count: row.get::<_, i64>(2)? as u64,
-                        total_input_tokens: row.get::<_, i64>(3)? as u64,
-                        total_output_tokens: row.get::<_, i64>(4)? as u64,
-                        total_cached_tokens: row.get::<_, i64>(5)? as u64,
-                        avg_latency_ms: row.get(6)?,
-                        avg_ttft_ms: row.get(7)?,
-                        success_rate: row.get(8)?,
-                        unavailable_usage_count: 0,
-                    })
-                },
-            )
+            let mut params: Vec<rusqlite::types::Value> = scope_params;
+            params.push(rusqlite::types::Value::Text(window.start_hour.clone()));
+            params.push(rusqlite::types::Value::Text(window.end_hour.clone()));
+            params.push(
+                model_for_rollup
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                model_for_rollup
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+
+            stmt.query_row(rusqlite::params_from_iter(params.iter()), |row| {
+                let total_requests: i64 = row.get(0)?;
+                let success_count: i64 = row.get(1)?;
+                Ok(SummaryResponse {
+                    total_requests: total_requests as u64,
+                    success_count: success_count as u64,
+                    failure_count: row.get::<_, i64>(2)? as u64,
+                    total_input_tokens: row.get::<_, i64>(3)? as u64,
+                    total_output_tokens: row.get::<_, i64>(4)? as u64,
+                    total_cached_tokens: row.get::<_, i64>(5)? as u64,
+                    avg_latency_ms: row.get(6)?,
+                    avg_ttft_ms: row.get(7)?,
+                    success_rate: row.get(8)?,
+                    unavailable_usage_count: 0,
+                })
+            })
         })
     })
     .await
@@ -316,22 +454,40 @@ async fn get_summary(
     // tokens were left out. In-flight rows are excluded because they have no
     // terminal state yet, and recovery resolves them either way.
     let pool = state.pool.clone();
-    let consumer_id = consumer.consumer_id().to_string();
     let window_start = window.start_ts.clone();
     let window_end = window.end_ts.clone();
     let unavailable = tokio::task::spawn_blocking(move || {
         pool.read(|conn| {
+            let mut params: Vec<rusqlite::types::Value> = scope_params_for_unavailable;
+            params.push(rusqlite::types::Value::Text(window_start.clone()));
+            params.push(rusqlite::types::Value::Text(window_end.clone()));
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+
             conn.query_row(
-                r#"
-                SELECT COUNT(*) FROM usage_records
-                WHERE consumer_id = ?1
-                  AND created_at >= ?2
-                  AND created_at < ?3
-                  AND (?4 IS NULL OR model = ?4)
-                  AND usage_status = 'unavailable'
-                  AND request_status <> 'in_flight'
-                "#,
-                rusqlite::params![consumer_id, window_start, window_end, model],
+                &format!(
+                    r#"
+                    SELECT COUNT(*) FROM usage_records
+                    WHERE {scope_sql}
+                      AND created_at >= ?
+                      AND created_at < ?
+                      AND (? IS NULL OR model = ?)
+                      AND usage_status = 'unavailable'
+                      AND request_status <> 'in_flight'
+                    "#,
+                    scope_sql = scope_sql_for_unavailable,
+                ),
+                rusqlite::params_from_iter(params.iter()),
                 |row| row.get::<_, i64>(0),
             )
         })
@@ -359,6 +515,15 @@ pub struct TimeseriesPoint {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    /// Sum of request durations in milliseconds for this hour's rollup rows.
+    /// Latency means are computed by the consumer over the bucketed sum, so the
+    /// weight (request count) survives a bucket merge.
+    pub total_duration_ms: u64,
+    /// Sum of time-to-first-token (ms) among requests that reported one.
+    pub total_ttft_ms: u64,
+    /// Requests in this hour that reported a time to first token. Zero means the
+    /// TTFT total above is meaningless (no request measured one).
+    pub ttft_count: u64,
 }
 
 async fn get_timeseries(
@@ -369,12 +534,13 @@ async fn get_timeseries(
     let retention_days = state.config.read().config.database.retention_days;
     let window = TimeWindow::resolve(&query, retention_days)?;
     let model = model_filter(&query);
-    let consumer_id = consumer.consumer_id().to_string();
+    let scope = resolve_scope(&consumer, &query);
+    let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
     let data = tokio::task::spawn_blocking(move || {
         pool.read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT
                     hour,
@@ -383,31 +549,55 @@ async fn get_timeseries(
                     SUM(failure_count),
                     SUM(total_input_tokens),
                     SUM(total_output_tokens),
-                    SUM(total_cached_tokens)
+                    SUM(total_cached_tokens),
+                    -- Raw latency totals rather than per-hour means: the consumer
+                    -- buckets points into local-time intervals and re-weights by
+                    -- request_count / ttft_count when it merges hours. A mean
+                    -- could not be re-weighted across a merge.
+                    SUM(total_duration_ms),
+                    SUM(total_ttft_ms),
+                    SUM(ttft_count)
                 FROM usage_hourly
-                WHERE consumer_id = ?1
-                  AND hour >= ?2
-                  AND hour <= ?3
-                  AND (?4 IS NULL OR model = ?4)
+                WHERE {scope_sql}
+                  AND hour >= ?
+                  AND hour <= ?
+                  AND (? IS NULL OR model = ?)
                 GROUP BY hour
                 ORDER BY hour ASC
                 "#,
-            )?;
+                scope_sql = scope_sql,
+            ))?;
 
-            let rows = stmt.query_map(
-                rusqlite::params![consumer_id, window.start_hour, window.end_hour, model],
-                |row| {
-                    Ok(TimeseriesPoint {
-                        hour: row.get(0)?,
-                        requests: row.get::<_, i64>(1)? as u64,
-                        success_count: row.get::<_, i64>(2)? as u64,
-                        failure_count: row.get::<_, i64>(3)? as u64,
-                        input_tokens: row.get::<_, i64>(4)? as u64,
-                        output_tokens: row.get::<_, i64>(5)? as u64,
-                        cached_tokens: row.get::<_, i64>(6)? as u64,
-                    })
-                },
-            )?;
+            let mut params: Vec<rusqlite::types::Value> = scope_params;
+            params.push(rusqlite::types::Value::Text(window.start_hour.clone()));
+            params.push(rusqlite::types::Value::Text(window.end_hour.clone()));
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok(TimeseriesPoint {
+                    hour: row.get(0)?,
+                    requests: row.get::<_, i64>(1)? as u64,
+                    success_count: row.get::<_, i64>(2)? as u64,
+                    failure_count: row.get::<_, i64>(3)? as u64,
+                    input_tokens: row.get::<_, i64>(4)? as u64,
+                    output_tokens: row.get::<_, i64>(5)? as u64,
+                    cached_tokens: row.get::<_, i64>(6)? as u64,
+                    total_duration_ms: row.get::<_, i64>(7)? as u64,
+                    total_ttft_ms: row.get::<_, i64>(8)? as u64,
+                    ttft_count: row.get::<_, i64>(9)? as u64,
+                })
+            })?;
 
             rows.collect::<Result<Vec<_>, _>>()
         })
@@ -430,6 +620,10 @@ pub struct RequestsResponse {
 pub struct RequestItem {
     pub request_id: String,
     pub created_at: String,
+    /// Which consumer the row belongs to. A consumer-key context can only ever
+    /// see its own, so this is redundant there; a manager view needs it to label
+    /// each row in the cross-consumer table.
+    pub consumer_id: String,
     pub model: String,
     pub endpoint: String,
     pub streaming: bool,
@@ -443,6 +637,9 @@ pub struct RequestItem {
     pub ttft_ms: Option<u64>,
     /// Present only for failed/interrupted requests; may repeat upstream text.
     pub error_message: Option<String>,
+    /// Bounded raw text from a non-streaming non-2xx upstream response.
+    /// This is scoped by the same authenticated-key query as every request field.
+    pub error_body: Option<String>,
 }
 
 async fn get_requests(
@@ -455,7 +652,8 @@ async fn get_requests(
     let limit = query.limit.clamp(1, MAX_LIMIT);
     let model = model_filter(&query).map(|m| m.to_string());
     let status = status_filter(&query);
-    let consumer_id = consumer.consumer_id().to_string();
+    let scope = resolve_scope(&consumer, &query);
+    let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
     // Cursors are signed with the per-database key: an unsigned or edited one is
@@ -476,41 +674,61 @@ async fn get_requests(
             let mut sql = String::from(
                 r#"
                 SELECT
-                    id, request_id, created_at, model, endpoint, streaming,
-                    http_status, request_status, usage_status,
+                    id, request_id, created_at, consumer_id, model, endpoint,
+                    streaming, http_status, request_status, usage_status,
                     input_tokens, output_tokens, cached_tokens,
-                    duration_ms, ttft_ms, error_message
+                    duration_ms, ttft_ms, error_message, error_body
                 FROM usage_records
-                WHERE consumer_id = ?1
-                  AND created_at >= ?2
-                  AND created_at < ?3
-                  AND (?4 IS NULL OR model = ?4)
-                  AND (?5 IS NULL OR request_status = ?5)
                 "#,
             );
+            sql.push_str("WHERE ");
+            sql.push_str(&scope_sql);
+            sql.push_str(" AND created_at >= ? AND created_at < ?\n");
+            sql.push_str(" AND (? IS NULL OR model = ?)\n");
+            sql.push_str(" AND (? IS NULL OR request_status = ?)\n");
             if cursor.is_some() {
-                sql.push_str("AND (created_at, id) < (?6, ?7)\n");
+                sql.push_str("AND (created_at, id) < (?, ?)\n");
             }
-            sql.push_str("ORDER BY created_at DESC, id DESC\nLIMIT ?8");
+            sql.push_str("ORDER BY created_at DESC, id DESC\nLIMIT ?");
 
             let mut stmt = conn.prepare(&sql)?;
 
-            let (cursor_created, cursor_id) = cursor.clone().unwrap_or_else(|| (String::new(), 0));
-            let fetch = limit as i64 + 1;
+            let mut params: Vec<rusqlite::types::Value> = scope_params;
+            params.push(rusqlite::types::Value::Text(window.start_ts.clone()));
+            params.push(rusqlite::types::Value::Text(window.end_ts.clone()));
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                model
+                    .as_ref()
+                    .map(|m| rusqlite::types::Value::Text(m.clone()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                status
+                    .as_ref()
+                    .map(|s| rusqlite::types::Value::Text(s.to_string()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
+            params.push(
+                status
+                    .as_ref()
+                    .map(|s| rusqlite::types::Value::Text(s.to_string()))
+                    .unwrap_or(rusqlite::types::Value::Null),
+            );
 
-            let rows = stmt.query_map(
-                rusqlite::params![
-                    consumer_id,
-                    window.start_ts,
-                    window.end_ts,
-                    model,
-                    status,
-                    cursor_created,
-                    cursor_id,
-                    fetch,
-                ],
-                map_row,
-            )?;
+            let (cursor_created, cursor_id) = cursor.clone().unwrap_or_else(|| (String::new(), 0));
+            if cursor.is_some() {
+                params.push(rusqlite::types::Value::Text(cursor_created));
+                params.push(rusqlite::types::Value::Integer(cursor_id));
+            }
+            params.push(rusqlite::types::Value::Integer(limit as i64 + 1));
+
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), map_row)?;
 
             let mut items: Vec<(i64, RequestItem)> = rows.collect::<Result<_, _>>()?;
 
@@ -549,22 +767,30 @@ async fn get_models(
 ) -> Result<Json<ModelsResponse>, DashboardError> {
     let retention_days = state.config.read().config.database.retention_days;
     let window = TimeWindow::resolve(&query, retention_days)?;
-    let consumer_id = consumer.consumer_id().to_string();
+    let scope = resolve_scope(&consumer, &query);
+    let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
+    // No model filter here: this endpoint answers "which models has this scope
+    // used", and filtering it by the caller's selected model would collapse the
+    // dropdown to exactly that selection. The consumer scope (including the
+    // manager narrowing) still applies.
     let models = tokio::task::spawn_blocking(move || {
         pool.read(|conn| {
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 r#"
                 SELECT DISTINCT model FROM usage_hourly
-                WHERE consumer_id = ?1 AND hour >= ?2 AND hour <= ?3
+                WHERE {scope_sql} AND hour >= ? AND hour <= ?
                 ORDER BY model ASC
                 "#,
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![consumer_id, window.start_hour, window.end_hour],
-                |row| row.get::<_, String>(0),
-            )?;
+                scope_sql = scope_sql,
+            ))?;
+            let mut params: Vec<rusqlite::types::Value> = scope_params;
+            params.push(rusqlite::types::Value::Text(window.start_hour.clone()));
+            params.push(rusqlite::types::Value::Text(window.end_hour.clone()));
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })?;
             rows.collect::<Result<Vec<_>, _>>()
         })
     })
@@ -582,18 +808,20 @@ fn map_row(row: &rusqlite::Row) -> rusqlite::Result<(i64, RequestItem)> {
         RequestItem {
             request_id: row.get(1)?,
             created_at: row.get(2)?,
-            model: row.get(3)?,
-            endpoint: row.get(4)?,
-            streaming: row.get::<_, i32>(5)? != 0,
-            http_status: row.get::<_, Option<i64>>(6)?.map(|v| v as u16),
-            request_status: row.get(7)?,
-            usage_status: row.get(8)?,
-            input_tokens: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-            output_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-            cached_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-            duration_ms: row.get::<_, i64>(12)? as u64,
-            ttft_ms: row.get::<_, Option<i64>>(13)?.map(|v| v as u64),
-            error_message: row.get(14)?,
+            consumer_id: row.get(3)?,
+            model: row.get(4)?,
+            endpoint: row.get(5)?,
+            streaming: row.get::<_, i32>(6)? != 0,
+            http_status: row.get::<_, Option<i64>>(7)?.map(|v| v as u16),
+            request_status: row.get(8)?,
+            usage_status: row.get(9)?,
+            input_tokens: row.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+            output_tokens: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+            cached_tokens: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+            duration_ms: row.get::<_, i64>(13)? as u64,
+            ttft_ms: row.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+            error_message: row.get(15)?,
+            error_body: row.get(16)?,
         },
     ))
 }
@@ -1181,6 +1409,129 @@ mod tests {
         );
         query.status = "all".into();
         assert_eq!(status_filter(&query), None);
+    }
+
+    // ── manager scope resolution ──────────────────────────────────────────────
+
+    fn consumer_ctx(consumer_id: &str) -> ConsumerContext {
+        ConsumerContext::new(consumer_id.to_string(), consumer_id.to_string(), Vec::new())
+    }
+
+    fn manager_ctx() -> ConsumerContext {
+        ConsumerContext::manager()
+    }
+
+    fn q_with_consumers(consumers: &str) -> DashboardQuery {
+        DashboardQuery {
+            range: "24h".to_string(),
+            consumers: consumers.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A consumer key is pinned to its own consumer no matter what the
+    /// `consumers` parameter says — the parameter never scopes a key.
+    #[test]
+    fn test_consumer_key_scope_ignores_the_consumers_parameter() {
+        let ctx = consumer_ctx("acme");
+        assert!(matches!(
+            resolve_scope(&ctx, &q_with_consumers("competitor")),
+            Scope::One(ref id) if id == "acme"
+        ));
+    }
+
+    /// A manager with no parameter sees every consumer.
+    #[test]
+    fn test_manager_without_a_parameter_sees_every_consumer() {
+        assert!(matches!(
+            resolve_scope(&manager_ctx(), &q_with_consumers("")),
+            Scope::All
+        ));
+    }
+
+    /// A manager's request names its consumers verbatim — the request narrows,
+    /// never widens, and there is no config list to intersect with any more.
+    #[test]
+    fn test_manager_request_narrows_to_the_named_consumers() {
+        assert!(matches!(
+            resolve_scope(&manager_ctx(), &q_with_consumers("b,d")),
+            Scope::List(ref list) if *list == vec!["b".to_string(), "d".to_string()]
+        ));
+    }
+
+    /// An unknown name is taken verbatim and matches no rows at query time —
+    /// the wrong answer would be a silent fall-back to everything. This pins
+    /// that a future re-introduction of config-capping cannot go unnoticed.
+    #[test]
+    fn test_manager_requesting_an_unknown_consumer_gets_it_verbatim() {
+        assert!(matches!(
+            resolve_scope(&manager_ctx(), &q_with_consumers("ghost")),
+            Scope::List(ref list) if *list == vec!["ghost".to_string()]
+        ));
+    }
+
+    /// Separators with no name in them are a typo'd empty request, not a
+    /// filter: the manager still sees everything.
+    #[test]
+    fn test_manager_request_with_only_separators_means_all() {
+        assert!(matches!(
+            resolve_scope(&manager_ctx(), &q_with_consumers(" , ,")),
+            Scope::All
+        ));
+    }
+
+    #[test]
+    fn test_manager_query_parameter_commas_and_whitespace_are_split() {
+        assert!(matches!(
+            resolve_scope(&manager_ctx(), &q_with_consumers(" a ,,b ")),
+            Scope::List(ref list) if *list == vec!["a".to_string(), "b".to_string()]
+        ));
+    }
+
+    /// `/api/me` offers exactly the consumers the ledger holds terminal rows
+    /// for, ordered — the same table the other tabs read, deduplicated.
+    #[test]
+    fn test_distinct_consumers_reads_the_rollup_ordered_and_deduplicated() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE usage_hourly (consumer_id TEXT NOT NULL)", [])
+            .unwrap();
+        assert!(
+            distinct_consumers(&conn).unwrap().is_empty(),
+            "an empty ledger offers no consumer"
+        );
+        for consumer in ["beta", "acme", "beta"] {
+            conn.execute(
+                "INSERT INTO usage_hourly (consumer_id) VALUES (?1)",
+                [consumer],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            distinct_consumers(&conn).unwrap(),
+            vec!["acme".to_string(), "beta".to_string()]
+        );
+    }
+
+    /// The SQL fragment shapes: a single consumer pins, a list becomes an
+    /// `IN (...)`, and the everything scope is a constant the planner folds.
+    #[test]
+    fn test_scope_clause_renders_sql_fragments() {
+        let (one_sql, one_params) = scope_clause(&Scope::One("acme".into()));
+        assert_eq!(one_sql, "consumer_id = ?");
+        assert_eq!(one_params.len(), 1);
+
+        let (list_sql, list_params) = scope_clause(&Scope::List(vec!["a".into(), "b".into()]));
+        assert_eq!(list_sql, "consumer_id IN (?,?)");
+        assert_eq!(list_params.len(), 2);
+
+        let (all_sql, all_params) = scope_clause(&Scope::All);
+        assert_eq!(all_sql, "1 = 1");
+        assert!(all_params.is_empty());
+
+        // Empty list -> IN () -> SQLite FALSE, the correct "nothing granted".
+        let (empty_sql, empty_params) = scope_clause(&Scope::List(Vec::new()));
+        assert_eq!(empty_sql, "consumer_id IN ()");
+        assert!(empty_params.is_empty());
     }
 
     #[test]

@@ -143,6 +143,38 @@ async fn each_key_sees_only_its_own_usage() {
         .map(|p| p["requests"].as_u64().unwrap_or(0))
         .sum();
     assert_eq!(requests, 2, "timeseries must sum to the same traffic");
+
+    // consumer-a made 2 completed non-streaming requests: durations were recorded,
+    // but no request measured a first token, so the TTFT inputs must stay at
+    // zero rather than inventing a TTFT for non-streaming traffic.
+    let a_point = points
+        .iter()
+        .find(|p| p["requests"].as_u64() == Some(2))
+        .expect("the hour with consumer-a's traffic");
+    assert!(
+        a_point["total_duration_ms"].as_u64().unwrap_or(0) > 0,
+        "both requests recorded a duration"
+    );
+    assert_eq!(
+        a_point["ttft_count"], 0,
+        "non-streaming requests report no ttft; ttft_count must not count them"
+    );
+    assert_eq!(a_point["total_ttft_ms"], 0);
+
+    // consumer-b's single request is scoped away from consumer-a's timeseries:
+    // the rollup (and its latency inputs) must not leak across keys.
+    let b_series = client
+        .get_json(&server.url("/api/dashboard/timeseries"), Some(OTHER_KEY))
+        .await;
+    let b_points = b_series.json()["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let b_total: u64 = b_points
+        .iter()
+        .map(|p| p["requests"].as_u64().unwrap_or(0))
+        .sum();
+    assert_eq!(b_total, 1, "the other consumer sees 1 request, not 3");
 }
 
 #[tokio::test]
@@ -353,7 +385,7 @@ async fn the_model_and_status_filters_narrow_the_result() {
 
     chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
     chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
-    chat(&client, &server, CLIENT_KEY, "gpt-4o-mini", true).await;
+    chat(&client, &server, CLIENT_KEY, "mock-model", true).await;
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     let by_model = client
@@ -520,4 +552,93 @@ async fn a_consumer_with_no_traffic_gets_an_empty_but_valid_view() {
         .await;
     assert_eq!(requests.json()["data"].as_array().map(|a| a.len()), Some(0));
     assert_eq!(requests.json()["next_cursor"], Value::Null);
+}
+
+#[tokio::test]
+async fn timeseries_ttft_is_weighted_over_reporting_requests_only() {
+    // The mock serves one behaviour at a time, so the stream request runs first
+    // under ChatStream and the plain request after the switch to ChatJson. With
+    // upstream_is_sse true the proxy streams every response — including one the
+    // client did not ask to stream — so both requests must be separated here.
+    let upstream = MockUpstream::start(Behaviour::ChatStream {
+        prompt: 10,
+        completion: 10,
+        cached: 0,
+        events: 3,
+        delay_ms: 0,
+    })
+    .await;
+    let server = TestServer::start(Spec::new(&upstream)).await;
+    let client = TestClient::new();
+
+    // A stream measures time to first token; a plain completion does not. Both
+    // land in the same hour bucket, so the TTFT inputs must cover only the
+    // stream (ttft_count = 1), not both requests.
+    let response = client
+        .call(
+            Method::POST,
+            &server.url("/v1/chat/completions"),
+            Some(CLIENT_KEY),
+            crate::common::chat_stream_request("gpt-4o"),
+            &[],
+        )
+        .await;
+    let stream_id = response.request_id().expect("x-request-id on stream");
+    let stream_row = wait_for_terminal(&server.db_path, &stream_id, WAIT_TIMEOUT).await;
+    let stream_ttft = stream_row.ttft_ms.expect("a stream measures a first token");
+
+    upstream.set_behaviour(Behaviour::ChatJson {
+        prompt: 10,
+        completion: 10,
+        cached: 0,
+    });
+    let response = client
+        .call(
+            Method::POST,
+            &server.url("/v1/chat/completions"),
+            Some(CLIENT_KEY),
+            crate::common::chat_request("gpt-4o"),
+            &[],
+        )
+        .await;
+    let plain_id = response.request_id().expect("x-request-id on plain");
+    wait_for_terminal(&server.db_path, &plain_id, WAIT_TIMEOUT).await;
+    wait_for_terminal_count(&server.db_path, 2, WAIT_TIMEOUT).await;
+
+    let series = client
+        .get_json(&server.url("/api/dashboard/timeseries"), Some(CLIENT_KEY))
+        .await;
+    let points = series.json()["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let point = points
+        .iter()
+        .find(|p| p["requests"].as_u64() == Some(2))
+        .expect("the hour containing both requests");
+    assert_eq!(
+        point["requests"], 2,
+        "both the stream and the plain request roll up into one hour"
+    );
+    // Both requests recorded a duration, but only the stream reported a first
+    // token: the TTFT denominator must be 1, not 2. The consumer computes
+    // avg_ttft_ms as total_ttft_ms / ttft_count, so this count is the whole
+    // invariant (unavailable is not zero) — a ttft_count of 2 would fabricate
+    // TTFT for a request that never measured one.
+    assert!(
+        point["total_duration_ms"].as_u64().unwrap_or(0) > 0,
+        "duration was recorded for both requests"
+    );
+    assert_eq!(
+        point["ttft_count"], 1,
+        "only the stream reported a first token; the plain request must not count"
+    );
+    // The sum must be exactly what the ledger recorded for that one stream —
+    // not a recomputed or fabricated figure. (A measured 0 ms is legitimate:
+    // the mock's first frame can arrive in under a millisecond.)
+    assert_eq!(
+        point["total_ttft_ms"].as_i64(),
+        Some(stream_ttft),
+        "the rollup's ttft sum must equal the raw row's ttft_ms"
+    );
 }

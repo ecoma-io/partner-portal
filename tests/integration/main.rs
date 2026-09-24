@@ -15,6 +15,7 @@ mod auth;
 mod dashboard;
 mod hot_reload;
 mod ledger_durability;
+mod manager;
 mod model_allow_list;
 mod proxy_chat_completions;
 mod sse;
