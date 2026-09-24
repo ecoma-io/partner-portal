@@ -1,10 +1,25 @@
 {
   "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
-  "$comment": "One component, the repository root: the version lives in Cargo.toml, and release-please's `rust` strategy updates Cargo.toml and Cargo.lock together — which is the pair that has to agree for `--locked` to work anywhere. dashboard/package.json is deliberately not a second component: the bundle is embedded in the binary and ships with it, so a separate dashboard version would be a second number nobody deploys. `include-component-in-tag` keeps the tag bare `vX.Y.Z` rather than `partner-portal-vX.Y.Z`: the tag is the artifact's name, and `deploy/rolling-update.sh` and the release jobs take it as the version they publish. The title pattern is pinned scopeless on purpose, not as a style choice: release-please's default is `chore${scope}: release${component} ${version}` and it fills `${scope}` with the TARGET BRANCH, so a Release PR would arrive titled `chore(main): release 0.1.0` — and `main` is not one of the scopes commitlint.config.mjs declares, because it is not an area of the code at all. The pattern matters twice over: it is the PR title AND the commit message release-please writes (the commit message is the title string), and the commit-msg hook checks both. Scopeless `chore: release 0.1.0` passes; every restatement of the default fails.",
   "release-type": "rust",
-  "include-component-in-tag": false,
-  "pull-request-title-pattern": "chore: release${component} ${version}",
   "packages": {
     ".": {}
-  }
+  },
+  "include-component-in-tag": false,
+  "initial-version": "0.1.0",
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "pull-request-title-pattern": "chore(release): release ${version}",
+  "changelog-sections": [
+    { "type": "feat", "section": "Features" },
+    { "type": "fix", "section": "Bug Fixes" },
+    { "type": "docs", "section": "Documentation" },
+    { "type": "revert", "section": "Reverts" },
+    { "type": "perf", "section": "Internal", "hidden": true },
+    { "type": "refactor", "section": "Internal", "hidden": true },
+    { "type": "test", "section": "Internal", "hidden": true },
+    { "type": "build", "section": "Internal", "hidden": true },
+    { "type": "ci", "section": "Internal", "hidden": true },
+    { "type": "chore", "section": "Internal", "hidden": true },
+    { "type": "style", "section": "Internal", "hidden": true }
+  ]
 }
