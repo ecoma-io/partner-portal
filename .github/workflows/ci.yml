@@ -270,7 +270,11 @@ jobs:
           tool: cargo-audit
 
       - name: cargo-audit
-        run: cargo audit --deny warnings
+        # RUSTSEC-2026-0009 (`time` < 0.3.47) is ignored with a written
+        # reachability argument in deny.toml; cargo-audit does not read that
+        # file's policy, so the same verdict is carried here by flag. The two
+        # entries change together — see deny.toml before touching either.
+        run: cargo audit --deny warnings --ignore RUSTSEC-2026-0009
 
       # ---------------------------------------------------------------------
       # Secrets in the tree and in history.
