@@ -112,9 +112,16 @@ COPY --from=dashboard /src/dashboard/dist ./dashboard/dist
 # The cargo caches are mounts, not layers: the registry and the target dir never
 # end up in the image, but a rebuild after a source-only change still reuses the
 # compiled dependencies.
+#
+# `--features hyper-rustls` is not optional here. Without it the connector is
+# plain-HTTP-only, so an `https://` upstream — what `config.example.yaml`
+# documents, and what every real OpenAI-compatible API is — fails as a 502 with
+# no TLS handshake ever attempted. It is a Cargo feature rather than a default
+# only so the `<1s` unit-test loop need not build rustls; every path that
+# *ships* a binary opts in explicitly (see .github/workflows/release.yml).
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target,target=/src/target \
-    cargo build --release --locked --bin partner-portal \
+    cargo build --release --locked --features hyper-rustls --bin partner-portal \
     && cp /src/target/release/partner-portal /usr/local/bin/partner-portal
 
 # The binary must actually carry a dashboard. build.rs only *warns* when
