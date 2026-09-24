@@ -15,7 +15,7 @@ describes the code as it is, not as it was intended.
 | `src/auth/` | Bearer extraction, server-side consumer identity (`Authenticated` extractor) |
 | `src/proxy/` | Upstream client, request handler, metering lifecycle, SSE usage scanner |
 | `src/ledger/` | SQLite pool, schema, bounded write queue, crash recovery, retention |
-| `src/dashboard/` | Consumer-scoped REST API and the SSE invalidation stream |
+| `src/dashboard/` | Consumer-scoped REST API (plus the one manager widening, ADR 0011/0013) and the SSE invalidation stream |
 | `src/web/` | Embedded dashboard assets and the SPA fallback |
 | `src/admin/` | `/healthz`, `/readyz`, `/version` |
 
@@ -48,8 +48,10 @@ from the first request on (`src/main.rs`).
   request ──▶ Authenticated extractor ──▶ ConsumerContext (consumer_id, key_name)
               key found in the live config snapshot?  no ──▶ 401 (no-store)
   ──▶ Endpoint::from_path(path)  ──▶ None ──▶ 404 JSON
-  ──▶ Endpoint::Models ──▶ proxied, not metered, no ledger row
+  ──▶ Endpoint::Models ──▶ proxied, not metered, no ledger row,
+                          body filtered to the key's allowed_models (ADR 0012)
   ──▶ parse body as JSON (tolerated if not JSON: model becomes "unknown")
+  ──▶ model in the key's allowed_models?  no ──▶ 404 model_not_found, unmetered
   ──▶ request_id = UUIDv7
   ──▶ ledger.accept(record)                     ══ COMMIT (in_flight)
         failure ──▶ mark_unhealthy() + 503 metering_error   [request not forwarded]
@@ -169,6 +171,17 @@ Indexes: a partial index on `in_flight` for recovery, `created_at` for retention
 and `(consumer_id, created_at, id)` so the dashboard's keyset pagination is an
 index-only range seek rather than a sort (`src/ledger/schema.sql`).
 
+`GET /api/dashboard/timeseries` groups `usage_hourly` by hour and returns the
+counts and token sums alongside three raw rollup inputs — `total_duration_ms`,
+`total_ttft_ms` and `ttft_count` — rather than a per-hour mean latency or TTFT.
+The dashboard buckets those UTC hours into local-time intervals before drawing,
+and a mean cannot be re-weighted across a merge; the sums and their weights
+(`request_count` for latency, `ttft_count` for TTFT) can, so the interval figures
+stay correct at every range. `ttft_count` is zero for an interval in which no
+request reported a time to first token, and the client renders a gap there rather
+than a zero — the same rule as invariant 3, carried up from the raw row to the
+rollup (`src/dashboard/api.rs`, `dashboard/src/views/Dashboard.vue`).
+
 ## Readiness model
 
 `/readyz` reports three independent facts and fails if either of the first two
@@ -196,6 +209,17 @@ Identity flows one way only:
         │
         └─ every dashboard query: WHERE consumer_id = ?1           (src/dashboard/api.rs)
 ```
+
+The one deliberate widening is the optional `manager:` password
+(ADR 0011, as widened by ADR 0013). It is matched after the keys, opens
+**only** the dashboard routes (never the proxy — `/v1/*` with a manager
+password is a 403, so the metering path can never mint a row from it), and
+sees **every** consumer: the `consumers=` query parameter is a pure filter
+over that view, fed by the selector that `/api/me` fills from the ledger's
+distinct `consumer_id`s (a consumer with no terminal row is not offered until
+it has usage). A consumer key's `consumers=` parameter is ignored. A
+deployment that never writes a `manager:` block keeps the ADR 0008 behaviour
+byte-for-byte.
 
 The SSE stream carries no usage data at all — only "something changed, refetch" —
 so a shared notification bus cannot leak one consumer's traffic to another. The

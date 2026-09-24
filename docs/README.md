@@ -45,6 +45,9 @@ of the invariants listed in [`AGENTS.md`](../AGENTS.md).
 | [0008](adr/0008-server-side-consumer-identity.md) | Server-side consumer identity | Identity comes from the credential, never from the request |
 | [0009](adr/0009-streaming-stays-incremental.md) | Streaming stays incremental | Frames are forwarded as they arrive; scanning is bounded at 256 KiB |
 | [0010](adr/0010-bodies-are-never-stored.md) | Bodies are never stored | The ledger is metadata; prompts and completions are not persisted |
+| [0011](adr/0011-manager-password-cross-consumer-view.md) | Manager password: one deliberate cross-consumer view | An operator password opens dashboard-only usage across consumers — superseded by [0013](adr/0013-manager-sees-all-consumers.md), which removed its allow-list |
+| [0012](adr/0012-per-key-model-allow-list.md) | Per-key model allow-list | Each key names the models it may call (strict-by-default); a refused model never reaches the upstream or the ledger, and `/v1/models` is filtered to the same list |
+| [0013](adr/0013-manager-sees-all-consumers.md) | Manager sees every consumer; config carries only what it must | The manager allow-list is gone — `consumers=` is a filter fed from the ledger, `keys[].metadata` is deleted, and the listen address is `PARTNER_PORTAL_LISTEN` |
 
 ### Adding an ADR
 

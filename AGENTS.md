@@ -54,7 +54,7 @@ tests that enforce it, and the superseded ADR, in one pull request.
 |---|---|
 | `src/main.rs` | Composition root: config load, recovery, listener, layer stack, signal handling, drain |
 | `src/lib.rs` | The crate's public surface and the invariants above |
-| `src/config/` | YAML types and defaults (`types.rs`), validation (`loader.rs`), the 1 s content-hash hot-reload watcher (`hot_reload.rs`) |
+| `src/config/` | YAML types and defaults (`types.rs`), validation (`loader.rs`), the listen-address env (`listen.rs`), the 1 s content-hash hot-reload watcher (`hot_reload.rs`) |
 | `src/auth/` | `Authenticated` extractor, Bearer parsing, server-side identity derivation |
 | `src/proxy/` | Upstream client (`client.rs`), request handler and `StreamMeter` (`handler.rs`), SSE scanner (`sse_scan.rs`), per-endpoint usage extraction (`usage.rs`) |
 | `src/ledger/` | `schema.sql`, single-writer task (`writer.rs`), crash recovery (`recovery.rs`), retention (`retention.rs`), fixed-width timestamps (`timefmt.rs`), pool |
@@ -66,6 +66,7 @@ tests that enforce it, and the superseded ADR, in one pull request.
 | `benches/` | `ledger_write` — commit-ack latency and throughput against the real writer |
 | `docs/` | [Architecture overview](docs/architecture/overview.md), [ADRs](docs/adr/) — indexed in [`docs/README.md`](docs/README.md) |
 | `deploy/` | Compose file, nginx config, smoke-test script |
+| `dev/` | Local dev fixtures: a stub upstream that draws its sizes, cache hits, frame counts and 15–26s durations per request and can be asked to fail (`x-dev-fail`), a request generator for the load loop, and the dev config. Separate from `deploy/`, which must stay deterministic |
 
 ## Commands
 
@@ -80,6 +81,52 @@ cargo clippy --all-targets -- -D warnings
 cargo bench --bench ledger_write
 pnpm --dir dashboard install && pnpm --dir dashboard build   # embeds the dashboard
 ```
+
+For a running stack to look at rather than a build to run:
+
+```bash
+scripts/dev-up.sh          # stub upstream + proxy + vite; all native, no image build
+scripts/dev-load.sh        # asks 2 rps, 30:1 success:failure; fixture requests run 15–26s, so it delivers ~0.4 rps and says so
+scripts/dev-restart.sh     # restart the proxy only, after a Rust edit
+scripts/dev-down.sh        # stop everything; the dev ledger is kept
+```
+
+Nothing in the dev loop is containerised, on purpose. The dashboard is embedded
+at compile time and the release profile is `lto = "thin"` with
+`codegen-units = 1`, so a container-based loop would pay a full image rebuild
+per source edit. `dev/mock-upstream-dev.py` and
+`dev/partner-portal.dev.yaml` are the dev fixtures; the deployment fixtures in
+`deploy/` are separate files, because `deploy/smoke-test.sh` asserts on
+deterministic token counts and must never see a failure the smoke run did not
+ask for.
+
+Four rules about the scripts, each learned the hard way — treat them as
+constraints, not as trivia:
+
+- **`scripts/dev-lib.sh` is sourced, never run, and holds all the
+  process-group handling.** Do not copy it into a fourth script. A group has to
+  be signalled as `kill -TERM -<gid>` with the shell's own builtin: dash rejects
+  a `--` marker before a group id, and the setuid `/bin/kill` fails *silently*
+  under a sandbox, so a script that uses it reports success and leaves the port
+  bound.
+- **Record the group, never the bare pid.** `pnpm` is a four-process chain whose
+  leader exec-replaces and exits, so pid-keyed signalling sees a corpse and
+  leaves vite holding 5173. Liveness is asked of the group for the same reason.
+- **The dev config batches differently from production on purpose**
+  (`batch_size: 8`, `batch_timeout_ms: 20`). `finalize` is awaited before the
+  client is answered, so at dev-loop concurrency the production 1000ms window
+  never fills and every request waits it out — measured at 1.02s per request
+  against 0.035s here. That is invariant 1 working, not a defect; changing it
+  back would be, and changing the *production* defaults to match would be a
+  behaviour change that needs an ADR.
+- **Every fixture duration sits in the 15–26s band on purpose, failures
+  included.** `dev/mock-upstream-dev.py` draws durations uniformly under the
+  dev config's 30s deadline (overall and per-frame idle), and an injected
+  failure thinks for the same band before refusing — a short-heavy tail was
+  tried and filled the duration chart with a blob near zero, and instant
+  failures drew rows at ~0s, the exact artefact the loop exists to prevent.
+  The band is also why `dev-load.sh` delivers ~0.4 rps against an asked 2: it
+  prints the ceiling it can reach instead of pretending.
 
 Two facts about the build:
 
@@ -157,7 +204,7 @@ tests that enforce it — in one pull request.
 
 ## Tests
 
-- **Three tiers.** Unit tests live beside the code (`cargo test --lib`, ~2 s, 133
+- **Three tiers.** Unit tests live beside the code (`cargo test --lib`, ~2 s, 237
   tests). `tests/integration/` drives the real binary as a child process with a
   mock upstream and reads the SQLite file back. `tests/e2e/` covers what is
   defined at the operating-system boundary — signals, a rolling update, crash
@@ -171,8 +218,9 @@ tests that enforce it — in one pull request.
   harness doc in `tests/common/mod.rs`.
 - **Deterministic, no fixed sleeps.** The harness gates on readiness and uses
   ephemeral ports; keep it that way. `test_config_hash_stability` is the cautionary
-  example: it hashes one in-memory instance twice with empty metadata, so it stays
-  green while `Config::hash` on two *parses* of a file can differ.
+  example: it hashes one in-memory instance twice, so it stays green while
+  `Config::hash` on two *parses* of a file once diverged over map ordering — a
+  hand-built value proves less than the input a deployment actually produces.
 - **Benches are not tests.** `cargo bench --bench ledger_write` reports p50/p95/p99
   commit-ack latency; read the table, do not gate on it.
 
@@ -209,13 +257,15 @@ all fixed; what remains is what is genuinely still true.
   several sweeps rather than in one long write transaction that would starve the
   metering writer. `pages_reclaimed` in the sweep's log line is the number to
   read; `0` means the database is not in auto-vacuum mode.
-- **The dashboard login is a single key field, not an account system.** The key
-  is entered on a login screen, validated against the backend (`/api/me`), and
-  held in `localStorage['api_key']`; there is no multi-factor, no password reset
-  and no per-consumer authentication beyond the key itself. That is deliberate —
-  the key *is* the credential — but "login" here means "present a valid key",
-  not "authenticate a user". A standalone deployment rotates its keys through
-  `config.yaml` and hot reload, not through the dashboard.
+- **The dashboard login is a single-key field, not an account system.** The key
+  (or, when configured, the `manager:` password) is entered on a login screen,
+  validated against the backend (`/api/me`), and held in
+  `localStorage['api_key']`; there is no multi-factor, no password reset and no
+  per-consumer authentication beyond the credential itself. That is deliberate —
+  the credential *is* the authentication — but "login" here means "present a
+  valid key or manager password", not "authenticate a user". A standalone
+  deployment rotates its keys and the manager password through `config.yaml`
+  and hot reload, not through the dashboard.
 - **A reclaimed ledger is only safe on a local filesystem.** The advisory
   instance lock and `busy_timeout` serialisation assume the database file is on a
   real local disk; the two-instances-write-one-file story in `tests/e2e` is proven

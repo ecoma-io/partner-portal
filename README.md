@@ -18,7 +18,7 @@ Status: pre-release (`0.1.0`), single-VPS deployment target.
 | A durable usage ledger (SQLite, WAL, `synchronous = FULL`) | A billing or pricing system: it records tokens and counts, never cost |
 | A local API-key authenticator that replaces the credential upstream | An identity provider, OIDC client or rate limiter |
 | An incremental streaming proxy (frames forwarded as they arrive) | A body transformer: requests and responses pass through verbatim |
-| A per-consumer usage dashboard | A multi-tenant admin console: no cross-consumer view exists |
+| A per-consumer usage dashboard, plus an optional operator password with a cross-consumer view (`manager:` in config) | A multi-tenant admin console: no key management, billing, or write surface exists |
 | A single static binary with the dashboard embedded | A TLS terminator: the listener is plain HTTP — put it behind something that speaks TLS |
 
 Three paths are proxied: `/v1/chat/completions`, `/v1/responses`, `/v1/models`.
@@ -76,11 +76,11 @@ log line exist and the response is the caller's only route to either.
 | `ANY /v1/chat/completions` | Bearer | yes (`chat_completions`) | Streaming and non-streaming. Any method is forwarded as-is |
 | `ANY /v1/responses` | Bearer | yes (`responses`) | Streaming and non-streaming |
 | `ANY /v1/models` | Bearer | **no** | Discovery traffic consumes no tokens; metering it would add zero-usage noise to every rollup |
-| `GET /api/me` | Bearer | — | `consumer_id` and `key_name` for the presented key |
-| `GET /api/dashboard/summary` | Bearer | — | Totals for a window, read from the hourly rollup |
-| `GET /api/dashboard/timeseries` | Bearer | — | Per-hour buckets for a window, read from the hourly rollup |
-| `GET /api/dashboard/requests` | Bearer | — | Keyset-paginated raw rows (max 200 per page) |
-| `GET /api/dashboard/models` | Bearer | — | Distinct models this consumer used in the window |
+| `GET /api/me` | Bearer | — | `consumer_id`, `key_name`, `role` (`consumer`/`manager`) and, for a manager, the consumers present in the ledger |
+| `GET /api/dashboard/summary` | Bearer | — | Totals for a window, read from the hourly rollup; `consumers=` narrows a manager |
+| `GET /api/dashboard/timeseries` | Bearer | — | Per-hour buckets for a window, read from the hourly rollup; `consumers=` narrows a manager |
+| `GET /api/dashboard/requests` | Bearer | — | Keyset-paginated raw rows (max 200 per page); `consumers=` narrows a manager |
+| `GET /api/dashboard/models` | Bearer | — | Distinct models this consumer used in the window; `consumers=` narrows a manager |
 | `GET /api/dashboard/events` | Bearer | — | SSE invalidation stream (`{"type":"data_changed"}`), no usage data |
 | `GET /healthz` | none | — | Liveness |
 | `GET /readyz` | none | — | Readiness — 503 while shutting down or while the ledger is degraded |
@@ -102,7 +102,9 @@ cargo build --release
 cp config.example.yaml config.yaml
 $EDITOR config.yaml          # set upstream.base_url, upstream.api_key and at least one local key
 
-# 3. Run.
+# 3. Run. The listen address is the PARTNER_PORTAL_LISTEN environment
+#    variable (default 0.0.0.0:8080) — a port belongs to the deployment, so it
+#    is set next to the config path, never in the YAML.
 PARTNER_PORTAL_CONFIG=config.yaml ./target/release/partner-portal
 
 # 4. First request.
@@ -132,25 +134,38 @@ Then open `http://localhost:8080/`. The bundle is served with a restrictive
 and content-hashed assets are cached immutably while `index.html` is `no-cache`.
 
 The dashboard starts at a **login screen**: enter the local API key assigned to
-your consumer. The key is presented to the running server as a Bearer credential
-and validated against it before anything else renders — no key, no dashboard. A
-rejected key shows the reason and stays on the login screen; the key itself is
-never sent anywhere except in the `Authorization` header (never in a URL), and
-is retained in this browser's `localStorage` only for the life of the session
-you are viewing. **Sign out** clears it and returns to the login screen.
+your consumer — or, if the deployment configured one, the manager password for
+a cross-consumer view. Either is presented to the running server as a Bearer
+credential and validated against it before anything else renders — no key, no
+dashboard. A rejected credential shows the reason and stays on the login screen;
+the value is never sent anywhere except in the `Authorization` header (never in
+a URL), and is retained in this browser's `localStorage` only for the life of
+the session you are viewing. The sign-out icon in the header clears it and
+returns to the login screen.
 
 * The API is authenticated by an `Authorization` header, and so is the event
   stream. The bundled client therefore does not use `EventSource`, which cannot
   set a header: it reads `/api/dashboard/events` with `fetch` and parses the
-  frames itself, so the "Live" badge works in the shipped bundle. A rejected or
-  missing credential is reported as `unauthenticated` and is not retried —
-  retrying a credential that cannot succeed is a 401 storm. The same stream is
-  readable by anything that can send the header:
+  frames itself. A rejected or missing credential is reported as `unauthenticated`
+  and is not retried — retrying a credential that cannot succeed is a 401 storm.
+  The same stream is readable by anything that can send the header:
   `curl -N -H "Authorization: Bearer <key>" http://localhost:8080/api/dashboard/events`.
+* Automatic updates are one preference, controlled by the pause/play icon in the
+  header. Pausing closes that stream and dismisses the data-change toasts, so the
+  view holds still and issues no further stream requests; resuming fetches the
+  current data first and then reopens the stream, so nothing that happened while
+  it was paused is missed. The preference is remembered in this browser across
+  reloads.
 * The dashboard is a read-only view of the consumer the key belongs to. There is
   no parameter anywhere in the API that widens that scope, and the model filter
   is built from `/api/dashboard/models` — the models that key's own traffic
   actually used, never a hardcoded list.
+* An **operator password** can be configured (`manager:` in
+  `config.example.yaml`): it logs into the dashboard with a view over **every**
+  consumer. The consumer selector offers the consumers that have usage in the
+  ledger, and choosing one narrows the view (`consumers=` is a filter, never a
+  grant). The password cannot call `/v1/*` — it is a dashboard credential only —
+  and a key's `consumers=` parameter is ignored. See ADR 0011 and ADR 0013.
 
 ## Configuration
 
@@ -165,7 +180,6 @@ including every default. Summary:
 
 | Setting | Default | Takes effect |
 |---|---|---|
-| `server.listen` | `0.0.0.0:8080` | restart |
 | `server.graceful_shutdown` | `true` | restart |
 | `server.shutdown_grace_secs` | `5` | restart |
 | `server.max_body_size` | `10485760` (10 MiB) | partly: the body-limit layer is built at startup, the per-request read follows the snapshot |
@@ -178,7 +192,8 @@ including every default. Summary:
 | `keys[].key` | — (required, unique, non-empty) | live |
 | `keys[].name` | — (required, non-empty) | live |
 | `keys[].consumer_id` | falls back to `name` | live |
-| `keys[].metadata` | `{}` | live |
+| `keys[].allowed_models` | `[]` (**strict: no models**) | live |
+| `manager.password` | — (optional; empty refuses to load) | live (hot reload) |
 | `database.path` | `partner-portal.db` | restart |
 | `database.retention_days` | `60` | restart for the sweep; live for the dashboard's window validation |
 | `database.queue_size` | `10000` | restart |
@@ -191,6 +206,20 @@ including every default. Summary:
 start with no keys, a duplicate key value, or a malformed upstream URL. Never
 logged: key values are never emitted — the reloader reports *that*
 `upstream.api_key` changed, never what it changed to.
+
+Two values are environment variables, not config: `PARTNER_PORTAL_CONFIG` names
+the file, and `PARTNER_PORTAL_LISTEN` is the listen address (default
+`0.0.0.0:8080`; unset or empty means the default). A port is a property of the
+*deployment* — it has to match the container port mapping, the health check and
+whatever fronts the process, none of which read this YAML — so it is set where
+those are set. An invalid value aborts startup, naming the variable and the
+rejected value.
+
+**Upgrading a configuration that sets `server.listen`, `keys[].metadata` or
+`manager.consumers`:** all three are now unknown fields and fail to parse —
+delete them. A file like that read at boot aborts startup; reached by hot
+reload it is refused with the previous configuration still in force and a log
+line naming the field, so watch the log. See ADR 0013.
 
 ## Accounting and durability
 
@@ -242,11 +271,19 @@ recovered by scanning frames in flight, with the partial-event buffer capped at
 `unavailable`, not buffered forever. Time-to-first-token is measured at the first
 data frame (`src/proxy/handler.rs`, `src/proxy/sse_scan.rs`).
 
-**The dashboard cannot see across consumers.** Consumer identity is derived
-server-side from the presented credential and the live config, and every
-dashboard query is filtered by that value. No request field contributes to
-identity, so there is nothing for a client to tamper with
-(`src/auth/middleware.rs`, `src/dashboard/api.rs`).
+**The dashboard cannot see across consumers — except by the one configured
+operator password.** Consumer identity is derived server-side from the
+presented credential and the live config, and every dashboard query is filtered
+by that value. No request field contributes to identity, so there is nothing for
+a client to tamper with (`src/auth/middleware.rs`, `src/dashboard/api.rs`). The
+single deliberate widening is the optional `manager:` password block, which
+grants a dashboard-only view over **every** consumer — the `consumers=` query
+parameter only narrows it, and it is refused on `/v1/*` (ADR 0011, ADR 0013).
+The same
+credential also carries the key's `allowed_models` allow-list (ADR 0012): a
+model outside it is refused with `404 model_not_found` before the upstream is
+contacted and before a metering row is written, and `/v1/models` answers the
+filtered list.
 
 ## Operations
 
@@ -374,6 +411,164 @@ resolves the live peer's in-flight rows). TLS is not implemented in the binary;
 the edge or your own load balancer terminates it.
 
 ## Development
+
+### The dev loop
+
+```bash
+scripts/dev-up.sh          # stub upstream + proxy + vite dev server
+scripts/dev-load.sh        # asks 2 rps, 30:1 success:failure, until Ctrl-C
+scripts/dev-load.sh --pattern 4:1 --stream --duration 120   # busier, all streaming
+scripts/dev-restart.sh     # restart the proxy only, after a Rust edit
+scripts/dev-down.sh        # stop everything; the ledger is kept
+```
+
+The daily loop, in order:
+
+| Step | Command | What it does |
+|---|---|---|
+| 1 | `scripts/dev-up.sh` | starts all three, waits for each to answer, returns the prompt |
+| 2 | `scripts/dev-load.sh` | in a second terminal, so the dashboard has something in it |
+| 3 | edit `src/…` | `scripts/dev-restart.sh` — the dashboard keeps its HMR, the ledger is untouched |
+| 4 | edit `dashboard/src/…` | nothing. Vite reloads it in the browser |
+| 5 | `scripts/dev-down.sh` | drains the proxy properly and frees all three ports |
+
+`dev-up.sh` starts three processes natively, waits for each to answer before
+starting the next, and leaves them in `target/dev/logs/`. Nothing is
+containerised, because nothing in a dev loop should require an image rebuild
+between a keystroke and a screenshot:
+
+| Where | What it is | Why native |
+|---|---|---|
+| `dev/mock-upstream-dev.py` | the stub upstream, on `:9100` — sizes, cache hits, frame counts and 15–26s durations drawn per request | stdlib-only, so it starts with `python3` and no install |
+| `dev/request-generator.py` | one varied request per line for each `dev-load.sh` worker — model, endpoint, stream flag and payload all drawn, no two alike in a row | stdlib-only; the variety is generated, not sampled, so the ledger has spread instead of a flat line |
+| the proxy, on `:8080` | `cargo run` against `dev/partner-portal.dev.yaml` | a Rust edit is a restart, not an LTO release build |
+| `pnpm --dir dashboard dev` | vite, on `:5173`, proxying `/api` and `/v1` to `:8080` | a `.vue` edit is an HMR update, not a rebundled embed |
+
+The container's hardening and the two-instance topology are what `deploy/` and
+CI are for; neither is on the path between an edit and a screenshot.
+
+Log in with `dev-key` (consumer `acme`), `dev-key-beta` (consumer `beta`), or
+`dev-manager` (every consumer, ADR 0013). Two keys share the `acme` consumer
+deliberately, so the dashboard shows what a key rotation looks like.
+
+The dev ledger is `target/dev/partner-portal-dev.db` and is **kept** between
+runs — `scripts/dev-up.sh --reset` or `scripts/dev-down.sh --purge` to start
+clean.
+
+#### Looking at the dashboard with something in it
+
+An empty ledger shows one line of every state in the UI. `dev-load.sh` fills it
+with all of them at zero cost. Every request the fixture answers — success or
+injected failure — runs **15–26 seconds** (`dev/mock-upstream-dev.py` draws the
+duration uniformly in that band, under the dev config's 30s deadline, so a
+slow-request view has a real spread to show and nothing trips a timeout by
+accident). Failures follow `--pattern` — 30 successes per failure by default —
+counted globally across workers, so one arrives every 31st request (~80s at the
+delivered rate) rather than in a per-worker burst:
+
+| Injected | Reaches the dashboard as |
+|---|---|
+| `x-dev-fail: 500` / `503` | `failed`, carrying the upstream's own error message |
+| `x-dev-fail: close` | `failed` with `502` — a transport failure, not a reported one |
+| `x-dev-fail: no-usage` | **not a failure**: `completed` with `NULL` tokens (invariant 3) |
+
+`no-usage` only applies to streaming requests; without `--stream` it is left out
+of the cycle, because a non-streaming response with no usage block is a different
+case. It is the fourth mode in the cycle, so at the default 30:1 it is a while
+between sightings — `--pattern 4:1 --stream` puts one in every fifth request.
+A further mode, `hang`, blocks for an hour so the proxy's own timeout fires
+— 30s to a `504`, recorded as a failure. It is not in the load loop because it
+would consume the whole request budget; send one by hand when testing drain:
+
+```bash
+curl -H 'x-dev-fail: hang' -H "Authorization: Bearer dev-key" \
+     -H 'content-type: application/json' -d '{"model":"gpt-4o","messages":[]}' \
+     http://127.0.0.1:8080/v1/chat/completions
+```
+
+What a measured run at the defaults leaves in the ledger (160 seconds on
+2026-09-24, read from SQLite):
+
+```
+   ('completed', 'available',   200, 63)     durations 15.2–26.0s, median ~19s
+   ('failed',    'unavailable', 500,  2)     the injected failures, also 16–18s
+```
+
+— and with `--pattern 2:1`, a measured 24-request run put 7 failures through
+the global cycle: three `500`s, two `503`s, two `close`s (recorded `502`).
+With `--stream` the cycle gains `no-usage` — a `completed` row with `NULL`
+tokens. Every state the summary card, the timeseries and the status filter can
+render, produced without an upstream credential and without an outbound call.
+
+A request for a model outside a key's `allowed_models` is deliberately **not** in
+this list: it is refused before metering (`ADR 0012`), so it never becomes a
+ledger row and would never appear in the dashboard.
+
+#### Rate, and what it costs
+
+`--rps` is a request, not a promise. What the loop delivers is bounded by the
+fixture: every request holds its worker for 15–26 seconds, so eight workers —
+the cap — carry about 0.4 rps however hard they are asked. The pool is sized
+from the fixture's own draws, sampled once per run, because a worker's cycle is
+`E[max(request, share)]` — the mean of each sample's max, not the max of the
+mean; averaging first hides exactly the requests that dominate. Whatever rate
+the pool cannot reach, the script prints rather than delivers in silence:
+
+```
+dev-load: --rps 2 cannot be reached; the fixture's requests run 15-26s,
+  so the best 8 workers deliver ~0.38 rps (cycle ~20.9s).
+```
+
+That ceiling is the point, not a defect: the loop exists to put long-running
+requests on a dashboard, and two requests a second of twenty-second requests
+would be forty concurrent ones. Pacing still matters below the ceiling — a
+worker waits out its share of the interval minus what its request cost, in
+0.02s slices so a stop is noticed promptly — and the pattern counter is global
+across workers, so the failure ratio is what `--pattern` says whatever the
+pace. Past this loop's purpose the tool is `scripts/bench-scale.sh`, which
+drives the real writer and reports percentiles.
+
+#### Restarting after a Rust edit
+
+`scripts/dev-restart.sh` restarts the proxy and nothing else, because the three
+processes have genuinely different lifetimes:
+
+| Process | Restart it when | How |
+|---|---|---|
+| proxy | you edit Rust | `dev-restart.sh` — SIGTERM, readiness down, accepted work finished, metering committed, database closed |
+| dashboard | you edit a `.vue` | nothing. Vite's HMR already did it |
+| stub | you edit `dev/mock-upstream-dev.py` | `dev-restart.sh --stub` |
+
+The ledger is not touched by a restart. Usage you generated is usage, and a
+restart that wiped it would quietly invalidate whatever you were looking at.
+`--ledger` prints a one-line summary read straight from SQLite when the proxy is
+back — the file, not the dashboard API, because the API is not a faithful view
+of every column.
+
+#### Why the dev config batches differently`dev/partner-portal.dev.yaml` sets `batch_size: 8` and
+`batch_timeout_ms: 20`, against production's `100` and `1000`. Those defaults
+are right in production — they amortise a `COMMIT` over a hundred records — and
+measurably wrong in a loop:
+
+A batch is committed when it is full or when the window elapses
+(`writer.rs::writer_loop`), and `finalize` is awaited before the client gets its
+response, so at dev-loop concurrency a batch never fills and **every request
+waits out the whole window**. Measured against the same binary: **1.02s per
+request** with `100`/`1000`, **0.035s** with `8`/`20`.
+
+Nothing is lost and nothing is wrong — this is invariant 1 working. The ledger
+simply makes an edit feel like a network call, and a 20ms window is still the
+cadence the dashboard's counters update on.
+
+All the scripts are POSIX `sh`, not bash — `/bin/sh` is dash on Debian, and a
+script that only runs under bash is a script that only runs on the machine where
+it was written. `scripts/dev-lib.sh` holds the process-group handling the three
+of them share, and it exists because none of that is ten lines and all of it
+has to be identical everywhere: `pnpm` is a four-process chain whose leader
+exits within a second, so a script keying on the pid sees a corpse, skips it,
+and leaves port 5173 bound until someone finds the orphan by hand.
+
+### The commands
 
 ```bash
 cargo build                        # debug binary
