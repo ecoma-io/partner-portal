@@ -26,6 +26,18 @@ use std::time::Duration;
 
 use crate::config::UpstreamConfig;
 
+/// Upstream connector type. With `tls`, an [`HttpsConnector`] that handles both
+/// `https://` and `http://`; without it, plain HTTP only.
+///
+/// The product sits in front of exactly one OpenAI-compatible API
+/// (docs/adr/0001), and real ones are `https://`, so plain-HTTP-only is not a
+/// supported production shape — but the `<1s` fast test loop must not have to
+/// build rustls/aws-lc every time, which is why TLS is a Cargo feature.
+#[cfg(feature = "hyper-rustls")]
+type UpstreamConnector = hyper_rustls::HttpsConnector<HttpConnector>;
+#[cfg(not(feature = "hyper-rustls"))]
+type UpstreamConnector = HttpConnector;
+
 /// Headers that apply to a single transport hop and must not be forwarded.
 ///
 /// RFC 7230 §6.1. The `Connection` header's own listed tokens are handled
@@ -77,11 +89,66 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
 /// Upstream proxy client.
 #[derive(Clone)]
 pub struct ProxyClient {
-    client: Client<HttpConnector, http_body_util::combinators::BoxBody<Bytes, hyper::Error>>,
+    client: Client<UpstreamConnector, http_body_util::combinators::BoxBody<Bytes, hyper::Error>>,
     /// Fallback upstream used when a caller does not supply a live snapshot.
     default_base_url: String,
     /// Fallback credential, paired with `default_base_url`.
     default_api_key: String,
+}
+
+/// Build the upstream connector with the shared TCP settings.
+///
+/// The settings match one deployment intent: `Nagle` off, a *connect* timeout
+/// (not an overall timeout — that is `timeout_secs`, applied per request), and
+/// Happy Eyeballs so a name that resolves to several addresses does not hang
+/// for the full connect timeout on a blackholed first choice.
+fn tcp_connector(config: &UpstreamConfig) -> HttpConnector {
+    let mut connector = HttpConnector::new();
+    connector.set_nodelay(true);
+    connector.set_connect_timeout(Some(Duration::from_secs(
+        config.connect_timeout_secs.max(1),
+    )));
+    // Without this, a name that resolves to several addresses — llm2.ecoma.io
+    // answers with two A, two AAAA behind Cloudflare — only ever tries the first
+    // and hangs for the full connect timeout if it is blackholed.
+    connector.set_happy_eyeballs_timeout(Some(Duration::from_millis(300)));
+
+    #[cfg(feature = "hyper-rustls")]
+    {
+        // hyper-util's `HttpConnector` rejects *any* non-`http://` destination
+        // with `client error (Connect)` before a socket is opened, because
+        // `enforce_http` defaults to true (connect/http.rs:485). The TLS
+        // connector is built around *this* connector via `wrap_connector`, and
+        // `HttpsConnectorBuilder::https_or_http()` only clears that flag on the
+        // builder's own internal connector — so it has to be cleared here as
+        // well, or every `https://` upstream becomes a 502 with no socket ever
+        // opened and no visible cause beyond `client error (Connect)`.
+        connector.enforce_http(false);
+    }
+    connector
+}
+
+/// The TLS-capable upstream connector (Cargo feature `hyper-rustls`).
+#[cfg(feature = "hyper-rustls")]
+fn build_connector(config: &UpstreamConfig) -> UpstreamConnector {
+    hyper_rustls::HttpsConnectorBuilder::new()
+        // `with_webpki_roots` (the Mozilla roots) over native certs: the binary
+        // runs in a minimal non-root container with no CA store on disk, so a
+        // cert store baked into the binary is the portable dependency.
+        .with_webpki_roots()
+        // The connector handles both schemes so hot-reloading the base URL from
+        // `http://` to `https://` (and back) keeps working without a restart.
+        .https_or_http()
+        // ALPN both — Cloudflare-fronted upstreams negotiate HTTP/2.
+        .enable_http1()
+        .enable_http2()
+        .wrap_connector(tcp_connector(config))
+}
+
+/// The plain-HTTP connector (default, no TLS dependencies in the test loop).
+#[cfg(not(feature = "hyper-rustls"))]
+fn build_connector(config: &UpstreamConfig) -> UpstreamConnector {
+    tcp_connector(config)
 }
 
 impl ProxyClient {
@@ -91,15 +158,7 @@ impl ProxyClient {
     /// fallback upstream. Per-request values normally come from the live config
     /// snapshot so hot reload is honoured.
     pub fn new(config: &UpstreamConfig) -> Self {
-        let mut connector = HttpConnector::new();
-        connector.set_nodelay(true);
-        connector.set_connect_timeout(Some(Duration::from_secs(
-            config.connect_timeout_secs.max(1),
-        )));
-        // Without this, a DNS name resolving to several addresses would only
-        // ever try the first — and hang for the full connect timeout if it is
-        // blackholed.
-        connector.set_happy_eyeballs_timeout(Some(Duration::from_millis(300)));
+        let connector = build_connector(config);
 
         let client = Client::builder(TokioExecutor::new())
             .pool_idle_timeout(Duration::from_secs(60))
