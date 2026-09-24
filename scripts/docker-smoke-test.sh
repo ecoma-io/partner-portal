@@ -20,6 +20,8 @@
 #   * /v1/models is proxied to the upstream and answers
 #   * /v1/chat/completions is proxied *and metered*: the ledger row exists, with the
 #     token usage the upstream reported
+#   * the model gate (docs/adr/0012): a model the key does not list is refused
+#     404 model_not_found before the upstream is contacted and mints no ledger row
 #   * the dashboard is embedded: GET / returns the built index, not the
 #     "built without a dashboard" placeholder, and a hashed asset is served
 #   * SIGTERM drains the metering pipeline ("metering pipeline drained and
@@ -234,18 +236,19 @@ expect_eq "/v1/models through the proxy" "200" "$(status)"
 expect_eq "/v1/models answers with the upstream model list" "$UPSTREAM_MODEL" \
     "$(body | json_get data.0.id)"
 
-MODEL="smoke-image-$(date +%s)"
+# The request goes out under the one model the smoke key lists, which is also
+# what keeps /v1/models' filtered answer above equal to the upstream's list.
 fetch "$BASE/v1/chat/completions" \
     -X POST \
     -H "Authorization: Bearer $KEY" \
     -H 'Content-Type: application/json' \
-    -d "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+    -d "{\"model\":\"$UPSTREAM_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
 expect_eq "/v1/chat/completions through the proxy" "200" "$(status)"
 
 # The ledger writer batches on a 1s timeout; the row is durable but may not be
 # queryable within the same millisecond the response returns.
 sleep 2
-fetch "$BASE/api/dashboard/requests?range=24h&limit=10&model=$MODEL" \
+fetch "$BASE/api/dashboard/requests?range=24h&limit=10&model=$UPSTREAM_MODEL" \
     -H "Authorization: Bearer $KEY"
 expect_eq "ledger query" "200" "$(status)"
 
@@ -275,6 +278,25 @@ print(f"  ok   1 ledger row, completed, usage {input_tokens}/{output_tokens}")
 else
     failures=$((failures + 1))
 fi
+
+# The gate's quiet direction (docs/adr/0012): a model the key does not list is
+# refused before the upstream is contacted and before any record is written. The
+# name is unique per run, so the refusal cannot be confused with a model some
+# earlier configuration allowed.
+REFUSED_MODEL="smoke-image-$(date +%s)"
+fetch "$BASE/v1/chat/completions" \
+    -X POST \
+    -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$REFUSED_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}"
+expect_eq "a model outside allowed_models is refused" "404" "$(status)"
+expect_eq "the refusal names the gate" "model_not_found" "$(body | json_get error.code)"
+expect_eq "the refused model never reached the upstream" "1" \
+    "$(curl -fsS "http://127.0.0.1:$MOCK_PORT/__count" | json_get inference_requests)"
+fetch "$BASE/api/dashboard/requests?range=24h&limit=10&model=$UPSTREAM_MODEL" \
+    -H "Authorization: Bearer $KEY"
+expect_eq "the ledger still holds exactly the one row" "1" \
+    "$(body | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["data"]))')"
 
 # ---------------------------------------------------------------------------
 say "The dashboard is embedded, not a placeholder"

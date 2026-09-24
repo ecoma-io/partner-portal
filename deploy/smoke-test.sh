@@ -19,6 +19,11 @@
 # to completion ("metering pipeline drained and committed") rather than being cut
 # short by a SIGKILL.
 #
+# And, because the per-key model gate (docs/adr/0012) is part of the deployment
+# path, it asserts the gate's quiet direction too: a request for a model the key
+# does not list is refused 404 `model_not_found` before the upstream is
+# contacted, and leaves every counter above untouched.
+#
 # Usage:
 #   PARTNER_PORTAL_IMAGE=partner-portal:local ./smoke-test.sh
 #
@@ -52,6 +57,12 @@ KEY="smoke-key"
 # Unique per run, so a leftover ledger from an earlier run cannot be mistaken for
 # traffic produced by this one.
 MODEL="smoke-$(date +%s)"
+# The traffic-switch burst gets its own name off the same stamp: its three rows
+# must stay separable from the main burst's in every ledger query below.
+SWITCH_MODEL="$MODEL-switch"
+# Refused by the gate: in no allow-list, so the smoke proves the refusal without
+# ever being able to reach the upstream under it.
+REFUSED_MODEL="$MODEL-not-allowed"
 REQUESTS=20
 PROMPT_TOKENS=11
 COMPLETION_TOKENS=7
@@ -67,6 +78,13 @@ STATUS_FILE="$(mktemp)"
 UPSTREAM_CONF="nginx/upstream.d/upstream.conf"
 UPSTREAM_CONF_BACKUP="$(mktemp)"
 cp "$UPSTREAM_CONF" "$UPSTREAM_CONF_BACKUP"
+
+# The file the instances load, and a copy of it to restore on exit — the preflight
+# below amends it with this run's model names, and a failed run must not leave
+# those behind, the same way it must not leave one instance out of rotation.
+SMOKE_CONF="config/${PARTNER_PORTAL_CONFIG_FILE}"
+SMOKE_CONF_BACKUP="$(mktemp)"
+cp "$SMOKE_CONF" "$SMOKE_CONF_BACKUP"
 
 failures=0
 say() { printf '\n=== %s\n' "$*"; }
@@ -138,11 +156,14 @@ ledger_records() {
 }
 
 cleanup() {
-    # The traffic-switch check rewrites the upstream that is in rotation; the
-    # repository copy is restored even if the script fails part-way, so a failed
-    # run cannot leave the deployment pointing at one instance.
+    # The traffic-switch check rewrites the upstream that is in rotation, and the
+    # preflight amends the smoke config with this run's model names; both
+    # repository copies are restored even if the script fails part-way, so a
+    # failed run can leave neither the deployment pointing at one instance nor
+    # a stale allow-list behind.
     cp "$UPSTREAM_CONF_BACKUP" "$UPSTREAM_CONF"
-    rm -f "$BODY_FILE" "$STATUS_FILE" "$UPSTREAM_CONF_BACKUP"
+    cp "$SMOKE_CONF_BACKUP" "$SMOKE_CONF"
+    rm -f "$BODY_FILE" "$STATUS_FILE" "$UPSTREAM_CONF_BACKUP" "$SMOKE_CONF_BACKUP"
 }
 trap cleanup EXIT
 
@@ -250,6 +271,34 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
     exit 1
 fi
 ok "image $IMAGE present"
+
+# The instances must be started on this run's amended config, not hot-reload it
+# mid-run: the model gate (docs/adr/0012) reads the allow-list that the preflight
+# is about to write, and a burst sent before the reload lands would 404. Taking
+# the stack down first makes the start deterministic whether or not a previous
+# run left one behind — without `-v`: the ledger volume survives, which is
+# exactly why MODEL is unique per run.
+"${COMPOSE[@]}" down --remove-orphans >/dev/null
+
+# This run's two burst names appended to the smoke key's `allowed_models`. The
+# committed fixture still lists exactly what the deployment serves (`mock-model`),
+# so `/v1/models` keeps answering the upstream's filtered list; the appended
+# entries exist only so the burst's unique names pass the gate. The rewrite is
+# in-place through the existing file, not a rename over it: the instances run as
+# uid 10001 and read the bind-mounted file directly, so the mode the fixture
+# carries (0644) must survive the edit — a `mktemp`d file renamed over it would
+# land as 0600 and the config load would die on EACCES.
+conf_tmp="$(mktemp)"
+awk -v model="$MODEL" -v switch_model="$SWITCH_MODEL" '
+    { print }
+    /^ *allowed_models:/ {
+        print "      - \"" model "\""
+        print "      - \"" switch_model "\""
+    }
+' "$SMOKE_CONF" >"$conf_tmp"
+cat "$conf_tmp" >"$SMOKE_CONF"
+rm -f "$conf_tmp"
+ok "smoke key lists this run's models: $MODEL, $SWITCH_MODEL"
 
 # `--wait` blocks on the compose healthcheck, which probes /readyz rather than
 # /healthz: an instance that is up but not ready to receive traffic is not up for
@@ -444,6 +493,19 @@ else
 fi
 info "portal-a committed $committed_a, portal-b committed $committed_b of them"
 
+# The gate's quiet direction, where it matters: the refusal happens before the
+# upstream is contacted and before any record is written, so the upstream counter
+# sits exactly where the burst left it and the ledger checks above stay true
+# afterwards.
+fetch "$EDGE/v1/chat/completions" \
+    -X POST \
+    -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$REFUSED_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"refused\"}]}"
+expect_eq "a model outside allowed_models is refused" "404" "$(status)"
+expect_eq "the refusal names the gate" "model_not_found" "$(body | json_get error.code)"
+expect_eq "the refused model never reached the upstream" "$REQUESTS" "$(mock_count)"
+
 # ---------------------------------------------------------------------------
 say "SIGTERM drains the metering pipeline instead of discarding it"
 # ---------------------------------------------------------------------------
@@ -467,7 +529,6 @@ say "Traffic switch: the survivor takes the load"
 # an instance is stopped (what the settle step in rolling-update.sh buys), and why
 # rotation() waits for the reload to take effect instead of for a fixed delay.
 # Anything other than a 200 here means the switch is not doing the work.
-SWITCH_MODEL="$MODEL-switch"
 switch_before="$(mock_count)"
 if rotation down portal-a; then
     ok "portal-a marked down in the edge's upstream, and the workers that still routed to it have retired"

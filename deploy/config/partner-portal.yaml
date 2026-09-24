@@ -42,6 +42,13 @@ upstream:
 keys:
   - key: "REPLACE-WITH-A-PARTNER-KEY"
     name: "partner-smoke"
+    # Models this key may call. Strict (docs/adr/0012): a key that omits the
+    # field serves `404 model_not_found` for every model, and `/v1/models`
+    # answers this same filtered list. Replace with what the real upstream
+    # serves and this partner may call.
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
 
 database:
   # Absolute, and on the shared volume: the pair writes to one ledger.
