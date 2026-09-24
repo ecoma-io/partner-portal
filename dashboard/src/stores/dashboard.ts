@@ -38,11 +38,19 @@ export interface TimeseriesPoint {
   input_tokens: number
   output_tokens: number
   cached_tokens: number
+  /** Sum of request durations (ms). Interval latency = this / `requests`. */
+  total_duration_ms: number
+  /** Sum of time to first token (ms) among requests that reported one. */
+  total_ttft_ms: number
+  /** Requests in this hour that reported a TTFT. 0 means TTFT is unavailable here. */
+  ttft_count: number
 }
 
 export interface RequestItem {
   request_id: string
   created_at: string
+  /** The consumer this request belongs to. Present on every row; only surfaced in the UI for managers. */
+  consumer_id: string
   model: string
   endpoint: string
   streaming: boolean
@@ -60,11 +68,21 @@ export interface RequestItem {
   ttft_ms: number | null
   /** Present for failed/interrupted requests; may repeat upstream text. */
   error_message: string | null
+  /** Optional upstream error payload, supplied only when the backend recorded it. */
+  error_body?: string | null
 }
 
 export interface Me {
   consumer_id: string
   key_name: string
+  /** `consumer` for a regular key scoped to one consumer; `manager` for a reader that may view several. */
+  role: 'consumer' | 'manager'
+  /**
+   * For managers only: the consumer_ids actually present in the ledger, offered
+   * by the selector. Not a permission list — a manager sees every consumer
+   * whether or not it appears here (docs/adr/0013).
+   */
+  consumers?: string[]
 }
 
 /**
@@ -119,13 +137,54 @@ export const useDashboardStore = defineStore('dashboard', () => {
   const timeseries = ref<TimeseriesPoint[]>([])
   const requests = ref<RequestItem[]>([])
   const nextCursor = ref<string | null>(null)
+  const cursorStack = ref<string[]>([])
+  const status = ref('all')
+  const pageSize = ref(10)
   const loading = ref(false)
   const error = ref<string | null>(null)
   const range = ref('24h')
   const model = ref('all')
   const streamState = ref<StreamState>('idle')
 
+  /**
+   * Whether the view follows the server: SSE invalidation connected, toasts
+   * shown. One preference for both, persisted across reloads — pausing is the
+   * user's choice, not a connection failure, so it survives a reload and a
+   * sign-out rather than silently reconnecting on the next visit.
+   *
+   * The legacy `sse_alerts_enabled` key is honoured as a fallback so a view
+   * paused under the old alerts-only toggle does not resume unasked.
+   */
+  const automaticUpdatesEnabled = ref(readAutomaticUpdatesPreference())
+
+  function readAutomaticUpdatesPreference(): boolean {
+    const stored = localStorage.getItem('automatic_updates_enabled')
+    if (stored !== null) return stored !== 'false'
+    const legacy = localStorage.getItem('sse_alerts_enabled')
+    return legacy !== 'false'
+  }
+
   const hasMore = computed(() => nextCursor.value !== null)
+  const hasPrevious = computed(() => cursorStack.value.length > 0)
+  const currentPage = computed(() => cursorStack.value.length + 1)
+  const currentCursor = computed(() => cursorStack.value.at(-1) ?? null)
+
+  /** Managers only: consumers to restrict the view to. Empty = the manager's full allowed set. */
+  const selectedConsumers = ref<string[]>([])
+
+  /** The newest request row seen. Feeds the live data-change toast. */
+  const latestRequest = ref<RequestItem | null>(null)
+
+  const isManager = computed(() => me.value?.role === 'manager')
+
+  function requestSignature(): string {
+    return `${range.value}+${model.value}+${status.value}+${pageSize.value}+${selectedConsumers.value.join(',')}`
+  }
+
+  function resetPagination() {
+    cursorStack.value = []
+    nextCursor.value = null
+  }
 
   /**
    * Per-endpoint sequence numbers. A response is only applied when it belongs
@@ -173,11 +232,23 @@ export const useDashboardStore = defineStore('dashboard', () => {
     }
   }
 
+  /**
+   * Scope a dashboard query to the manager's selected consumers. Empty means
+   * "everything the manager may see" — the backend already answers that, so the
+   * parameter is only sent when the manager actually narrows the view.
+   */
+  function applyConsumersScope(params: URLSearchParams) {
+    if (isManager.value && selectedConsumers.value.length > 0) {
+      params.set('consumers', selectedConsumers.value.join(','))
+    }
+  }
+
   async function fetchSummary() {
     const ticket = ++seq.summary
     try {
       const params = new URLSearchParams({ range: range.value })
       if (model.value !== 'all') params.set('model', model.value)
+      applyConsumersScope(params)
 
       const res = await fetch(`${BASE_URL}/dashboard/summary?${params}`, {
         headers: authHeaders(),
@@ -205,6 +276,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     try {
       const params = new URLSearchParams({ range: range.value })
       if (model.value !== 'all') params.set('model', model.value)
+      applyConsumersScope(params)
       const res = await fetch(`${BASE_URL}/dashboard/models?${params}`, {
         headers: authHeaders(),
       })
@@ -222,6 +294,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     try {
       const params = new URLSearchParams({ range: range.value })
       if (model.value !== 'all') params.set('model', model.value)
+      applyConsumersScope(params)
 
       const res = await fetch(`${BASE_URL}/dashboard/timeseries?${params}`, {
         headers: authHeaders(),
@@ -236,61 +309,93 @@ export const useDashboardStore = defineStore('dashboard', () => {
     }
   }
 
-  /**
-   * A reload requested while one is in flight is coalesced, not dropped: it
-   * runs exactly once more when the current run finishes. `null` means nothing
-   * is queued; otherwise it is the `append` flag that queued run takes, and a
-   * queued full reload wins over a queued "load more".
-   */
-  let pendingAppend: boolean | null = null
+  interface RequestPage {
+    cursor: string | null
+    stack: string[]
+    /** An invalidation on page one preserves still-visible rows after fresh rows. */
+    mergeFresh?: boolean
+  }
 
-  async function fetchRequests(append = false) {
+  /** A request page queued behind the one currently in flight. */
+  let pendingPage: RequestPage | null = null
+
+  async function fetchRequests(page: RequestPage = {
+    cursor: currentCursor.value,
+    stack: [...cursorStack.value],
+  }) {
     if (loading.value) {
-      pendingAppend = pendingAppend === null ? append : pendingAppend && append
+      // The latest user action or invalidation is the only page that matters.
+      pendingPage = page
       return
     }
     loading.value = true
+    const signature = requestSignature()
 
     try {
       const ticket = ++seq.requests
-      const params = new URLSearchParams({ range: range.value, limit: '50' })
+      const params = new URLSearchParams({ range: range.value, limit: String(pageSize.value) })
       if (model.value !== 'all') params.set('model', model.value)
-      if (append && nextCursor.value) params.set('cursor', nextCursor.value)
+      if (status.value !== 'all') params.set('status', status.value)
+      applyConsumersScope(params)
+      if (page.cursor) params.set('cursor', page.cursor)
 
       const res = await fetch(`${BASE_URL}/dashboard/requests?${params}`, {
         headers: authHeaders(),
       })
       if (!res.ok) throw new Error(httpMessage(res, 'the request list'))
       const data: { data: RequestItem[]; next_cursor: string | null } = await res.json()
-      if (ticket !== seq.requests) return
+      if (ticket !== seq.requests || signature !== requestSignature()) return
 
-      if (append) {
-        requests.value = [...requests.value, ...data.data]
-      } else {
-        requests.value = data.data
-      }
+      requests.value = page.mergeFresh
+        ? [...data.data, ...requests.value]
+            .filter((request, index, all) => all.findIndex(({ request_id }) => request_id === request.request_id) === index)
+            .slice(0, pageSize.value)
+        : data.data
+      cursorStack.value = page.stack
       nextCursor.value = data.next_cursor
+      // The first row is the newest request the backend has. Keep the most
+      // recent row ever seen so the data-change toast names the latest request
+      // even after pagination or an emptied filter moved it off-screen.
+      latestRequest.value = data.data[0] ?? latestRequest.value
       error.value = null
     } catch (e) {
       error.value = messageOf(e)
     } finally {
       loading.value = false
-      const queued = pendingAppend
-      pendingAppend = null
-      if (queued !== null) {
-        void fetchRequests(queued)
-      }
+      const queued = pendingPage
+      pendingPage = null
+      if (queued !== null) void fetchRequests(queued)
     }
   }
 
-  /** Bursts of invalidation events coalesce into at most one extra pass. */
+  async function firstPage() {
+    await fetchRequests({ cursor: null, stack: [] })
+  }
+
+  async function previousPage() {
+    if (!hasPrevious.value) return
+    const stack = cursorStack.value.slice(0, -1)
+    await fetchRequests({ cursor: stack.at(-1) ?? null, stack })
+  }
+
+  async function nextPage() {
+    if (!nextCursor.value) return
+    await fetchRequests({
+      cursor: nextCursor.value,
+      stack: [...cursorStack.value, nextCursor.value],
+    })
+  }
+
+  /** Bursts of full reloads coalesce into at most one extra pass. */
   let refreshing = false
   let refreshQueued = false
+  /** Each SSE event also advances this counter so the view can show an alert. */
+  const dataChangeVersion = ref(0)
 
   /**
    * Sign in with a key the user typed. The key is validated against the backend
-   * before anything else happens: a 401 here is the whole point of the login
-   * screen, and it must show a message rather than pretend the key worked.
+   * before the view is handed anything: a 401 here is the whole point of the
+   * login screen, and it must show a message rather than pretend the key worked.
    */
   async function signIn(key: string) {
     const trimmed = key.trim()
@@ -299,12 +404,27 @@ export const useDashboardStore = defineStore('dashboard', () => {
       return false
     }
     error.value = null
-    await fetchMe(trimmed)
-    if (!authenticated.value) return false
-    closeStream()
+
+    // Store the typed key *before* validating it. Flipping `authenticated` is
+    // what mounts the dashboard, and that view's first refresh reads the key
+    // from localStorage — validating first would mount it with no credential
+    // and fire every dashboard query unauthenticated. A rejected key never
+    // survives: the previous value is restored below, so a wrong guess cannot
+    // evict a key that was already working.
+    const previous = localStorage.getItem('api_key')
     localStorage.setItem('api_key', trimmed)
-    await refresh()
-    connect()
+
+    await fetchMe()
+    if (!authenticated.value) {
+      if (previous === null) localStorage.removeItem('api_key')
+      else localStorage.setItem('api_key', previous)
+      return false
+    }
+    closeStream()
+    // The dashboard view mounts on the `authenticated` flip above and performs
+    // the first load itself, so refreshing here as well would double every
+    // query on every sign-in. `connect()` is left to the view for the same
+    // reason; sign-out does not depend on it.
     return true
   }
 
@@ -317,7 +437,9 @@ export const useDashboardStore = defineStore('dashboard', () => {
     summary.value = null
     timeseries.value = []
     requests.value = []
-    nextCursor.value = null
+    selectedConsumers.value = []
+    latestRequest.value = null
+    resetPagination()
     error.value = null
   }
 
@@ -330,11 +452,54 @@ export const useDashboardStore = defineStore('dashboard', () => {
     try {
       do {
         refreshQueued = false
-        await Promise.all([fetchSummary(), fetchTimeseries(), fetchRequests(), fetchModels()])
+        await Promise.all([
+          fetchSummary(),
+          fetchTimeseries(),
+          fetchRequests({ cursor: currentCursor.value, stack: [...cursorStack.value] }),
+          fetchModels(),
+        ])
       } while (refreshQueued)
     } finally {
       refreshing = false
     }
+  }
+
+  /**
+   * An invalidation always updates summary and chart. On page one it makes one
+   * list query only, placing newly fetched records before any still-visible
+   * records and de-duplicating by request ID. Later pages retain their cursor
+   * position and use their ordinary single-page reload.
+   */
+  async function refreshFromDataChange() {
+    dataChangeVersion.value += 1
+    const first = !hasPrevious.value
+    await Promise.all([
+      fetchSummary(),
+      fetchTimeseries(),
+      fetchModels(),
+      fetchRequests({
+        cursor: first ? null : currentCursor.value,
+        stack: first ? [] : [...cursorStack.value],
+        mergeFresh: first,
+      }),
+    ])
+  }
+
+  function resetAndFetchRequests() {
+    resetPagination()
+    void fetchRequests({ cursor: null, stack: [] })
+  }
+
+  function setStatus(nextStatus: string) {
+    if (status.value === nextStatus) return
+    status.value = nextStatus
+    resetAndFetchRequests()
+  }
+
+  function setPageSize(nextPageSize: number) {
+    if (pageSize.value === nextPageSize) return
+    pageSize.value = nextPageSize
+    resetAndFetchRequests()
   }
 
   // --- Invalidation stream --------------------------------------------------
@@ -358,10 +523,15 @@ export const useDashboardStore = defineStore('dashboard', () => {
   /**
    * Open the invalidation stream. Idempotent: while a run exists — connecting,
    * live, or waiting out a backoff — this does nothing, so repeated calls
-   * cannot accumulate sockets or timers.
+   * cannot accumulate sockets or timers. Does nothing while automatic updates
+   * are disabled: the preference, not a retry, is what closes the stream.
    */
   function connect() {
     if (streamRun !== null) return
+    if (!automaticUpdatesEnabled.value) {
+      streamState.value = 'idle'
+      return
+    }
     cancelReconnect()
 
     // Nothing to authenticate with: the route would answer 401, and retrying a
@@ -389,6 +559,27 @@ export const useDashboardStore = defineStore('dashboard', () => {
     streamRun = null
     controller?.abort()
     streamState.value = 'idle'
+  }
+
+  /**
+   * Set the automatic-update preference. Disabling closes the SSE stream (and
+   * the view dismisses its toasts); enabling refreshes once — the data that
+   * arrived while paused must be fetched, not assumed from a stream that was
+   * closed, and a missed invalidation is not one SSE event — then reconnects.
+   */
+  async function setAutomaticUpdates(enabled: boolean) {
+    if (automaticUpdatesEnabled.value === enabled) return
+    automaticUpdatesEnabled.value = enabled
+    localStorage.setItem(
+      'automatic_updates_enabled',
+      enabled ? 'true' : 'false',
+    )
+    if (enabled) {
+      await refresh()
+      connect()
+    } else {
+      disconnect()
+    }
   }
 
   /** Wait `ms`, resolving early — and clearing the timer — when aborted. */
@@ -525,7 +716,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
         event !== null &&
         (event as { type?: unknown }).type === 'data_changed'
       ) {
-        void refresh()
+        void refreshFromDataChange()
       }
     } catch {
       // A frame we cannot parse is not a reason to drop the stream.
@@ -539,12 +730,21 @@ export const useDashboardStore = defineStore('dashboard', () => {
     timeseries,
     requests,
     nextCursor,
+    status,
+    pageSize,
     loading,
     error,
     range,
     model,
     streamState,
+    automaticUpdatesEnabled,
+    dataChangeVersion,
+    selectedConsumers,
+    latestRequest,
+    isManager,
     hasMore,
+    hasPrevious,
+    currentPage,
     models,
     fetchMe,
     signIn,
@@ -553,6 +753,13 @@ export const useDashboardStore = defineStore('dashboard', () => {
     fetchTimeseries,
     fetchRequests,
     fetchModels,
+    firstPage,
+    setAutomaticUpdates,
+    previousPage,
+    nextPage,
+    setStatus,
+    setPageSize,
+    resetAndFetchRequests,
     connect,
     disconnect,
     refresh,
