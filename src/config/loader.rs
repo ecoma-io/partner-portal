@@ -190,6 +190,36 @@ impl ConfigLoader {
             }
         }
 
+        // A blank entry in `allowed_models` is a typo that silently lists
+        // nothing useful and can mask the key's real capability: an operator
+        // reading "gpt-4o, ,gpt-4o-mini" cannot tell which names are real, and
+        // a truncated line reads as if the missing name were allowed. Refuse
+        // it by position; model names are not credentials, so naming them is
+        // optional and the position suffices (ADR 0012).
+        for (key_index, key) in config.keys.iter().enumerate() {
+            for (model_index, model) in key.allowed_models.iter().enumerate() {
+                if model.trim().is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "keys[{key_index}].allowed_models[{model_index}] cannot be blank"
+                    )));
+                }
+            }
+        }
+
+        // The password must not be empty — an empty password parses, but
+        // `find_manager` deliberately ignores it, so accepting the file would
+        // run a config whose manager block does nothing while reading as though
+        // it did. The message names the field, never the password: a credential
+        // must not reach an error that the reload watcher logs.
+        if let Some(manager) = &config.manager {
+            if manager.password.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "manager.password cannot be empty when the manager block is present"
+                        .to_string(),
+                ));
+            }
+        }
+
         // A metering queue capacity of zero is not a small queue, it is no
         // queue: tokio refuses to build a zero-capacity channel, so the process
         // panics at startup. Refusing the config says the same thing in a
@@ -381,8 +411,15 @@ keys:
     #[test]
     fn test_use_defaults() {
         let config = ConfigLoader::parse_yaml(VALID_CONFIG).unwrap();
-        assert_eq!(config.server.listen, "0.0.0.0:8080");
         assert_eq!(config.database.retention_days, 60);
+        // The listen address is not a config field; its default lives with the
+        // env override (src/config/listen.rs).
+        assert_eq!(
+            crate::config::parse_listen_addr(None).unwrap(),
+            crate::config::DEFAULT_LISTEN_ADDR
+                .parse()
+                .expect("the default listen address must parse"),
+        );
     }
 
     /// Every rejected URL must be rejected *at load*. `http://` has the right
@@ -451,6 +488,112 @@ keys:
         );
     }
 
+    /// The manager block's one refusal path: an empty password, which would
+    /// parse and then silently never authenticate. The error names the field.
+    #[test]
+    fn test_manager_block_must_have_a_password() {
+        let yaml = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\nmanager:\n  password: \"\"\n";
+        let err = ConfigLoader::parse_yaml(yaml).expect_err("an empty password must not load");
+        assert!(
+            err.to_string().contains("manager.password"),
+            "the error must name manager.password: {err}"
+        );
+        assert!(
+            !err.to_string().contains("secret"),
+            "a validation error must not echo the password: {err}"
+        );
+    }
+
+    /// A blank entry in `allowed_models` is a typo that silently lists nothing
+    /// useful, so it is refused by position (ADR 0012). Model names are not
+    /// credentials, so the message may — and this test already relies on it —
+    /// name the offending position without echoing a secret.
+    #[test]
+    fn test_reject_blank_allowed_models_entry() {
+        for (label, models_block) in [
+            ("empty", "allowed_models:\n    - \"\"\n"),
+            ("whitespace", "allowed_models:\n    - \"   \"\n"),
+        ] {
+            let yaml = format!(
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n    {models_block}"
+            );
+            let err = ConfigLoader::parse_yaml(&yaml)
+                .expect_err(&format!("a {label} allowed_models entry must not load"));
+            assert!(
+                err.to_string().contains("allowed_models[0]"),
+                "the error must name the offending model position: {err}"
+            );
+        }
+    }
+
+    /// A real, non-empty list loads; the strict default (no list at all) also
+    /// loads — it means "no models", a config choice, not a config error.
+    #[test]
+    fn test_allowed_models_list_loads_and_empty_list_is_a_valid_choice() {
+        let with_list = ConfigLoader::parse_yaml(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
+        )
+        .unwrap();
+        assert_eq!(
+            with_list.keys[0].allowed_models,
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
+
+        let omitted = ConfigLoader::parse_yaml(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n",
+        )
+        .unwrap();
+        assert!(
+            omitted.keys[0].allowed_models.is_empty(),
+            "a key that omits the field gets the empty strict default"
+        );
+    }
+
+    /// A fully-specified manager block loads, and the password stays out of
+    /// every error rendering even when the manager block is *valid*.
+    #[test]
+    fn test_manager_block_with_a_password_loads() {
+        let yaml = r#"
+upstream:
+  base_url: https://api.openai.com
+  api_key: sk-test
+keys:
+  - key: key1
+    name: Key 1
+manager:
+  password: mgr-valid-secret
+"#;
+        let config = ConfigLoader::parse_yaml(yaml).unwrap();
+        let manager = config.manager.expect("manager present");
+        assert_eq!(manager.password, "mgr-valid-secret");
+    }
+
+    /// The unknown-field guard extends into the manager block: a typo'd key
+    /// there must be a parse error, not a silently ignored intention.
+    #[test]
+    fn test_reject_unknown_field_inside_the_manager_block() {
+        let yaml = r#"
+upstream:
+  base_url: https://api.openai.com
+  api_key: sk-test
+keys:
+  - key: key1
+    name: Key 1
+manager:
+  password: secret
+  pasword: typo
+"#;
+        let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("pasword"),
+            "the error must name the offending field: {err}"
+        );
+        assert!(
+            !err.to_string().contains("secret"),
+            "a parse error must not echo the manager password: {err}"
+        );
+    }
+
     #[test]
     fn test_accept_the_smallest_workable_batch_and_queue() {
         let yaml = VALID_CONFIG.replace(
@@ -474,7 +617,11 @@ keys:
             ),
             ("database", "database:\n  batch_sise: 5\n"),
             ("server", "server:\n  listenX: 0.0.0.0:1\n"),
-            ("keys", "keys:\n  - key: a\n    name: b\n    metadota: 1\n"),
+            // `listen` left the config entirely (PARTNER_PORTAL_LISTEN); a
+            // config file that still carries it must fail loudly, not bind
+            // somewhere the operator did not mean.
+            ("listen", "server:\n  listen: \"0.0.0.0:8080\"\n"),
+            ("keys", "keys:\n  - key: a\n    name: b\n    metadata: 1\n"),
         ];
         for (field, block) in cases {
             let yaml = if block.starts_with("upstream:") {

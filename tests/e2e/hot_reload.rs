@@ -33,12 +33,12 @@ async fn hot_reload_applies_a_valid_change_and_refuses_an_invalid_one() {
     let started = Instant::now();
     write_config_full(
         &instance.config_path,
-        instance.port,
         &db_path,
         &upstream,
         "rotated-upstream-secret",
         "rotated-local-key",
         "rotated",
+        E2E_MODELS,
     );
 
     let mut applied = None;
@@ -124,12 +124,12 @@ async fn hot_reload_applies_a_valid_change_and_refuses_an_invalid_one() {
     let recovered = Instant::now();
     write_config_full(
         &instance.config_path,
-        instance.port,
         &db_path,
         &upstream,
         "final-upstream-secret",
         "final-local-key",
         "final",
+        E2E_MODELS,
     );
 
     let mut ok = false;

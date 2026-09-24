@@ -9,6 +9,14 @@
 # The path is taken from `PARTNER_PORTAL_CONFIG`, falling back to `config.yaml`
 # in the working directory (src/main.rs).
 #
+# The listen address is not in this file. It comes from `PARTNER_PORTAL_LISTEN`
+# (src/config/listen.rs), defaulting to "0.0.0.0:8080": a port is a property of
+# the *deployment* — it has to match the container's port mapping, the
+# health-check URL and whatever fronts the process, none of which read this
+# YAML — so it is set where the deployment is described, not in a file those
+# other halves cannot see. An invalid value is a startup abort that names the
+# variable and the value it rejected.
+#
 # The file is re-read once per second. A change that parses and validates is
 # swapped in atomically; a change that does not is logged and the previous
 # configuration stays in force (src/config/hot_reload.rs). An unknown key is a
@@ -17,10 +25,10 @@
 #
 # A reload is not uniform, and the watcher says which is which on every change.
 # Fields marked "Live" below are read per request from the new snapshot. Every
-# other field was captured when the process started — the listener is bound
-# once, and the router, the upstream connector, the SSE poller and the ledger
-# writer are each built once — so changing one of those logs a warning saying
-# explicitly that the new value is NOT in force until restart.
+# other field was captured when the process started — the router, the upstream
+# connector, the SSE poller and the ledger writer are each built once — so
+# changing one of those logs a warning saying explicitly that the new value is
+# NOT in force until restart.
 #
 # No keys are logged: the reloader reports *that* a credential changed and which
 # entry changed, never the value (src/config/hot_reload.rs::report_changes).
@@ -28,13 +36,12 @@
 # ---------------------------------------------------------------------------
 # server — HTTP listener behaviour.
 #
+# The listen address itself is NOT here: it is the `PARTNER_PORTAL_LISTEN`
+# environment variable (see the header above).
+#
 # Optional as a block: omit it entirely and every default below applies.
 # ---------------------------------------------------------------------------
 server:
-  # Listen address, parsed as a SocketAddr. Must be `host:port`.
-  # Default: "0.0.0.0:8080". Restart required to change.
-  listen: "0.0.0.0:8080"
-
   # Wait for already-accepted requests to finish on SIGTERM/SIGINT.
   #
   # This controls only the listener. Draining the metering pipeline is *not*
@@ -171,23 +178,57 @@ keys:
     # observe another's.
     consumer_id: "acme"
 
-    # Free-form string map carried on the consumer context. Not metered and not
-    # exposed by the dashboard API; available to code that reads
-    # `ConsumerContext`.
+    # Models this key may call. **Strict**: an empty list — or a key that omits
+    # the field entirely — is allowed *no* model. Every inference request whose
+    # `model` is not listed is refused with `404 model_not_found` *before* the
+    # upstream is contacted and *before* a metering row is written; `/v1/models`
+    # answers the same filtered list.
     #
-    # Any number of entries may be used: it is stored in a `BTreeMap` so that
-    # the content hash — which decides whether a reload happened at all — does
-    # not depend on the order the entries happen to be in (src/config/types.rs).
-    # Default: {}.
-    metadata:
-      plan: "partner"
+    # A model already in use must be added here or the key stops working the
+    # moment this field ships (docs/adr/0012). Model names are not credentials:
+    # they are logged in cleartext by the reload report.
+    #
+    # Live: read per request from the snapshot, so a rotation takes effect on
+    # the next request.
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
 
   - # A second key for the same consumer: same usage view, separate credential,
   # so one can be revoked without disturbing the other.
     key: "pp-local-key-staging-replace-me"
     name: "acme-staging"
     consumer_id: "acme"
-    metadata: {}
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+
+# ---------------------------------------------------------------------------
+# manager — optional operator credential with a cross-consumer dashboard view.
+#
+# This is the one deliberate widening of the otherwise strictly consumer-scoped
+# dashboard (docs/adr/0008, docs/adr/0013). When the block is present, the
+# dashboard login accepts this password — sent as
+# `Authorization: Bearer <password>`, exactly like a key value — and the
+# resulting session sees the usage of EVERY consumer. There is no allow-list to
+# configure: a list of what may be seen would live in the same file as the data
+# it guards, which is why it was removed. The dashboard's consumer selector
+# offers the consumers actually present in the ledger; picking one narrows the
+# view, and that filter never widens anything.
+#
+# The comparison is exact string equality, so a password *is* a plaintext secret
+# in a file: rotate it via hot reload, and it is scrubbed from ledger text and
+# redacted in logs just like a key value (src/config/types.rs::credentials).
+#
+# Live: read per request from the snapshot, so a rotation takes effect on the
+# next request.
+# ---------------------------------------------------------------------------
+manager:
+  # The password a manager presents at the dashboard login. Required when the
+  # block is present: `manager: {}` is refused at load, because an empty
+  # password would parse and silently do nothing while reading as though it
+  # granted access.
+  password: "pp-manager-password-replace-me"
 
 # ---------------------------------------------------------------------------
 # database — the durable usage ledger.

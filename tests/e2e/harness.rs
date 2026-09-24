@@ -36,6 +36,33 @@ pub use hyper_util::rt::TokioExecutor;
 pub use serde_json::json;
 
 pub const LOCAL_KEY: &str = "local-test-key";
+
+/// Every model any e2e test sends, so every e2e key can carry one shared
+/// allow-list. The request names a model from an unbounded counter
+/// (`model-{n}`, `burst-{i}`) in a few stress tests; those now cycle a single
+/// fixed ring (`e2e-ring`) instead, because a strict per-key allow-list (ADR
+/// 0012) cannot enumerate an unbounded set. The ring's name is deliberately a
+/// member of this list (`E2E_MODELS[0]`).
+pub const E2E_MODELS: &[&str] = &[
+    "e2e-ring",
+    "reload-0",
+    "reload-probe",
+    "reload-old-key",
+    "reload-badyaml",
+    "reload-invalid",
+    "reload-final",
+    "before-shutdown",
+    "during-stream",
+    "gpt-4o",
+    "sse-cross-instance",
+    "model-in-flight",
+    "model-killed",
+    "alpha-0",
+    "alpha-1",
+    "alpha-2",
+    "beta-0",
+    "beta-1",
+];
 pub const UPSTREAM_KEY: &str = "upstream-secret";
 
 /// How long any single wait may take before the test gives up.
@@ -58,6 +85,10 @@ pub struct MockInner {
     auth_seen: parking_lot::Mutex<Vec<String>>,
     /// Stalls the response, so a request is still in flight when a signal lands.
     hang: AtomicBool,
+    /// Total requests received — mutating `models_seen` counts distinct-name
+    /// requests correctly even when many records share one model (see
+    /// `assert_no_divergence`).
+    request_count: AtomicUsize,
 }
 
 impl MockUpstream {
@@ -67,12 +98,18 @@ impl MockUpstream {
                 models_seen: parking_lot::Mutex::new(Vec::new()),
                 auth_seen: parking_lot::Mutex::new(Vec::new()),
                 hang: AtomicBool::new(false),
+                request_count: AtomicUsize::new(0),
             }),
         }
     }
 
     pub fn models_seen(&self) -> Vec<String> {
         self.inner.models_seen.lock().clone()
+    }
+
+    /// Total number of requests the mock served, regardless of model names.
+    pub fn request_count(&self) -> usize {
+        self.inner.request_count.load(Ordering::Acquire)
     }
 
     pub fn set_hang(&self, hang: bool) {
@@ -103,6 +140,7 @@ pub async fn mock_chat_completions(
 
     // Recorded before any stall: the request genuinely reached the upstream.
     mock.inner.models_seen.lock().push(model.clone());
+    mock.inner.request_count.fetch_add(1, Ordering::Relaxed);
 
     if mock.inner.hang.load(Ordering::Acquire) {
         // Long enough that a signal always lands while this is in flight, short
@@ -159,13 +197,18 @@ pub struct Instance {
 
 impl Instance {
     /// Start an instance listening on an ephemeral port, sharing `db_path`.
+    ///
+    /// The port reaches the child only through `PARTNER_PORTAL_LISTEN`: the
+    /// listen address is an environment property now, so the harness exercises
+    /// exactly the wiring a deployment uses.
     pub fn start(name: &str, dir: &Path, db_path: &Path, upstream: &str) -> Self {
         let port = free_port();
         let config_path = dir.join(format!("config-{name}.yaml"));
-        write_config(&config_path, port, db_path, upstream);
+        write_config(&config_path, db_path, upstream);
 
         let child = Command::new(binary_path())
             .env("PARTNER_PORTAL_CONFIG", &config_path)
+            .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{port}"))
             .env("RUST_LOG", "warn")
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -265,31 +308,35 @@ pub fn free_port() -> u16 {
     port
 }
 
-pub fn write_config(path: &Path, port: u16, db_path: &Path, upstream: &str) {
+pub fn write_config(path: &Path, db_path: &Path, upstream: &str) {
     write_config_full(
         path,
-        port,
         db_path,
         upstream,
         UPSTREAM_KEY,
         LOCAL_KEY,
         "tester",
+        E2E_MODELS,
     );
 }
 
 /// Write a configuration file, varying the fields a reload test needs to move.
+///
+/// No listen address here: that is `PARTNER_PORTAL_LISTEN`, set where the
+/// instance is spawned.
+#[allow(clippy::too_many_arguments)]
 pub fn write_config_full(
     path: &Path,
-    port: u16,
     db_path: &Path,
     upstream: &str,
     upstream_key: &str,
     local_key: &str,
     local_name: &str,
+    allowed_models: &[&str],
 ) {
+    let models = render_allowed_models(allowed_models);
     let yaml = format!(
         r#"server:
-  listen: "127.0.0.1:{port}"
   shutdown_grace_secs: 1
   sse_poll_interval_ms: 100
   max_body_size: 1048576
@@ -301,7 +348,7 @@ upstream:
 keys:
   - key: "{local_key}"
     name: "{local_name}"
-database:
+{models}database:
   path: "{db}"
   queue_size: 5000
   batch_size: 50
@@ -309,15 +356,28 @@ database:
   retention_interval_secs: 3600
 "#,
         db = db_path.display(),
+        models = models,
     );
 
     write_raw(path, &yaml);
 }
 
+/// Render the `allowed_models:` block for a key, or nothing when the slice is
+/// empty (the strict default — a test that wants to probe it must say so).
+fn render_allowed_models(models: &[&str]) -> String {
+    if models.is_empty() {
+        return String::new();
+    }
+    let mut out = "    allowed_models:\n".to_string();
+    for m in models {
+        out.push_str(&format!("      - \"{m}\"\n"));
+    }
+    out
+}
+
 /// Write a configuration with several local keys, each with its own consumer.
 pub fn write_config_multi(
     path: &Path,
-    port: u16,
     db_path: &Path,
     upstream: &str,
     keys: &[(&str, &str, &str)],
@@ -325,13 +385,13 @@ pub fn write_config_multi(
     let mut list = String::new();
     for (key, name, consumer) in keys {
         list.push_str(&format!(
-            "  - key: \"{key}\"\n    name: \"{name}\"\n    consumer_id: \"{consumer}\"\n"
+            "  - key: \"{key}\"\n    name: \"{name}\"\n    consumer_id: \"{consumer}\"\n{models}",
+            models = render_allowed_models(E2E_MODELS),
         ));
     }
 
     let yaml = format!(
         r#"server:
-  listen: "127.0.0.1:{port}"
   shutdown_grace_secs: 1
   sse_poll_interval_ms: 100
 upstream:
@@ -647,9 +707,12 @@ impl Rotation {
 
                         let n = rotation.counter.fetch_add(1, Ordering::Relaxed);
                         let target = &targets[n % targets.len()];
-                        let model = format!("model-{n}");
+                        // A fixed ring rather than `model-{n}`: the strict
+                        // per-key allow-list (ADR 0012) cannot name an
+                        // unbounded counter. The tests only count acceptances.
+                        let model = E2E_MODELS[0];
 
-                        if let Ok(200) = client.chat(target, &model).await {
+                        if let Ok(200) = client.chat(target, model).await {
                             rotation.accepted.fetch_add(1, Ordering::Relaxed);
                         }
 
@@ -749,10 +812,15 @@ pub fn assert_ledger_sound(ledger: &LedgerSnapshot) {
 }
 
 /// The exact check: the set of requests the upstream served must equal the set
-/// of requests the ledger recorded.
+/// of requests the ledger recorded, and the counts must match exactly.
 ///
-/// Set equality rather than a count, because one lost record and one duplicated
-/// record would cancel out in a count and leave the bug invisible.
+/// Set equality for *which* models, plus an exact count comparison rather than
+/// set-size comparison, because one lost record and one duplicated record would
+/// cancel out in a count and leave the bug invisible — so the count is taken
+/// from the mock's raw request tally (`request_count`), not from the unique set
+/// of model names, which coalesces under the strict per-key allow-list (ADR
+/// 0012): a busy loop now sends one allowed model per request instead of an
+/// unbounded counter.
 pub fn assert_no_divergence(mock: &MockUpstream, ledger: &LedgerSnapshot) {
     let upstream: std::collections::HashSet<String> = mock.models_seen().into_iter().collect();
     let recorded: std::collections::HashSet<String> = ledger.models.iter().cloned().collect();
@@ -772,7 +840,7 @@ pub fn assert_no_divergence(mock: &MockUpstream, ledger: &LedgerSnapshot) {
     );
     assert_eq!(
         ledger.models.len(),
-        upstream.len(),
+        mock.request_count(),
         "ledger row count must match the upstream request count exactly"
     );
 }

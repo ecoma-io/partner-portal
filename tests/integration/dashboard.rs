@@ -353,7 +353,7 @@ async fn the_model_and_status_filters_narrow_the_result() {
 
     chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
     chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
-    chat(&client, &server, CLIENT_KEY, "claude-3", true).await;
+    chat(&client, &server, CLIENT_KEY, "gpt-4o-mini", true).await;
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     let by_model = client

@@ -5,5 +5,5 @@
 mod context;
 mod middleware;
 
-pub use context::{ConsumerContext, ConsumerIdentity};
+pub use context::{ConsumerContext, ConsumerIdentity, ManagerRole};
 pub use middleware::{AuthError, Authenticated};

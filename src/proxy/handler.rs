@@ -134,7 +134,7 @@ pub async fn handle_proxy(
     // but deliberately not metered: it consumes no tokens, and recording it
     // would add noise with zero usage to every usage view and rollup.
     if endpoint == Endpoint::Models {
-        return proxy_unmetered(&state, method, path, headers, body, &request_id).await;
+        return proxy_unmetered(&state, &consumer, method, path, headers, body, &request_id).await;
     }
 
     let request_value: Option<serde_json::Value> = if body.is_empty() {
@@ -151,6 +151,15 @@ pub async fn handle_proxy(
         },
         None => "unknown".to_string(),
     };
+
+    // Per-key model allow-list (ADR 0012). Strict: a key whose list omits the
+    // requested model — or that has no list at all — is refused before metering,
+    // so a disallowed model never reaches the upstream and never mints a ledger
+    // row. `/v1/models` exits above; only inference endpoints can reach here,
+    // and an empty body degrades to "unknown", which no list ever contains.
+    if !consumer.allowed_models().iter().any(|m| m == &model) {
+        return model_not_allowed_error(&request_id, &model);
+    }
 
     let wants_stream = request_value
         .as_ref()
@@ -408,8 +417,15 @@ fn forward_upstream_error(
 }
 
 /// Proxy a request without metering it.
+///
+/// For the `/v1/models` endpoint the response is filtered to the key's
+/// `allowed_models` (ADR 0012): a restricted key sees exactly the models it may
+/// call, nothing more. Chat/responses never reach this path. A body we cannot
+/// parse as a `data` list is forwarded verbatim — a discovery endpoint that
+/// surprises us is not a reason to invent an empty list or fail.
 async fn proxy_unmetered(
     state: &Arc<AppState>,
+    consumer: &ConsumerContext,
     method: Method,
     path: String,
     headers: HeaderMap,
@@ -453,13 +469,15 @@ async fn proxy_unmetered(
                     "upstream_error",
                 );
             }
+            let body = filter_models_response(&bytes, consumer.allowed_models());
+
             let builder = ProxyClient::forward_response_headers(
                 Response::builder().status(status),
                 &parts.headers,
             );
             match builder
                 .header("x-request-id", request_id)
-                .body(AxumBody::from(bytes))
+                .body(AxumBody::from(body))
             {
                 Ok(response) => response,
                 Err(_) => error_response(
@@ -471,6 +489,41 @@ async fn proxy_unmetered(
             }
         }
     }
+}
+
+/// Filter a `/v1/models` response body down to the models a key may call.
+///
+/// The upstream shape is `{"object":"list","data":[{"id":"<model>",...},...]}`.
+/// Only the `data` entries whose `id` is in the allow-list survive. Any shape
+/// we cannot parse — non-JSON, missing `data`, non-list elements — is returned
+/// verbatim: a discovery response that surprises us is forwarded as-is rather
+/// than replaced with a guessed empty list.
+fn filter_models_response(body: &[u8], allowed: &[String]) -> Bytes {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return Bytes::from(body.to_vec());
+    };
+
+    let Some(data) = json.get("data").and_then(|v| v.as_array()) else {
+        return Bytes::from(body.to_vec());
+    };
+
+    let filtered: Vec<&serde_json::Value> = data
+        .iter()
+        .filter(|entry| match entry.get("id").and_then(|v| v.as_str()) {
+            Some(id) => allowed.iter().any(|m| m == id),
+            None => false,
+        })
+        .collect();
+
+    // Rebuild the same document with only the allowed entries.
+    let mut out = json.clone();
+    if let Some(out_data) = out.get_mut("data").and_then(|v| v.as_array_mut()) {
+        out_data.clear();
+        out_data.extend(filtered.into_iter().cloned());
+    }
+    serde_json::to_vec(&out)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::from(body.to_vec()))
 }
 
 /// Terminal state chosen for a request, applied by [`finalize_and_respond`].
@@ -992,6 +1045,31 @@ pub fn error_response(
 
     Response::builder()
         .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-request-id", request_id)
+        .body(AxumBody::from(json))
+        .unwrap_or_else(|_| Response::new(AxumBody::empty()))
+}
+
+/// Refuse a model a key is not allowed to call, before anything is metered.
+///
+/// OpenAI-compatible: "The model 'x' does not exist" is the signal clients
+/// already surface for a model they cannot use, so a restricted key needs no
+/// new SDK behaviour. `code: "model_not_found"` distinguishes this from other
+/// `invalid_request_error`s.
+pub fn model_not_allowed_error(request_id: &str, model: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": format!("The model '{model}' does not exist"),
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+        }
+    });
+
+    let json = serde_json::to_string(&body).unwrap_or_else(|_| r#"{"error":{}}"#.to_string());
+
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-request-id", request_id)
         .body(AxumBody::from(json))

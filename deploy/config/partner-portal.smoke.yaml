@@ -7,7 +7,6 @@
 # proves the deployment path, not a different deployment.
 
 server:
-  listen: "0.0.0.0:8080"
   graceful_shutdown: true
   shutdown_grace_secs: 5
   cors_allow_origins: []
@@ -23,8 +22,6 @@ upstream:
 keys:
   - key: "smoke-key"
     name: "partner-smoke"
-    metadata:
-      tier: "test"
 
 database:
   path: "/var/lib/partner-portal/partner-portal.db"

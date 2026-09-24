@@ -185,6 +185,15 @@ fn report_live_changes(old: &Config, new: &Config) {
 
     report_key_changes(old, new);
 
+    // The manager password is read per request from the snapshot, like a key
+    // value, so a rotation is live from the next request. That it moved is the
+    // operational fact; the value is a credential and is not logged.
+    let old_password = old.manager.as_ref().map(|m| m.password.as_str());
+    let new_password = new.manager.as_ref().map(|m| m.password.as_str());
+    if old_password != new_password {
+        applied("manager.password", REDACTED, REDACTED);
+    }
+
     if old.server.max_body_size != new.server.max_body_size {
         // Half live, and saying so is the point: the per-request read follows
         // the snapshot, but the layer that rejects an oversized body at the
@@ -200,9 +209,6 @@ fn report_live_changes(old: &Config, new: &Config) {
 
 /// Fields whose value was captured when the process started.
 fn report_restart_required_changes(old: &Config, new: &Config) {
-    if old.server.listen != new.server.listen {
-        needs_restart("server.listen", &old.server.listen, &new.server.listen);
-    }
     if old.server.graceful_shutdown != new.server.graceful_shutdown {
         needs_restart(
             "server.graceful_shutdown",
@@ -323,10 +329,20 @@ fn report_key_changes(old: &Config, new: &Config) {
                 b.consumer_id(),
             );
         }
-        if a.metadata != b.metadata {
-            info!(
-                field = "keys[].metadata",
-                index, "applied on reload: metadata changed (values not logged)"
+        if a.allowed_models != b.allowed_models {
+            // Model names are not credentials — they are the same identifiers
+            // the ledger stores in cleartext — so the list itself is logged.
+            // Strict-by-default note: an empty list means *no* models, so it
+            // renders as "(none)" rather than looking like an opening-up.
+            let render = |models: &[String]| match models {
+                [] => "(none)".to_string(),
+                list => list.join(","),
+            };
+            applied_indexed(
+                "keys[].allowed_models",
+                index,
+                render(&a.allowed_models),
+                render(&b.allowed_models),
             );
         }
     }
@@ -499,7 +515,6 @@ keys:
     fn test_every_changed_field_is_reported() {
         const BASE: &str = r#"
 server:
-  listen: "0.0.0.0:8080"
   graceful_shutdown: true
   shutdown_grace_secs: 5
   max_body_size: 10485760
@@ -513,6 +528,9 @@ upstream:
 keys:
   - key: test-key
     name: Test
+    allowed_models:
+      - gpt-4o
+      - gpt-4o-mini
 database:
   path: "./partner-portal.db"
   retention_days: 60
@@ -527,11 +545,6 @@ database:
         // field it names: a bare scalar would also rewrite every other field
         // holding the same digits.
         let changes = [
-            (
-                "server.listen",
-                "listen: \"0.0.0.0:8080\"",
-                "listen: \"0.0.0.0:9090\"",
-            ),
             (
                 "server.graceful_shutdown",
                 "graceful_shutdown: true",
@@ -620,6 +633,80 @@ database:
             "a change to server.cors_allow_origins must be reported:\n{rendered}"
         );
 
+        // The `manager` block is optional, so adding one (or dropping it, or
+        // rotating its password) is an insert-and-remove shape like CORS.
+        // Password changes are reported without their value.
+        let with_manager = config_from(&format!(
+            r#"{BASE}manager:
+  password: pp-manager-secret
+"#
+        ));
+        let rendered = capture_report(&old, &with_manager);
+        assert!(
+            rendered.contains("field=\"manager.password\""),
+            "adding a manager password must be reported by name:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("pp-manager-secret"),
+            "the report rendered the manager password:\n{rendered}"
+        );
+
+        // `keys[].allowed_models` is a per-key list (ADR 0012) with a
+        // hand-written report branch. Model names are not credentials, so the
+        // values are logged; an emptied list renders as "(none)", the strict
+        // default, not as "*" (which would falsely read as "all models").
+        let models_changed = config_from(&BASE.replace(
+            "    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
+            "    allowed_models:\n      - gpt-4o\n      - gpt-5\n",
+        ));
+        assert_ne!(
+            old.hash(),
+            models_changed.hash(),
+            "the allowed_models edit does not change the config, so it tests nothing"
+        );
+        let rendered = capture_report(&old, &models_changed);
+        assert!(
+            rendered.contains("field=\"keys[].allowed_models\""),
+            "a change to keys[].allowed_models must be reported by name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("gpt-4o-mini") && rendered.contains("gpt-5"),
+            "the report should log the model names (they are not credentials):\n{rendered}"
+        );
+
+        // Strict-by-default rendering: an emptied list must read as "(none)",
+        // never as a wildcard that reads as "every model allowed".
+        let emptied = config_from(&BASE.replace(
+            "    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
+            "    allowed_models: []\n",
+        ));
+        let rendered = capture_report(&old, &emptied);
+        assert!(
+            rendered.contains("(none)"),
+            "an emptied allowed_models must render as (none), not *:\n{rendered}"
+        );
+
+        // A separate password rotation is the shape the extraction above
+        // rewrites, so report it directly rather than via string surgery on a
+        // BASE that has no manager block.
+        let base_with_manager = format!(
+            r#"{BASE}manager:
+  password: pp-manager-old
+"#
+        );
+        let rotated = config_from(
+            &base_with_manager.replace("password: pp-manager-old", "password: pp-manager-new"),
+        );
+        let rendered = capture_report(&old, &rotated);
+        assert!(
+            rendered.contains("field=\"manager.password\""),
+            "a manager password rotation must be reported by name:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("pp-manager-old") && !rendered.contains("pp-manager-new"),
+            "the report rendered a manager password:\n{rendered}"
+        );
+
         for (field, from, to) in changes {
             let new = config_from(&BASE.replace(from, to));
             assert_ne!(
@@ -662,20 +749,23 @@ database:
     fn test_report_never_logs_a_credential() {
         const SECRET_LOCAL: &str = "pp-local-do-not-log";
         const SECRET_UPSTREAM: &str = "sk-upstream-do-not-log";
+        const SECRET_MANAGER: &str = "pp-manager-do-not-log";
 
         let old = config_from(&format!(
-            "upstream:\n  base_url: https://api.openai.com\n  api_key: {SECRET_UPSTREAM}\nkeys:\n  - key: {SECRET_LOCAL}\n    name: Test\n"
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: {SECRET_UPSTREAM}\nkeys:\n  - key: {SECRET_LOCAL}\n    name: Test\nmanager:\n  password: {SECRET_MANAGER}\n"
         ));
         let new = config_from(
-            "upstream:\n  base_url: https://other.example\n  api_key: sk-rotated-do-not-log\nkeys:\n  - key: pp-rotated-do-not-log\n    name: Test\n",
+            "upstream:\n  base_url: https://other.example\n  api_key: sk-rotated-do-not-log\nkeys:\n  - key: pp-rotated-do-not-log\n    name: Test\nmanager:\n  password: pp-manager-rotated-do-not-log\n",
         );
 
         let rendered = capture_report(&old, &new);
         for secret in [
             SECRET_LOCAL,
             SECRET_UPSTREAM,
+            SECRET_MANAGER,
             "sk-rotated-do-not-log",
             "pp-rotated-do-not-log",
+            "pp-manager-rotated-do-not-log",
         ] {
             assert!(
                 !rendered.contains(secret),
@@ -689,6 +779,10 @@ database:
             "{rendered}"
         );
         assert!(rendered.contains("field=\"keys[].key\""), "{rendered}");
+        assert!(
+            rendered.contains("field=\"manager.password\""),
+            "{rendered}"
+        );
         assert!(rendered.contains(REDACTED), "{rendered}");
     }
 }

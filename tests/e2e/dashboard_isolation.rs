@@ -23,7 +23,6 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     let config_path = dir.path().join("config.yaml");
     write_config_multi(
         &config_path,
-        port,
         &db_path,
         &upstream,
         &[(KEY_A, "alpha-key", "alpha"), (KEY_B, "beta-key", "beta")],
@@ -31,6 +30,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
 
     let child = Command::new(binary_path())
         .env("PARTNER_PORTAL_CONFIG", &config_path)
+        .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{port}"))
         .env("RUST_LOG", "warn")
         .current_dir(dir.path())
         .stdin(Stdio::null())

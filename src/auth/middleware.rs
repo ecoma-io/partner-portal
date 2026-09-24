@@ -2,8 +2,14 @@
 //!
 //! Identity is **always derived server-side** from the presented credential and
 //! the current config snapshot. Nothing a client sends — `consumer_id`,
-//! `x-consumer-id`, metadata, or any other field — contributes to identity, so
-//! no request can read or write another consumer's data by asserting it.
+//! `x-consumer-id`, or any other field — contributes to identity, so no request
+//! can read or write another consumer's data by asserting it.
+//!
+//! Two credentials are accepted: a local key value (scoped to its consumer) and,
+//! when configured, the manager password (scoped to every consumer; ADR 0013).
+//! Both travel as `Authorization: Bearer <value>`; the manager password is not a
+//! key, and the two sets never intersect because `find_key` runs first and the
+//! manager password is not a member of the key set.
 //!
 //! Implemented as an axum extractor rather than a middleware layer: a handler
 //! that takes `Authenticated` cannot be written without resolving an identity,
@@ -97,16 +103,22 @@ impl FromRequestParts<Arc<AppState>> for Authenticated {
     ) -> Result<Self, Self::Rejection> {
         let token = extract_bearer_token(parts)?;
 
-        // Read from the live snapshot, so a key added or revoked by hot reload
-        // takes effect on the next request without a restart.
+        // Read from the live snapshot, so a key or the manager password added
+        // or revoked by hot reload takes effect on the next request without a
+        // restart. `find_key` runs first: the manager password is a distinct
+        // credential, not a member of the key set.
         let config = state.config.read();
-        let key_config = config.config.find_key(token).ok_or(AuthError::InvalidKey)?;
-
-        Ok(Authenticated(ConsumerContext::new(
-            key_config.consumer_id().to_string(),
-            key_config.name.clone(),
-            key_config.metadata.clone(),
-        )))
+        if let Some(key_config) = config.config.find_key(token) {
+            return Ok(Authenticated(ConsumerContext::new(
+                key_config.consumer_id().to_string(),
+                key_config.name.clone(),
+                key_config.allowed_models.clone(),
+            )));
+        }
+        if config.config.find_manager(token).is_some() {
+            return Ok(Authenticated(ConsumerContext::manager()));
+        }
+        Err(AuthError::InvalidKey)
     }
 }
 

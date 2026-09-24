@@ -10,9 +10,9 @@
 # at the repository root; this file lists what the deployment actually sets.
 
 server:
-  # Inside its own container each instance has its own network namespace, so
-  # both can bind 8080. The host-facing ports are the compose `ports:` entries.
-  listen: "0.0.0.0:8080"
+  # No listen address here: the image sets `PARTNER_PORTAL_LISTEN=0.0.0.0:8080`
+  # (the Dockerfile), which is the right value inside a container's own network
+  # namespace. The host-facing ports are the compose `ports:` entries.
 
   # The edge stops routing to an instance before it stops accepting, so the
   # listener must wait for requests it already accepted. Readiness flips at the
@@ -42,8 +42,6 @@ upstream:
 keys:
   - key: "REPLACE-WITH-A-PARTNER-KEY"
     name: "partner-smoke"
-    metadata:
-      tier: "test"
 
 database:
   # Absolute, and on the shared volume: the pair writes to one ledger.

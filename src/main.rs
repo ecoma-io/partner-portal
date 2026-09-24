@@ -57,7 +57,7 @@ use tracing::{error, info, warn};
 use partner_portal::{
     admin::create_admin_router,
     auth::Authenticated,
-    config::{ConfigLoader, HotReloader},
+    config::{ConfigLoader, HotReloader, listen_addr},
     dashboard::{SseBroadcaster, create_dashboard_router},
     ledger::{
         InstanceGuard, LedgerPool, LedgerWriter, LedgerWriterConfig, RecoveryContext,
@@ -256,10 +256,11 @@ async fn main() -> anyhow::Result<()> {
 
     // --- Serve --------------------------------------------------------------
 
-    let addr: SocketAddr =
-        config.server.listen.parse().map_err(|e| {
-            anyhow::anyhow!("invalid server.listen {:?}: {e}", config.server.listen)
-        })?;
+    // The listen address comes from the environment, not the config file — it
+    // is a deployment property that must match the port mapping and the
+    // health-check URL (see src/config/listen.rs). An invalid value aborts
+    // startup rather than binding somewhere unrequested.
+    let addr: SocketAddr = listen_addr().map_err(|e| anyhow::anyhow!("{e}"))?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| anyhow::anyhow!("failed to bind {addr}: {e}"))?;
@@ -575,6 +576,21 @@ async fn proxy_handler(
     Authenticated(consumer): Authenticated,
     request: Request,
 ) -> Response {
+    // The manager password is a dashboard-only credential (ADR 0008): it grants a
+    // cross-consumer usage view, never the ability to spend the upstream. If it
+    // reached the metering path it would mint rows with an empty consumer_id,
+    // which is both a fabricated identity and a way for one partner to see
+    // another's traffic in a manager-less view. Refuse it here, before a request
+    // id even exists.
+    if consumer.is_manager() {
+        return partner_portal::proxy::handler::error_response(
+            &uuid::Uuid::now_v7().to_string(),
+            axum::http::StatusCode::FORBIDDEN,
+            "The manager credential is a dashboard credential and cannot be used to proxy requests",
+            "invalid_request_error",
+        );
+    }
+
     let method = request.method().clone();
     // Path *and* query. `uri().path()` alone drops the query string, which
     // silently changes the request the upstream sees: `?beta=true`, a cache

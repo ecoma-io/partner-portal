@@ -22,7 +22,9 @@
 #     partner-portal:test
 #
 # Contract of the produced image:
-#   * listens on 0.0.0.0:8080            (EXPOSE 8080; `server.listen` in config)
+#   * listens on 0.0.0.0:8080            (EXPOSE 8080; PARTNER_PORTAL_LISTEN
+#     is pinned below — the listen address is an environment variable, not a
+#     config field, so the published port and the bind agree by construction)
 #   * config from /etc/partner-portal/config.yaml (override with PARTNER_PORTAL_CONFIG)
 #   * data at   /var/lib/partner-portal  (declared VOLUME; holds partner-portal.db
 #     plus its -wal/-shm siblings — these three files are one unit, never split
@@ -174,6 +176,7 @@ COPY --from=rust-build --chown=root:root --chmod=0755 \
 WORKDIR /var/lib/partner-portal
 
 ENV PARTNER_PORTAL_CONFIG=/etc/partner-portal/config.yaml \
+    PARTNER_PORTAL_LISTEN=0.0.0.0:8080 \
     PARTNER_PORTAL_HEALTH_URL=http://127.0.0.1:8080/healthz
 
 # The ledger, its WAL and its SHM file. Declared so a plain `docker run` without
@@ -186,8 +189,9 @@ USER 10001:10001
 EXPOSE 8080
 
 # Liveness, not readiness: `/healthz` never consults SQLite, so a slow disk can
-# never turn into a restart loop. Update PARTNER_PORTAL_HEALTH_URL if
-# `server.listen` is changed away from 8080.
+# never turn into a restart loop. PARTNER_PORTAL_HEALTH_URL already points where
+# PARTNER_PORTAL_LISTEN binds; change the two together if the image ever stops
+# listening on 8080.
 HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
     CMD curl -fsS "$PARTNER_PORTAL_HEALTH_URL" >/dev/null || exit 1
 

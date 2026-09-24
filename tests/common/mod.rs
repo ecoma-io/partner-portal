@@ -52,6 +52,16 @@ use serde_json::{Value, json};
 /// The compiled binary under test.
 pub const BIN: &str = env!("CARGO_BIN_EXE_partner-portal");
 
+/// Models the default test key may call — everything the mock upstream
+/// accepts, so ordinary tests never trip the strict-per-key allow-list.
+const DEFAULT_ALLOWED_MODELS: &[&str] = &[
+    "gpt-4o",
+    "gpt-4o-mini",
+    "gpt-5",
+    "mock-model",
+    "mock-model-mini",
+];
+
 /// Default credential for the first configured key.
 pub const CLIENT_KEY: &str = "sk-local-test-key";
 /// Default consumer identity for that key.
@@ -694,14 +704,24 @@ pub struct KeySpec {
     pub key: String,
     pub name: String,
     pub consumer_id: Option<String>,
+    /// Models this key may call. Empty means *no* models (strict default).
+    pub allowed_models: Vec<String>,
 }
 
 impl KeySpec {
+    /// A key that may call every model the mock upstream serves. `Spec::new`
+    /// builds its default key through this, so ordinary tests keep exercising
+    /// the proxy rather than the allow-list; a test about restrictions calls
+    /// `with_allowed_models` explicitly.
     pub fn new(key: &str, name: &str) -> Self {
         Self {
             key: key.to_string(),
             name: name.to_string(),
             consumer_id: None,
+            allowed_models: DEFAULT_ALLOWED_MODELS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
         }
     }
 
@@ -710,9 +730,31 @@ impl KeySpec {
         self
     }
 
+    /// Restrict this key to exactly the listed models. Passing `&[]` models
+    /// the strict default: no model is allowed.
+    pub fn with_allowed_models(mut self, models: &[&str]) -> Self {
+        self.allowed_models = models.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
     /// The identity the ledger will record for this key.
     pub fn effective_consumer_id(&self) -> &str {
         self.consumer_id.as_deref().unwrap_or(&self.name)
+    }
+}
+
+/// A configured manager password, mapping onto the `manager` config block.
+/// A manager sees every consumer; there is no allow-list to configure (ADR 0013).
+#[derive(Clone, Debug)]
+pub struct ManagerSpec {
+    pub password: String,
+}
+
+impl ManagerSpec {
+    pub fn new(password: &str) -> Self {
+        Self {
+            password: password.to_string(),
+        }
     }
 }
 
@@ -724,6 +766,8 @@ pub struct Spec {
     pub upstream_key: String,
     pub upstream_timeout_secs: u64,
     pub keys: Vec<KeySpec>,
+    /// Optional manager credential. `None` means no `manager` block in the file.
+    pub manager: Option<ManagerSpec>,
     /// Ledger path. Relative names are resolved inside the server's directory,
     /// so a restart against the same directory reuses the same database.
     pub db_name: PathBuf,
@@ -746,6 +790,7 @@ impl Spec {
             upstream_key: UPSTREAM_KEY.to_string(),
             upstream_timeout_secs: 10,
             keys: vec![KeySpec::new(CLIENT_KEY, CONSUMER)],
+            manager: None,
             db_name: PathBuf::from("ledger.db"),
             port: free_port(),
             queue_size: 10_000,
@@ -815,6 +860,11 @@ impl Spec {
         self
     }
 
+    pub fn with_manager(mut self, manager: ManagerSpec) -> Self {
+        self.manager = Some(manager);
+        self
+    }
+
     pub fn yaml(&self) -> String {
         let mut keys = String::new();
         for key in &self.keys {
@@ -826,11 +876,23 @@ impl Spec {
             if let Some(consumer_id) = &key.consumer_id {
                 keys.push_str(&format!("    consumer_id: {}\n", yaml_str(consumer_id)));
             }
+            if !key.allowed_models.is_empty() {
+                keys.push_str("    allowed_models:\n");
+                for model in &key.allowed_models {
+                    keys.push_str(&format!("      - {}\n", yaml_str(model)));
+                }
+            }
         }
 
+        let manager = match &self.manager {
+            None => String::new(),
+            Some(m) => format!("manager:\n  password: {}\n", yaml_str(&m.password)),
+        };
+
+        // The listen address is not in the file: `spawn_in` passes it as
+        // PARTNER_PORTAL_LISTEN, like a real deployment does.
         format!(
             "server:\n  \
-               listen: {listen}\n  \
                graceful_shutdown: true\n  \
                shutdown_grace_secs: {grace}\n  \
                max_body_size: {max_body}\n  \
@@ -842,6 +904,7 @@ impl Spec {
                timeout_secs: {timeout}\n  \
                connect_timeout_secs: 2\n\
              keys:\n{keys}\
+             {manager}\
              database:\n  \
                path: {db}\n  \
                retention_days: {retention}\n  \
@@ -850,13 +913,13 @@ impl Spec {
                batch_timeout_ms: {batch_timeout}\n  \
                retention_interval_secs: 3600\n  \
                retention_batch_size: 2000\n",
-            listen = yaml_str(&format!("127.0.0.1:{}", self.port)),
             grace = self.shutdown_grace_secs,
             max_body = self.max_body_size,
             sse = self.sse_poll_interval_ms,
             upstream = yaml_str(&self.upstream_url),
             upstream_key = yaml_str(&self.upstream_key),
             timeout = self.upstream_timeout_secs,
+            manager = manager,
             db = yaml_str(&self.db_name.display().to_string()),
             retention = self.retention_days,
             queue = self.queue_size,
@@ -925,6 +988,7 @@ impl TestServer {
         let log = File::create(&log_path).expect("create log file");
         let child = Command::new(BIN)
             .env("PARTNER_PORTAL_CONFIG", &config_path)
+            .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{}", spec.port))
             .env("RUST_LOG", "info")
             .current_dir(dir)
             .stdin(Stdio::null())

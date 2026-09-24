@@ -21,7 +21,11 @@
 //! 6. **Shutdown drains.** Readiness fails, in-flight work finishes, the metering
 //!    pipeline drains and commits, and only then does the database close.
 //! 7. **Dashboard data is key-scoped.** Consumer identity comes from the
-//!    authenticated credential, never from the request.
+//!    authenticated credential, never from the request. The one deliberate
+//!    widening is the configured `manager:` password, which sees every
+//!    consumer and narrows only through the `consumers=` filter (ADR 0011,
+//!    ADR 0013); a deployment that never configures one is byte-for-byte the
+//!    ADR 0008 behaviour.
 
 pub mod admin;
 pub mod auth;

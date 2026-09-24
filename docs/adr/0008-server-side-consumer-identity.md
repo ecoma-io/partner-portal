@@ -28,8 +28,13 @@ traffic, or writing rows attributed to another consumer.
 * Upstream credentials are replaced, not appended to: the client's `Authorization`
   header is dropped before the upstream credential is set, so a local key is never
   forwarded.
-* There is no cross-consumer or administrative view. The dashboard router contains
-  only the five self-scoped routes plus the SSE stream.
+* There is no cross-consumer or administrative view **except the one described in
+  ADR 0011 and widened by [ADR 0013](0013-manager-sees-all-consumers.md)**: an
+  optional `manager:` password that opens the same five self-scoped routes (plus
+  the SSE stream) over **every** consumer, narrowed only by the `consumers=`
+  query parameter. A deployment that never configures a `manager:` block is
+  byte-for-byte this decision's behaviour. The manager password is a
+  dashboard-only credential — it is refused on `/v1/*`.
 * Failures do not echo credentials: `401` responses carry
   `Cache-Control: no-store` and a fixed message, and `SetSensitiveHeadersLayer`
   marks `Authorization` unrenderable before any inner layer can log it.
@@ -44,9 +49,14 @@ traffic, or writing rows attributed to another consumer.
 * **Deriving identity from the upstream's returned model/owner fields** —
   rejected: identity must come from our own configuration, not from a response we
   do not control.
-* **An admin key with a cross-consumer view** — rejected for now: it would be the
-  one endpoint whose scoping is special, and it is not needed to operate the
-  service. `/api/me`, plus the ledger on disk, is enough.
+* **An admin key with a cross-consumer view** — rejected for now, and now
+  implemented in one gated form by **[ADR 0011](0011-manager-password-cross-consumer-view.md)**
+  and [ADR 0013](0013-manager-sees-all-consumers.md): a *separate* `manager:`
+  password (never an existing key) opens a dashboard-only view over **all**
+  consumers — ADR 0013 removed the allow-list, so the `consumers=` parameter is
+  a pure filter that can only narrow. The credential is refused on the proxy
+  path. Nothing else widens; `/api/me` plus the ledger on disk remains the
+  answer for everything else.
 * **Trusting a metadata field for scoping** — rejected: metadata is opaque and
   consumer-scoped by construction, and nothing reads it for authorisation.
 
@@ -67,8 +77,12 @@ traffic, or writing rows attributed to another consumer.
   other — revocation is a hot reload.
 * Revoking a key takes effect on the next request, with no restart, because the
   lookup reads the live config snapshot.
-* There is no way to ask "how much did all consumers spend?" through the API; that
-  question is answered by querying the SQLite file directly.
+* There is no way to ask "how much did all consumers spend?" through the API —
+  **unless a `manager:` block is configured**, in which case the manager password
+  answers it over every consumer, narrowed only by the `consumers=` parameter
+  ([ADR 0013](0013-manager-sees-all-consumers.md)), through the very same
+  queries. Without a manager block, the question is still answered by querying
+  the SQLite file directly.
 * **The ledger records no per-key attribution by design.** Local key values are
   credentials and never reach persisted text (`src/config/types.rs::credentials()`);
   a key that is leaked exposes the consumer's view while it remains configured.

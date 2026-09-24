@@ -3,7 +3,6 @@
 use hex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 /// What a secret renders as wherever it might be logged or `Debug`-printed.
 ///
@@ -34,6 +33,16 @@ pub struct Config {
     /// Database configuration
     #[serde(default)]
     pub database: DatabaseConfig,
+
+    /// Optional operator credential with a cross-consumer dashboard view.
+    ///
+    /// When present, the dashboard login accepts this password (sent as
+    /// `Authorization: Bearer <password>`) and the resulting session can see
+    /// the usage of every consumer. This is the one deliberate widening
+    /// of the otherwise strictly consumer-scoped dashboard; see docs/adr/0008
+    /// and docs/adr/0013, which superseded the allow-list it once carried.
+    #[serde(default)]
+    pub manager: Option<ManagerConfig>,
 }
 
 impl Config {
@@ -42,11 +51,10 @@ impl Config {
     /// Every field participates, through serde — the hash covers exactly what
     /// the file says, so a field added to this struct is covered without this
     /// function being touched. What it must *not* do is depend on how a value
-    /// happens to be laid out in memory: `keys[].metadata` is a `BTreeMap`
-    /// precisely so that two parses of an unchanged file in two different
-    /// processes serialise identically. With a `HashMap` they do not, the hash
-    /// differs, and the watcher swaps a config that did not change — every
-    /// second.
+    /// happens to be laid out in memory, which is why this configuration holds
+    /// no map-typed field: a `HashMap` serialises in iteration order, two
+    /// parses of an unchanged file would hash differently, and the watcher
+    /// would swap a config that did not change — every second.
     pub fn hash(&self) -> String {
         let yaml = serde_yaml::to_string(self).unwrap_or_default();
         let mut hasher = Sha256::new();
@@ -61,12 +69,13 @@ impl Config {
 
     /// Every credential this configuration holds.
     ///
-    /// The upstream key *and* every local key, because the rule that matters is
-    /// "no credential in this file reaches text we persist or serve" — stating it
-    /// over the whole set makes it true by construction, instead of resting on an
-    /// argument about which paths could see which secret. In practice only the
-    /// upstream key can appear in upstream text (the local keys are never sent
-    /// upstream), so including the rest costs a comparison each.
+    /// The upstream key, every local key, *and* the manager password, because
+    /// the rule that matters is "no credential in this file reaches text we
+    /// persist or serve" — stating it over the whole set makes it true by
+    /// construction, instead of resting on an argument about which paths could
+    /// see which secret. In practice only the upstream key can appear in
+    /// upstream text (the local keys are never sent upstream), so including the
+    /// rest costs a comparison each.
     ///
     /// Values too short to be credentials are left out deliberately: scrubbing
     /// every occurrence of a two-character string would garble ordinary words in
@@ -74,6 +83,7 @@ impl Config {
     pub fn credentials(&self) -> Vec<&str> {
         std::iter::once(self.upstream.api_key.as_str())
             .chain(self.keys.iter().map(|k| k.key.as_str()))
+            .chain(self.manager.as_ref().map(|m| m.password.as_str()))
             .filter(|secret| secret.len() >= MIN_SCRUBBED_SECRET_LEN)
             .collect()
     }
@@ -201,12 +211,13 @@ pub struct KeyConfig {
     #[serde(default)]
     pub consumer_id: Option<String>,
 
-    /// Optional metadata.
-    ///
-    /// A `BTreeMap` rather than a `HashMap` because the ordering is part of the
-    /// hash: see [`Config::hash`].
+    /// Models this key may call. **Strict**: an empty list (or a key that omits
+    /// the field entirely) is allowed *no* model — every inference request is
+    /// refused with `404 model_not_found` before it reaches the upstream. A
+    /// model already in use must be added here or the key stops working the
+    /// moment this ships. Read live per request (ADR 0012).
     #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
+    pub allowed_models: Vec<String>,
 }
 
 /// Manual, so `key` renders as a redaction. A key value is a credential, and a
@@ -218,7 +229,6 @@ impl std::fmt::Debug for KeyConfig {
             .field("key", &REDACTED)
             .field("name", &self.name)
             .field("consumer_id", &self.consumer_id)
-            .field("metadata", &self.metadata)
             .finish()
     }
 }
@@ -228,16 +238,64 @@ impl KeyConfig {
     pub fn consumer_id(&self) -> &str {
         self.consumer_id.as_deref().unwrap_or(&self.name)
     }
+
+    /// Whether this key may call `model`.
+    ///
+    /// Strict by default: an empty list (or a key that never declared the
+    /// field) allows nothing. Only an explicitly listed name passes.
+    pub fn allows_model(&self, model: &str) -> bool {
+        !self.allowed_models.is_empty() && self.allowed_models.iter().any(|m| m == model)
+    }
+}
+
+/// Credential granting a **cross-consumer** dashboard view.
+///
+/// This is the one deliberate exception to the "dashboard is consumer-scoped"
+/// rule in ADR 0008: an operator who presents this password (as
+/// `Authorization: Bearer <password>`) may view the usage of **every**
+/// consumer (ADR 0013). It is a *credential*, exactly like a key value, so
+/// it is scrubbed from ledger text, redacted in `Debug`, and never logged by
+/// the reload watcher — the same treatment `keys[].key` gets.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ManagerConfig {
+    /// The password. Required when the `manager` block is present.
+    pub password: String,
+}
+
+/// Manual, so `password` renders as a redaction. A manager password is a
+/// credential — the same exact-equality bearer the keys are — and a derived
+/// `Debug` here would emit it from any `{:?}` of a config snapshot.
+impl std::fmt::Debug for ManagerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagerConfig")
+            .field("password", &REDACTED)
+            .finish()
+    }
+}
+
+impl Config {
+    /// Match a presented Bearer token against the manager password.
+    ///
+    /// Exact string equality, like a key value. Returns the manager config so a
+    /// caller can tell a manager credential from a key.
+    pub fn find_manager(&self, token: &str) -> Option<&ManagerConfig> {
+        self.manager
+            .as_ref()
+            .filter(|m| !m.password.is_empty() && m.password == token)
+    }
 }
 
 /// Server configuration
+///
+/// The listen address is deliberately **not** here: it is an environment
+/// property, not application configuration — `PARTNER_PORTAL_LISTEN`
+/// (see [`crate::config::listen_addr`]). A port that lived in this file would
+/// have to be changed in lockstep with the container runtime's port mapping,
+/// in a different file, with nothing keeping the two honest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Listen address
-    #[serde(default = "default_listen_addr")]
-    pub listen: String,
-
     /// Wait for in-flight requests to finish on SIGTERM.
     ///
     /// This controls only whether the listener waits for work already accepted.
@@ -279,7 +337,6 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            listen: default_listen_addr(),
             graceful_shutdown: default_true(),
             shutdown_grace_secs: default_shutdown_grace_secs(),
             max_body_size: default_max_body_size(),
@@ -289,9 +346,6 @@ impl Default for ServerConfig {
     }
 }
 
-fn default_listen_addr() -> String {
-    "0.0.0.0:8080".to_string()
-}
 fn default_true() -> bool {
     true
 }
@@ -397,54 +451,15 @@ mod tests {
                 key: "local-key".to_string(),
                 name: "test".to_string(),
                 consumer_id: None,
-                metadata: BTreeMap::new(),
+                allowed_models: Vec::new(),
             }],
             database: DatabaseConfig::default(),
+            manager: None,
         };
 
         let hash1 = config.hash();
         let hash2 = config.hash();
         assert_eq!(hash1, hash2);
-    }
-
-    /// The bug this pins: with a `HashMap`, two *parses* of one unchanged file
-    /// hash differently, and the watcher swaps the config every second. Written
-    /// as two parses rather than two `hash()` calls on one instance, because
-    /// hashing one instance twice is exactly the shape that stays green.
-    #[test]
-    fn test_config_hash_is_stable_across_parses_of_metadata_in_any_order() {
-        let first = r#"
-upstream:
-  base_url: https://api.openai.com
-  api_key: sk-test
-keys:
-  - key: local-key
-    name: test
-    metadata:
-      tier: partner
-      region: eu
-      plan: enterprise
-"#;
-        let second = r#"
-upstream:
-  base_url: https://api.openai.com
-  api_key: sk-test
-keys:
-  - key: local-key
-    name: test
-    metadata:
-      plan: enterprise
-      tier: partner
-      region: eu
-"#;
-
-        let a = crate::config::ConfigLoader::parse_yaml(first).unwrap();
-        let b = crate::config::ConfigLoader::parse_yaml(second).unwrap();
-        assert_eq!(
-            a.hash(),
-            b.hash(),
-            "the same logical config must hash the same whatever order its metadata was written in"
-        );
     }
 
     #[test]
@@ -453,11 +468,10 @@ keys:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
+  timeout_secs: 120
 keys:
   - key: local-key
     name: test
-    metadata:
-      tier: partner
 database:
   batch_size: 100
 "#;
@@ -466,11 +480,11 @@ database:
 
         for (name, changed) in [
             ("upstream api_key", base.replace("sk-test", "sk-other")),
-            ("key value", base.replace("local-key", "local-key-2")),
             (
-                "metadata",
-                base.replace("tier: partner", "tier: partner\n      extra: one"),
+                "upstream timeout",
+                base.replace("timeout_secs: 120", "timeout_secs: 121"),
             ),
+            ("key value", base.replace("local-key", "local-key-2")),
             (
                 "database",
                 base.replace("batch_size: 100", "batch_size: 101"),
@@ -489,7 +503,9 @@ database:
     fn test_every_configured_credential_is_scrubbed_from_text() {
         // The upstream key is the one that can appear in upstream text, but the
         // point of scrubbing the whole set is that the rule holds for any of
-        // them without an argument about reachability.
+        // them without an argument about reachability — including the manager
+        // password, which could otherwise reach an `error_message` if an
+        // upstream echoed it the way providers echo keys.
         let config = crate::config::ConfigLoader::parse_yaml(
             r#"
 upstream:
@@ -498,18 +514,22 @@ upstream:
 keys:
   - key: pp-local-secret
     name: test
+manager:
+  password: mgr-secret-password
 "#,
         )
         .unwrap();
         let credentials = config.credentials();
-        assert_eq!(credentials.len(), 2);
+        assert_eq!(credentials.len(), 3);
 
         let echo = "Incorrect API key provided: sk-upstream-secret. \
-                    The key pp-local-secret is also rejected.";
+                    The key pp-local-secret is also rejected, \
+                    and neither is mgr-secret-password.";
         let scrubbed = redact_credentials(echo, &credentials);
         assert!(!scrubbed.contains("sk-upstream-secret"), "{scrubbed}");
         assert!(!scrubbed.contains("pp-local-secret"), "{scrubbed}");
-        assert_eq!(scrubbed.matches(REDACTED).count(), 2, "{scrubbed}");
+        assert!(!scrubbed.contains("mgr-secret-password"), "{scrubbed}");
+        assert_eq!(scrubbed.matches(REDACTED).count(), 3, "{scrubbed}");
         // The rest of the message survives: the reason must still be readable.
         assert!(
             scrubbed.contains("Incorrect API key provided"),
@@ -544,6 +564,8 @@ upstream:
 keys:
   - key: pp-local-secret
     name: test
+manager:
+  password: mgr-secret-password
 "#,
         )
         .unwrap();
@@ -557,9 +579,123 @@ keys:
             !rendered.contains("pp-local-secret"),
             "keys[].key must not render: {rendered}"
         );
-        assert_eq!(rendered.matches(REDACTED).count(), 2, "{rendered}");
-        // Still identifiable: the name is what an operator locates a key by.
+        assert!(
+            !rendered.contains("mgr-secret-password"),
+            "manager.password must not render: {rendered}"
+        );
+        assert_eq!(rendered.matches(REDACTED).count(), 3, "{rendered}");
+        // Still identifiable: the name is what an operator locates a key by,
+        // and the redacted `password` label is what says a manager block is
+        // there without saying what it holds.
         assert!(rendered.contains("test"), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
+    }
+
+    /// The manager credential is matched by exact equality like a key value, and
+    /// the empty-password guard keeps a block that failed validation from
+    /// silently authenticating as "manager".
+    #[test]
+    fn test_find_manager_matches_by_exact_password_and_never_an_empty_one() {
+        let config = crate::config::ConfigLoader::parse_yaml(
+            r#"
+upstream:
+  base_url: https://api.openai.com
+  api_key: sk-test
+keys:
+  - key: pp-local-secret
+    name: test
+manager:
+  password: mgr-password-exact
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config.find_manager("mgr-password-exact").is_some(),
+            "the exact password matches"
+        );
+
+        assert!(
+            config.find_manager("mgr-password-exact ").is_none(),
+            "no trimming"
+        );
+        assert!(
+            config.find_manager("mgr-password-exacT").is_none(),
+            "no case folding"
+        );
+        assert!(config.find_manager("").is_none());
+    }
+
+    /// A config without a `manager` block must not authenticate as manager, and
+    /// neither must a block whose password is empty — `find_manager` carries a
+    /// defensive guard even though validation refuses the latter at load.
+    #[test]
+    fn test_find_manager_is_none_without_a_manager_block_or_with_an_empty_password() {
+        let without_block = crate::config::ConfigLoader::parse_yaml(
+            r#"
+upstream:
+  base_url: https://api.openai.com
+  api_key: sk-test
+keys:
+  - key: pp-local-secret
+    name: test
+"#,
+        )
+        .unwrap();
+        assert!(without_block.find_manager("anything").is_none());
+
+        let with_empty_password = Config {
+            server: ServerConfig::default(),
+            upstream: UpstreamConfig {
+                base_url: "https://api.openai.com".to_string(),
+                api_key: "test-key".to_string(),
+                timeout_secs: 120,
+                connect_timeout_secs: 10,
+            },
+            keys: vec![KeyConfig {
+                key: "local-key".to_string(),
+                name: "test".to_string(),
+                consumer_id: None,
+                allowed_models: Vec::new(),
+            }],
+            database: DatabaseConfig::default(),
+            manager: Some(ManagerConfig {
+                password: String::new(),
+            }),
+        };
+        assert!(
+            with_empty_password.find_manager("").is_none(),
+            "an empty password must never authenticate"
+        );
+    }
+
+    /// The strict-by-default contract: only an explicitly listed name passes.
+    #[test]
+    fn test_allows_model_is_strict_by_default() {
+        let key = |list: &[&str]| KeyConfig {
+            key: "k".to_string(),
+            name: "n".to_string(),
+            consumer_id: None,
+            allowed_models: list.iter().map(|s| s.to_string()).collect(),
+        };
+
+        // A declared list admits exactly its members.
+        let listed = key(&["gpt-4o", "gpt-4o-mini"]);
+        assert!(listed.allows_model("gpt-4o"));
+        assert!(listed.allows_model("gpt-4o-mini"));
+
+        // Anything outside the list is refused.
+        assert!(!listed.allows_model("gpt-5"));
+        assert!(
+            !listed.allows_model("GPT-4o"),
+            "matching is exact, not case-insensitive"
+        );
+
+        // An empty list — the default for a key that omits the field — is the
+        // strict case: *no* model is allowed at all, never "everything".
+        let empty = key(&[]);
+        assert!(!empty.allows_model("gpt-4o"));
+        assert!(!empty.allows_model("anything"));
     }
 
     #[test]

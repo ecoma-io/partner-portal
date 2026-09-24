@@ -64,3 +64,13 @@ the admin endpoints and an SPA fallback. Anything else under `/v1/` is a 404.
 * `src/proxy/handler.rs` — `Endpoint::from_path` returns `None` for every other
   path, which becomes a 404.
 * `README.md` — the "what it deliberately is not" table.
+
+## Scope note (ADR 0012)
+
+The proxy path now carries one *policy* refusal that is neither routing nor
+transformation: a per-key `allowed_models` capability check, which rejects a
+request whose model the key may not call *before* the upstream is contacted and
+*meters nothing*. This ADR's "no request transformation" rule is about the
+request's *destination* — the proxy still appends, never chooses or rewrites.
+The per-key check is scoped, documented, and tested in
+[`0012-per-key-model-allow-list.md`](0012-per-key-model-allow-list.md).

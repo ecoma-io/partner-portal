@@ -134,11 +134,13 @@ async fn shutdown_commits_every_accepted_request() {
     // A burst that is still arriving when the signal lands.
     let mut sent = 0usize;
     let mut tasks = Vec::new();
-    for i in 0..200 {
+    for _ in 0..200 {
         let client = client.clone();
         let base = base.clone();
         tasks.push(tokio::spawn(async move {
-            client.chat(&base, &format!("burst-{i}")).await
+            // A fixed ring: the strict per-key allow-list (ADR 0012) cannot
+            // enumerate `burst-{i}`; this burst only counts acceptances.
+            client.chat(&base, E2E_MODELS[0]).await
         }));
     }
 
