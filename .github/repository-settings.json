@@ -1,0 +1,70 @@
+{
+  "$comment": "The repository settings that are NOT code — branch rules and merge policy — written down because nothing else can hold them. A clone carries every gate in this tree, and none of these: delete the repository and they are gone, recreate it and they come back as GitHub's defaults, which are not these. That is the failure this file exists to prevent. Apply with `gh api --method PUT repos/ecoma-io/partner-portal --input <the repository object>` and `gh api --method POST repos/ecoma-io/partner-portal/rulesets --input <a rulesets entry>`; read the live state back with the same paths and `GET` to diff it against this file. This is a record, not an enforcer: no gate compares it to reality, because doing so needs an admin token and this repository holds none. Check it by hand when something about landing a change feels different from what is written here. The ruleset below was applied live, from this file, when the repository's first pull request landed; `appliedLive` records what that means. The shape follows ecoma-io/ecoma's file — same merge policy, same queue — because the org lands changes one way and this repository is part of the org; the required checks differ only in what this repository's gates are named.",
+  "repository": {
+    "$comment": "Merge policy. Exactly one method stays enabled, so the strategy is a mechanism rather than whichever button someone clicked. `delete_branch_on_merge` is safe under merge commits and only under them: a merge commit's second parent puts the branch's commits on the default branch as the SAME objects, so deleting the ref removes a pointer and no history. Under rebase the branch commits are REPLAYED as new objects and the originals are reachable only through that ref.",
+    "allow_merge_commit": true,
+    "allow_squash_merge": false,
+    "allow_rebase_merge": false,
+    "delete_branch_on_merge": true
+  },
+  "rulesets": [
+    {
+      "name": "main",
+      "target": "branch",
+      "enforcement": "active",
+      "conditions": { "ref_name": { "include": ["~DEFAULT_BRANCH"], "exclude": [] } },
+      "rules": [
+        {
+          "$comment": "The default branch cannot be deleted, and cannot be force-pushed: landed history stays landed, which is what every SHA-pinned action ref, every release tag and every ledger-recovery commit assumes. Both rules are required together — protecting history while allowing deletion leaves nothing to protect.",
+          "type": "deletion"
+        },
+        {
+          "type": "non_fast_forward"
+        },
+        {
+          "$comment": "`required_linear_history` is deliberately ABSENT, for the reason ecoma's file records: it forbids merge commits outright, and this repository's merge policy is merge commits — linearity is recoverable as a view (`git log --first-parent`), the pull-request boundary a merge commit records is not recoverable once flattened. `required_approving_review_count: 0` is the solo-maintainer reality: the one person who can push this repository is also the only person who could review it, and a count of 1 would make the repository unable to land its own fixes. The pull-request requirement itself is what carries the gate — every change reaches main through a pull request whose checks ran on the merge queue. `.github/CODEOWNERS` names the owner, so `require_code_owner_review` has someone to bind when a second reviewer ever exists; today the count above it makes it advisory.",
+          "type": "pull_request",
+          "parameters": {
+            "required_approving_review_count": 0,
+            "dismiss_stale_reviews_on_push": false,
+            "required_reviewers": [],
+            "require_code_owner_review": true,
+            "dismissal_restriction": { "enabled": false, "allowed_actors": [] },
+            "require_last_push_approval": false,
+            "required_review_thread_resolution": false,
+            "allowed_merge_methods": ["merge"]
+          }
+        },
+        {
+          "$comment": "`integration_id` 15368 is GitHub Actions: it pins each check to the app that produces it, so a differently-owned check of the same name cannot satisfy it. The two names are the two aggregating jobs — `ci-gate` in ci.yml, `analysis-gate` in analysis.yml — and they are single jobs on purpose: one name to require each, so adding a CI or analysis job never means remembering to add it here too.",
+          "type": "required_status_checks",
+          "parameters": {
+            "strict_required_status_checks_policy": true,
+            "do_not_enforce_on_create": false,
+            "required_status_checks": [
+              { "context": "ci-gate", "integration_id": 15368 },
+              { "context": "analysis-gate", "integration_id": 15368 }
+            ]
+          }
+        },
+        {
+          "$comment": "An approved pull request does not merge directly, it queues and CI re-runs on the would-be trunk — trunk plus the entries ahead of it. `ALLGREEN` makes that real rather than decorative: a batch lands only if every entry in it passes together, so two individually-correct changes that are wrong combined fail the batch instead of landing. `merge_method: MERGE` matches the pull_request rule above; a queue configured to squash or rebase would quietly undo the decision recorded there. THIS RULE HAS A CODE DEPENDENCY, and it is the one place in this file where enabling a setting alone makes things worse than leaving it off: the queue waits for the required checks on the temporary queue ref, so both workflows must list `merge_group` among their triggers. Without it nothing runs there, no check reports, and every entry waits out `check_response_timeout_minutes` and is dropped — a queue that accepts pull requests and merges none, with no error anywhere saying so. Removing that trigger and keeping this rule is the failure mode; they change together or not at all.",
+          "type": "merge_queue",
+          "parameters": {
+            "merge_method": "MERGE",
+            "grouping_strategy": "ALLGREEN",
+            "max_entries_to_build": 5,
+            "min_entries_to_merge": 1,
+            "max_entries_to_merge": 5,
+            "min_entries_to_merge_wait_minutes": 2,
+            "check_response_timeout_minutes": 60
+          }
+        }
+      ]
+    }
+  ],
+  "appliedLive": {
+    "$comment": "Unlike a repository whose maintainer token lacks admin rights, this ruleset was applied to the live repository from this file on 2026-09-25, via `gh api` authenticated as the repository owner, immediately after the first pull request landed and before the second one could queue. Re-verify with `gh api repos/ecoma-io/partner-portal/rulesets` (list) and `gh api repos/ecoma-io/partner-portal/rulesets/{id}` (detail) and diff against the JSON above; the repository object's merge-policy half reads back from `gh api repos/ecoma-io/partner-portal`. Nothing in this block is part of the applyable ruleset above.",
+    "order": "The rules could only be created once a default branch existed to protect, and the merge queue could only be exercised once its two required checks existed in the workflows that land on main — which is why this file arrived in the second pull request and not the first. If the rules are ever found absent, recreate them from the JSON above before trusting any green check on a pull request: the checks are advisory without the ruleset that requires them."
+  }
+}

@@ -131,7 +131,11 @@ jobs:
       # `with:`, where the `secrets` context IS available.
       RELEASE_APP_ID: ${{ secrets.ECOMA_APP_ID }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Release Please authenticates with its own token, minted below; the
+          # checkout's credential would be an unused second one.
+          persist-credentials: false
 
       # The escape hatch, ON. With the default token the Release PR arrives with
       # no CI attached — it cannot satisfy a required check and sits blocked
@@ -169,15 +173,16 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
 
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 12.3.4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -188,7 +193,7 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm build
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dashboard-dist
           path: dashboard/dist
@@ -222,32 +227,38 @@ jobs:
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-please.outputs.tag }}
           # The revision baked into the binary is the commit the tag points at,
           # and a shallow clone cannot prove that is the commit that was checked
           # out.
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: release-${{ matrix.target }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: dashboard-dist
           path: dashboard/dist
 
+      # Workflow expressions travel into the step through `env:`, never through
+      # string interpolation into the script: the script a reviewer reads is the
+      # script that runs.
       - name: Resolve version
         id: version
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag }}
         run: |
           set -euo pipefail
-          ref="${{ needs.release-please.outputs.tag }}"
+          ref="$RELEASE_TAG"
           version="${ref#v}"
           if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$'; then
             echo "::error::tag $ref is not a v-prefixed semver version"
@@ -257,6 +268,9 @@ jobs:
           echo "version=$version" >>"$GITHUB_OUTPUT"
 
       - name: Build
+        env:
+          GIT_COMMIT: ${{ github.sha }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           # Baked in by src/admin/mod.rs via option_env! and served by GET
@@ -264,7 +278,6 @@ jobs:
           # running after a rolling update. The timestamp is computed here rather
           # than read from `github.run_started_at`, which actionlint's context
           # data does not carry.
-          export GIT_COMMIT="${{ github.sha }}"
           export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           # `--features hyper-rustls` is not optional for a published artifact:
           # without it the connector is plain-HTTP-only, so every real upstream
@@ -272,17 +285,18 @@ jobs:
           # 502 with no TLS handshake attempted. The feature is opt-in because
           # the `<1s` unit-test loop must not build rustls; every path that
           # *ships* a binary (here and the Dockerfile) opts in explicitly.
-          cargo build --locked --release --features hyper-rustls --target "${{ matrix.target }}"
+          cargo build --locked --release --features hyper-rustls --target "$TARGET"
 
       - name: Package
         id: package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          version="${{ steps.version.outputs.version }}"
-          target="${{ matrix.target }}"
-          name="partner-portal-${version}-${target}"
+          name="partner-portal-${VERSION}-${TARGET}"
           mkdir -p "dist/$name"
-          cp "target/${target}/release/partner-portal" "dist/$name/"
+          cp "target/${TARGET}/release/partner-portal" "dist/$name/"
           cp README.md LICENSE "dist/$name/"
           # The version the artifact reports, asserted against the tag it was
           # built from: a mismatch here means the tag and the binary disagree.
@@ -291,7 +305,7 @@ jobs:
           ( cd dist && sha256sum "$name.tar.gz" >"$name.tar.gz.sha256" )
           echo "name=$name" >>"$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
@@ -303,7 +317,7 @@ jobs:
   # ---------------------------------------------------------------------------
   # The OCI image, multi-architecture, pushed by digest.
   # ---------------------------------------------------------------------------
-  image:
+  oci:
     name: OCI image
     needs: [release-please, binaries]
     if: needs.release-please.outputs.released == 'true'
@@ -318,14 +332,15 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-please.outputs.tag }}
+          persist-credentials: false
 
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -333,9 +348,11 @@ jobs:
 
       - name: Resolve version
         id: version
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag }}
         run: |
           set -euo pipefail
-          ref="${{ needs.release-please.outputs.tag }}"
+          ref="$RELEASE_TAG"
           echo "tag=$ref" >>"$GITHUB_OUTPUT"
           echo "version=${ref#v}" >>"$GITHUB_OUTPUT"
 
@@ -344,7 +361,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -367,22 +384,23 @@ jobs:
           cache-to: type=gha,mode=max,scope=partner-portal-image
 
       - name: Record the digest
+        env:
+          IMAGE: ghcr.io/${{ github.repository }}
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          image="ghcr.io/${{ github.repository }}"
-          version="${{ steps.version.outputs.version }}"
-          digest="${{ steps.build.outputs.digest }}"
-          printf '%s@%s\n' "$image" "$digest" >image-digest.txt
+          printf '%s@%s\n' "$IMAGE" "$BUILD_DIGEST" >image-digest.txt
           {
             echo "### OCI image"
             echo
             echo '```'
-            printf '%s:%s\n' "$image" "$version"
-            printf '%s@%s\n' "$image" "$digest"
+            printf '%s:%s\n' "$IMAGE" "$RELEASE_VERSION"
+            printf '%s@%s\n' "$IMAGE" "$BUILD_DIGEST"
             echo '```'
           } >>"$GITHUB_STEP_SUMMARY"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-digest
           path: image-digest.txt
@@ -394,7 +412,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: GitHub Release
-    needs: [release-please, binaries, image]
+    needs: [release-please, binaries, oci]
     if: needs.release-please.outputs.released == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -405,10 +423,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.release-please.outputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       # The tag must be a tag on the default branch. A release built from a
       # commit that never landed is a release nobody can reproduce from main, and
@@ -417,15 +436,17 @@ jobs:
       # exactly what makes it worth keeping: it fails the release instead of
       # publishing one from a tag nobody can find in the history.
       - name: The tag is an ancestor of main
+        env:
+          RELEASE_TAG: ${{ needs.release-please.outputs.tag }}
         run: |
           set -euo pipefail
           git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
           if ! git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main; then
-            echo "::error::tag ${{ needs.release-please.outputs.tag }} does not point at a commit on main"
+            echo "::error::tag $RELEASE_TAG does not point at a commit on main"
             exit 1
           fi
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
 
@@ -447,7 +468,7 @@ jobs:
       # consumer needs to answer "is this build affected by CVE-X" without
       # rebuilding it.
       - name: SBOM (syft, SPDX JSON)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: spdx-json
@@ -456,12 +477,12 @@ jobs:
           upload-release-assets: false
 
       # Build provenance for the tarballs, verifiable with `gh attestation verify`.
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: release/*.tar.gz
 
       - name: Create the release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.release-please.outputs.tag }}
           name: ${{ needs.release-please.outputs.tag }}
