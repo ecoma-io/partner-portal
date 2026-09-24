@@ -266,7 +266,13 @@ jobs:
           # data does not carry.
           export GIT_COMMIT="${{ github.sha }}"
           export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          cargo build --locked --release --target "${{ matrix.target }}"
+          # `--features hyper-rustls` is not optional for a published artifact:
+          # without it the connector is plain-HTTP-only, so every real upstream
+          # — `config.example.yaml` documents `https://api.openai.com` — is a
+          # 502 with no TLS handshake attempted. The feature is opt-in because
+          # the `<1s` unit-test loop must not build rustls; every path that
+          # *ships* a binary (here and the Dockerfile) opts in explicitly.
+          cargo build --locked --release --features hyper-rustls --target "${{ matrix.target }}"
 
       - name: Package
         id: package
