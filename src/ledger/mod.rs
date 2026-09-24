@@ -39,7 +39,8 @@ pub use writer::{LedgerWriter, LedgerWriterConfig, WriteError};
 /// * 1 — initial ledger
 /// * 2 — `cached_tokens`
 /// * 3 — `usage_records.instance_id` + `ledger_instances` (ownership-aware recovery)
-pub const SCHEMA_VERSION: u32 = 3;
+/// * 4 — bounded `usage_records.error_body` for non-2xx upstream responses
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// A failure to bring the database up to the schema this binary expects.
 #[derive(Debug)]
@@ -119,6 +120,18 @@ pub fn init_schema(conn: &rusqlite::Connection) -> Result<(), SchemaError> {
             column: "usage_records.instance_id",
         });
     }
+    // v4: a bounded upstream error body. Adding a nullable column is safe while
+    // an older binary is still writing during a rolling update: it neither
+    // changes old statements nor requires a value from them.
+    if found < 4 && !column_exists(conn, "usage_records", "error_body")? {
+        conn.execute_batch("ALTER TABLE usage_records ADD COLUMN error_body TEXT;")?;
+    }
+    if !column_exists(conn, "usage_records", "error_body")? {
+        return Err(SchemaError::MigrationIncomplete {
+            column: "usage_records.error_body",
+        });
+    }
+
     // One partial index serves both recovery and the in-flight audit: the
     // candidate set is tiny, and narrowing the index to in-flight rows keeps it
     // cheap to maintain on the write path.
@@ -394,13 +407,13 @@ mod tests {
         let conn = new_db(&dir.path().join("t.db"));
         assert_eq!(read_schema_version(&conn).unwrap(), 0);
         init_schema(&conn).unwrap();
-        assert_eq!(read_schema_version(&conn).unwrap(), 3);
+        assert_eq!(read_schema_version(&conn).unwrap(), SCHEMA_VERSION);
     }
 
     #[test]
     fn test_older_schema_is_migrated_forward_not_relabelled() {
-        // Build a v2 database: the ledger as it shipped before instance
-        // ownership, with no `instance_id` column and the version stamped 2.
+        // Build a v3 database: the ledger as it shipped before bounded error
+        // bodies, with ownership present and the version stamped 3.
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("legacy.db");
         let conn = new_db(&path);
@@ -415,6 +428,7 @@ mod tests {
                 streaming INTEGER NOT NULL DEFAULT 0,
                 http_status INTEGER,
                 request_status TEXT NOT NULL,
+                instance_id TEXT,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
                 cached_tokens INTEGER,
@@ -424,7 +438,7 @@ mod tests {
                 error_message TEXT
              );
              CREATE TABLE ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             INSERT INTO ledger_meta (key, value) VALUES ('schema_version', '2');
+             INSERT INTO ledger_meta (key, value) VALUES ('schema_version', '3');
              INSERT INTO usage_records (
                 request_id, created_at, consumer_id, model, endpoint, streaming,
                 request_status, duration_ms, usage_status
@@ -435,25 +449,25 @@ mod tests {
 
         init_schema(&conn).unwrap();
 
-        assert_eq!(read_schema_version(&conn).unwrap(), 3);
+        assert_eq!(read_schema_version(&conn).unwrap(), 4);
         assert!(
-            column_exists(&conn, "usage_records", "instance_id").unwrap(),
+            column_exists(&conn, "usage_records", "error_body").unwrap(),
             "the migration must actually add the column, not just relabel the file"
         );
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM usage_records", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rows, 1, "migrating must not touch existing rows");
-        let owner: Option<String> = conn
+        let error_body: Option<String> = conn
             .query_row(
-                "SELECT instance_id FROM usage_records WHERE request_id = 'legacy-1'",
+                "SELECT error_body FROM usage_records WHERE request_id = 'legacy-1'",
                 [],
                 |r| r.get(0),
             )
             .unwrap();
         assert_eq!(
-            owner, None,
-            "a pre-migration row has no known owner and must stay NULL"
+            error_body, None,
+            "a pre-migration row has no captured upstream error body"
         );
     }
 

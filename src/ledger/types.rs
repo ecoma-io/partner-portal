@@ -181,6 +181,9 @@ pub struct RequestRecord {
     pub ttft_ms: Option<u64>,
     pub duration_ms: u64,
     pub error_message: Option<String>,
+    /// Bounded, lossy UTF-8 text from a non-streaming non-2xx upstream response.
+    /// Never set from request, successful, or streaming bodies.
+    pub error_body: Option<String>,
 }
 
 impl RequestRecord {
@@ -205,6 +208,7 @@ impl RequestRecord {
             ttft_ms: None,
             duration_ms: 0,
             error_message: None,
+            error_body: None,
         }
     }
 

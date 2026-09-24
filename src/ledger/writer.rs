@@ -647,8 +647,9 @@ fn insert_accept(
         INSERT INTO usage_records (
             request_id, created_at, consumer_id, model, endpoint, streaming,
             http_status, request_status, instance_id, input_tokens, output_tokens,
-            cached_tokens, ttft_ms, duration_ms, usage_status, error_message
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', ?7, NULL, NULL, NULL, NULL, 0, 'unavailable', NULL)
+            cached_tokens, ttft_ms, duration_ms, usage_status, error_message,
+            error_body
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', ?7, NULL, NULL, NULL, NULL, 0, 'unavailable', NULL, NULL)
         ON CONFLICT(request_id) DO NOTHING
         "#,
         rusqlite::params![
@@ -726,7 +727,8 @@ fn finalize_record(
                     ttft_ms = ?8,
                     duration_ms = ?9,
                     usage_status = ?10,
-                    error_message = ?11
+                    error_message = ?11,
+                    error_body = ?12
                 WHERE request_id = ?1
                 "#,
                 rusqlite::params![
@@ -741,6 +743,7 @@ fn finalize_record(
                     record.duration_ms as i64,
                     record.usage_status().as_str(),
                     record.error_message,
+                    record.error_body,
                 ],
             )?;
 
@@ -757,8 +760,8 @@ fn finalize_record(
                     request_id, created_at, consumer_id, model, endpoint, streaming,
                     http_status, request_status, instance_id, input_tokens,
                     output_tokens, cached_tokens, ttft_ms, duration_ms,
-                    usage_status, error_message
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+                    usage_status, error_message, error_body
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 "#,
                 rusqlite::params![
                     record.request_id,
@@ -777,6 +780,7 @@ fn finalize_record(
                     record.duration_ms as i64,
                     record.usage_status().as_str(),
                     record.error_message,
+                    record.error_body,
                 ],
             )?;
         }

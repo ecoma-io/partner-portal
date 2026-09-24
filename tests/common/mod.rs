@@ -1513,6 +1513,8 @@ pub struct LedgerRow {
     pub ttft_ms: Option<i64>,
     pub duration_ms: i64,
     pub error_message: Option<String>,
+    /// Bounded raw text from a non-streaming non-2xx upstream response, if any.
+    pub error_body: Option<String>,
 }
 
 impl LedgerRow {
@@ -1538,13 +1540,14 @@ impl LedgerRow {
             ttft_ms: row.get(13)?,
             duration_ms: row.get(14)?,
             error_message: row.get(15)?,
+            error_body: row.get(16)?,
         })
     }
 }
 
 const ROW_COLUMNS: &str = "id, request_id, created_at, consumer_id, model, endpoint, streaming, \
                            http_status, request_status, usage_status, input_tokens, output_tokens, \
-                           cached_tokens, ttft_ms, duration_ms, error_message";
+                           cached_tokens, ttft_ms, duration_ms, error_message, error_body";
 
 /// Every row, oldest first.
 pub fn all_rows(conn: &Connection) -> Vec<LedgerRow> {

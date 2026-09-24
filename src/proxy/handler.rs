@@ -51,6 +51,13 @@ use crate::proxy::usage::{
 /// unavailable rather than guessed.
 pub const MAX_BUFFERED_RESPONSE: usize = 32 * 1024 * 1024;
 
+/// Maximum UTF-8 byte length persisted from a non-2xx upstream response body.
+///
+/// This is deliberately much smaller than [`MAX_BUFFERED_RESPONSE`]. The latter
+/// is a transient parsing cap; this is the durable privacy and storage cap.
+const MAX_STORED_ERROR_BODY: usize = 8 * 1024;
+const ERROR_BODY_TRUNCATION_MARKER: &str = "… (truncated)";
+
 /// Reason recorded when the client goes away mid-stream.
 const CLIENT_DISCONNECT: &str = "client disconnected during streaming";
 
@@ -208,6 +215,7 @@ pub async fn handle_proxy(
                     http_status: Some(StatusCode::GATEWAY_TIMEOUT.as_u16()),
                     reason,
                     usage: Usage::default(),
+                    error_body: None,
                 },
                 started,
                 error_response(
@@ -228,6 +236,7 @@ pub async fn handle_proxy(
                     http_status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                     reason,
                     usage: Usage::default(),
+                    error_body: None,
                 },
                 started,
                 error_response(
@@ -280,6 +289,7 @@ pub async fn handle_proxy(
                 http_status: Some(status.as_u16()),
                 reason,
                 usage,
+                error_body: Some(bounded_error_body(&body_bytes)),
             },
             started,
             response,
@@ -327,6 +337,7 @@ pub async fn handle_proxy(
                 http_status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                 reason,
                 usage: Usage::default(),
+                error_body: None,
             },
             started,
             error_response(
@@ -468,6 +479,8 @@ enum Outcome {
         http_status: Option<u16>,
         reason: String,
         usage: Usage,
+        /// Only set from a non-streaming non-2xx upstream response body.
+        error_body: Option<String>,
     },
 }
 
@@ -492,9 +505,11 @@ async fn finalize_and_respond(
             http_status,
             reason,
             usage,
+            error_body,
         } => {
             record.fail(http_status, reason, duration_ms);
             record.set_usage(usage);
+            record.error_body = error_body;
         }
     }
 
@@ -843,6 +858,43 @@ async fn collect_capped(mut body: hyper::body::Incoming) -> (Bytes, BodyFate) {
     (Bytes::from(acc), fate)
 }
 
+/// Convert a non-2xx upstream error body to bounded display text for the ledger.
+///
+/// This helper is only called from the non-2xx, non-streaming branch in
+/// [`handle_proxy`]. It decodes malformed bytes lossily, never stores more than
+/// [`MAX_STORED_ERROR_BODY`] UTF-8 bytes, and marks every shortened representation
+/// plainly so a reader never mistakes a prefix for the full upstream response.
+fn bounded_error_body(body: &[u8]) -> String {
+    let source = &body[..body.len().min(MAX_STORED_ERROR_BODY)];
+    let decoded = String::from_utf8_lossy(source);
+    let truncated = body.len() > MAX_STORED_ERROR_BODY || decoded.len() > MAX_STORED_ERROR_BODY;
+    let content_limit = if truncated {
+        MAX_STORED_ERROR_BODY - ERROR_BODY_TRUNCATION_MARKER.len()
+    } else {
+        MAX_STORED_ERROR_BODY
+    };
+    let content = truncate_utf8(&decoded, content_limit);
+
+    if truncated {
+        format!("{content}{ERROR_BODY_TRUNCATION_MARKER}")
+    } else {
+        content.to_string()
+    }
+}
+
+/// Return a valid UTF-8 prefix that does not exceed `max_bytes`.
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
+}
+
 /// Longest reason string persisted to the ledger.
 ///
 /// The reason is upstream-influenced text (a provider's error document, a
@@ -1147,6 +1199,86 @@ mod tests {
             status, "completed",
             "the guard must not overwrite a terminal state"
         );
+    }
+
+    #[test]
+    fn test_bounded_error_body_preserves_small_bodies_verbatim() {
+        let body = br#"{"error":{"message":"slow down"}}"#;
+        assert_eq!(
+            bounded_error_body(body),
+            String::from_utf8_lossy(body),
+            "a body under the cap must not be touched"
+        );
+    }
+
+    #[test]
+    fn test_bounded_error_body_truncates_and_marks_at_the_byte_cap() {
+        let mut body = vec![b'{']; // Then 8 KiB of 'x'.
+        body.extend(std::iter::repeat_n(b'x', 8 * 1024));
+        body.push(b'}');
+        assert!(body.len() > MAX_STORED_ERROR_BODY);
+
+        let stored = bounded_error_body(&body);
+        assert!(
+            stored.len() <= MAX_STORED_ERROR_BODY,
+            "the stored value must respect the 8 KiB cap, got {} bytes",
+            stored.len()
+        );
+        assert!(
+            stored.ends_with(ERROR_BODY_TRUNCATION_MARKER),
+            "a shortened body must say so: {stored:?}"
+        );
+        assert!(
+            !body.iter().all(|b| *b == b'x'),
+            "sanity: the fixture has non-x bytes too"
+        );
+    }
+
+    #[test]
+    fn test_bounded_error_body_cuts_at_a_utf8_boundary() {
+        // 'é' is two bytes; the cap must never split it. A body that exceeds the
+        // cap by a whole number of multi-byte characters is cut at a fixed byte
+        // budget, and the cut must land on a character boundary — a naive byte
+        // cut at an odd offset would leave a dangling half of an 'é'.
+        //
+        // `MAX_STORED_ERROR_BODY` 'é's is exactly twice the cap in bytes, so the
+        // arithmetic below works in whole characters.
+        let body = "é".repeat(MAX_STORED_ERROR_BODY);
+        assert_eq!(body.len(), MAX_STORED_ERROR_BODY * 2);
+        assert!(body.len() > MAX_STORED_ERROR_BODY);
+
+        let stored = bounded_error_body(body.as_bytes());
+        // The stored value is a `String`, so it is valid UTF-8 by construction
+        // (a split 'é' would have panicked inside `truncate_utf8`'s slice).
+        // What we can still assert: the content before the marker is an integral
+        // number of whole 'é' characters, never a lone byte.
+        let content = stored
+            .strip_suffix(ERROR_BODY_TRUNCATION_MARKER)
+            .expect("a shortened body must carry the truncation marker");
+        assert_eq!(content.len() % 2, 0, "the prefix must not split an 'é'");
+        assert!(
+            content.chars().all(|c| c == 'é'),
+            "the prefix must be whole characters, got {content:?}"
+        );
+        assert!(
+            stored.len() <= MAX_STORED_ERROR_BODY + ERROR_BODY_TRUNCATION_MARKER.len(),
+            "the stored value must stay within the cap plus its marker"
+        );
+    }
+
+    #[test]
+    fn test_truncate_utf8_does_not_split_a_multibyte_char() {
+        const MAX: usize = 7;
+        // "\u{1F600}" is 4 bytes; we ask for a 5-byte cut that lands inside it.
+        let value = "ab\u{1F600}c\u{1F600}";
+        let cut = truncate_utf8(value, MAX);
+        assert!(cut.is_char_boundary(MAX));
+        assert!(cut.len() <= MAX);
+        assert!(
+            !cut.ends_with('\u{1F600}'),
+            "the emoji must be cut off whole"
+        );
+        let _ = String::from(cut);
     }
 
     #[test]

@@ -906,6 +906,131 @@ async fn a_cached_usage_object_is_recorded_verbatim() {
 }
 
 #[tokio::test]
+async fn an_upstream_error_body_is_persisted_bounded_and_lower_cased() {
+    // The user-chosen exception to ADR 0010: a bounded raw error body from a
+    // non-2xx, non-streaming upstream response is persisted only for that request
+    // and exposed only to the owning consumer.
+    const BODY: &[u8] = br#"{"error":{"message":"from upstream","code":"quota_exceeded"}}"#;
+    let upstream = MockUpstream::start(Behaviour::ErrorText {
+        status: 503,
+        body: String::from_utf8_lossy(BODY).into_owned(),
+    })
+    .await;
+    let server = TestServer::start(Spec::new(&upstream)).await;
+    let client = TestClient::new();
+
+    let response = client
+        .post_json(
+            &server.url("/v1/chat/completions"),
+            Some(server.key()),
+            TestClient::chat_body("gpt-4o", false),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let row = wait_for_single_terminal(&server.db_path, WAIT_TIMEOUT).await;
+    assert_eq!(row.request_status, "failed");
+    assert_eq!(row.http_status, Some(503));
+    let stored = row.error_body.expect("the failure body must be persisted");
+    let expected = String::from_utf8_lossy(BODY);
+    assert_eq!(
+        stored, expected,
+        "a body under the 8 KiB cap must be stored verbatim"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_error_body_over_the_cap_is_truncated_with_a_marker() {
+    // A body longer than MAX_STORED_ERROR_BODY must neither be persisted whole
+    // nor silently cut: the stored value ends with a visible truncation marker so
+    // a reader never mistakes a prefix for the full upstream response.
+    let long = format!(
+        "{{\"error\":{{\"message\":\"{}\"}}}}",
+        "x".repeat(20 * 1024)
+    );
+    assert!(
+        long.len() > 8 * 1024,
+        "the fixture body must exceed the cap"
+    );
+    let upstream = MockUpstream::start(Behaviour::ErrorText {
+        status: 503,
+        body: long.clone(),
+    })
+    .await;
+    let server = TestServer::start(Spec::new(&upstream)).await;
+    let client = TestClient::new();
+
+    let response = client
+        .post_json(
+            &server.url("/v1/chat/completions"),
+            Some(server.key()),
+            TestClient::chat_body("gpt-4o", false),
+        )
+        .await;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+
+    let row = wait_for_single_terminal(&server.db_path, WAIT_TIMEOUT).await;
+    let stored = row.error_body.expect("the failure body must be persisted");
+    assert!(
+        stored.ends_with("… (truncated)"),
+        "a shortened body must say so, got {:?}",
+        stored.chars().rev().take(20).collect::<String>()
+    );
+    assert!(
+        stored.len() <= 8 * 1024,
+        "the stored body must respect the 8 KiB cap, got {} bytes",
+        stored.len()
+    );
+    assert!(
+        !stored.contains(&("x".repeat(8 * 1024))),
+        "the full body must never be persisted"
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_stream_break_never_persists_a_body() {
+    // Streaming responses are forwarded incrementally and their partial bytes
+    // must never be captured as an error body, even when the stream breaks.
+    let upstream = MockUpstream::start(Behaviour::StreamAbort { after: 2 }).await;
+    let server = TestServer::start(Spec::new(&upstream)).await;
+    let client = TestClient::new();
+
+    let response = client
+        .send(
+            Method::POST,
+            &server.url("/v1/chat/completions"),
+            Some(server.key()),
+            Bytes::from(
+                serde_json::to_vec(&json!({
+                    "model": "gpt-4o",
+                    "stream": true,
+                    "messages": [],
+                }))
+                .unwrap(),
+            ),
+            &[],
+        )
+        .await
+        .expect("streaming request");
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("x-request-id")
+        .to_string();
+    let _ = BodyReader::new(response.into_body())
+        .read_to_end(Duration::from_secs(5))
+        .await;
+
+    let row = wait_for_terminal(&server.db_path, &request_id, WAIT_TIMEOUT).await;
+    assert_eq!(row.request_status, "failed");
+    assert!(
+        row.error_body.is_none(),
+        "a broken stream must not capture a body"
+    );
+}
+
+#[tokio::test]
 async fn an_upstream_error_message_is_recorded_verbatim() {
     let upstream = MockUpstream::start(Behaviour::Error {
         status: 429,

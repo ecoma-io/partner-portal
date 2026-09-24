@@ -16,7 +16,9 @@ succeed". None of those need the payload.
 
 ## Decision
 
-The ledger stores **metadata only**. The complete set of persisted columns is in
+The ledger stores **metadata only**, except for one deliberately narrow and
+user-approved exception: a bounded copy of the upstream's error body on a
+non-2xx, non-streaming response. The complete set of persisted columns is in
 `src/ledger/schema.sql`:
 
 | Column | What it is |
@@ -34,16 +36,31 @@ The ledger stores **metadata only**. The complete set of persisted columns is in
 | `duration_ms` | Handler-observed duration |
 | `usage_status` | `available` \| `unavailable` \| `partial` |
 | `error_message` | A failure reason, or the upstream's `error.message` |
+| `error_body` | Bounded raw upstream error body, non-2xx non-streaming only (`NULL` otherwise) |
 
 Not stored anywhere: prompt content, completion content, message arrays, tool
-arguments, `input` fields, response bodies, embeddings, or anything derived from
-them. There is no column for a body and no code path that would write one.
+arguments, `input` fields, request bodies, successful (2xx) response bodies,
+streaming bodies, embeddings, or anything derived from them. There is no code
+path that would write any of those.
 
-What *is* copied from a response body is a single string — the upstream's
+What *is* copied from a response body is a single bounded string — the upstream's
 `error.message` on a non-2xx response — because a failure that cannot be explained
-is not operable. That string is provider-authored and may quote request content, so
-it is the one field with payload-adjacent risk; it is exposed only to the consumer
-that owns the request, and only on failed or interrupted rows.
+is not operable, plus, by explicit user decision, the upstream's *error body*
+itself:
+
+* **Only** a non-streaming, non-2xx upstream response. 2xx responses are never
+  captured, streaming responses are never captured (their bytes are forwarded
+  incrementally and dropped), request bodies are never captured, and a transport
+  or timeout failure has no upstream body to capture.
+* **Bounded to 8 KiB** of UTF-8 (lossy conversion, valid-UTF-8 cut at the char
+  boundary, distinct `… (truncated)` marker when shortened), independent of the
+  32 MiB transient buffering cap used for usage extraction.
+* **Consumer-scoped** by the same `consumer_id = ?1` request-list query as every
+  other ledger field.
+
+That string is provider-authored and may quote request content, so it is the one
+field with payload-adjacent risk; it is exposed only to the consumer that owns the
+request, and only on failed rows.
 
 Bodies are never written to logs either. `Authorization` is marked unrenderable by
 `SetSensitiveHeadersLayer` as the outermost layer, so no inner layer can log the
@@ -55,9 +72,15 @@ credential, and no handler logs a body.
   rejected: it needs a second retention policy, a second store, and a story for
   what happens when the window is wrong. The value is real but the liability is
   larger.
-* **Store bodies only for failures** — rejected: failure bodies are where prompts
-  are most likely to appear (validation errors quote input), and "only failures"
-  still means arbitrary partner content at rest.
+* **Store bodies only for failures** — historically rejected: failure bodies are
+  where prompts are most likely to appear (validation errors quote input), and
+  "only failures" still means arbitrary partner content at rest. The origin of
+  this rejected alternative was the *whole* failure body at full length, with no
+  bound and no scrub path. The accepted decision narrows it considerably — a
+  bounded 8 KiB capture of **only** non-streaming non-2xx upstream responses,
+  consumer-scoped, with a visible truncation marker — while the privacy
+  consideration behind the rejection (partners may put the prompt in the body)
+  still stands and is documented as a consequence below.
 * **Store a hash of the body for deduplication** — rejected as premature; it would
   add a fingerprint of content, which is itself a (weak) content signal, with no
   current use.
@@ -79,18 +102,33 @@ credential, and no handler logs a body.
 * `error_message` is the field to review if a partner raises a privacy question;
   it is consumer-scoped and failure-only, and its exposure is documented in the
   dashboard's response type.
+* So is `error_body` now. The bounded copy re-opens the question the original
+  rejection asked: a provider quoting the prompt in a 4xx/5xx response stores a
+  snippet of partner content at rest. Mitigations that remain deliberate: it is
+  exactly the failing response's own text (never a request body, never a 2xx,
+  never a stream), it is capped and visibly truncated, it is served only to the
+  owning consumer, and retention applies to it like every other column. Any
+  future widening of this exception needs a new ADR.
 
 ## Evidence
 
 * `src/ledger/schema.sql` — the complete column list for `usage_records` and
-  `usage_hourly`; there is no body, prompt or payload column.
+  `usage_hourly`: `error_body TEXT` is the only body column, nullable and set
+  only by the non-2xx branch.
 * `src/proxy/handler.rs` — the request body is used only to read `model` and
   `stream` (`extract_model_from_request`), then forwarded unchanged; the response
-  body is scanned for usage and forwarded, never persisted.
-* `src/proxy/handler.rs::upstream_error_message` — the only response-body content
-  that reaches the ledger.
+  body is scanned for usage and forwarded, never persisted, except for the
+  single non-2xx branch calling `bounded_error_body` on a
+  non-2xx body.
+* `src/proxy/handler.rs::upstream_error_message` — the string extracted from a
+  failure body that reaches the ledger.
+* `src/proxy/handler.rs::bounded_error_body` — the only function that turns a
+  response body into a persisted string; 8 KiB, lossy UTF-8, visible truncation
+  marker. It is only called from the non-2xx, non-streaming branch.
 * `src/dashboard/api.rs::RequestItem` — `error_message` is documented as "Present
-  only for failed/interrupted requests; may repeat upstream text".
+  only for failed/interrupted requests; may repeat upstream text", and
+  `error_body` as "Bounded raw text from a non-streaming non-2xx upstream
+  response"; both are read through the consumer-scoped `consumer_id = ?1` query.
 * `src/main.rs` — `SetSensitiveHeadersLayer` for `AUTHORIZATION` applied outermost.
 * `src/proxy/sse_scan.rs` — the scanner holds one event's bytes in memory, bounded
   at 256 KiB, and drops them as it goes.

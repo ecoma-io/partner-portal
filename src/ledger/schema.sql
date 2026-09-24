@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS usage_records (
     duration_ms INTEGER NOT NULL,
     usage_status TEXT NOT NULL,
     error_message TEXT,
+    -- Raw upstream error text only: bounded to 8 KiB by the proxy. It is NULL
+    -- for requests, successful responses, and streaming responses.
+    error_body TEXT,
 
     CHECK (request_status IN ('in_flight', 'completed', 'failed', 'interrupted')),
     CHECK (usage_status IN ('available', 'unavailable', 'partial')),

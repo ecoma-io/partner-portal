@@ -186,7 +186,8 @@ fn recover_in_tx(
             "UPDATE usage_records SET
                  request_status = 'interrupted',
                  usage_status = 'unavailable',
-                 error_message = ?2
+                 error_message = ?2,
+                 error_body = NULL
              WHERE {STRANDED_PREDICATE}"
         ),
         rusqlite::params![old_before, INTERRUPT_REASON],
