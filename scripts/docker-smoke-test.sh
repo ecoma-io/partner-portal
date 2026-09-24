@@ -326,7 +326,24 @@ fi
 say "SIGTERM drains the metering pipeline"
 # ---------------------------------------------------------------------------
 docker stop --time 30 "$CONTAINER" >/dev/null
-if docker logs "$CONTAINER" 2>&1 | grep -q "metering pipeline drained and committed"; then
+
+# `docker stop` returns when the process exits, but the daemon's final flush of
+# the container's log stream to the json-file can trail the exit by a beat —
+# on a loaded CI runner a single read right after stop has missed drain lines
+# the container demonstrably wrote (#6). Poll for the line instead of trusting
+# one read: the stop already waited out the drain, so the only wait left here
+# is log plumbing, and 10 s is far beyond any plausible flush lag while still
+# failing fast if the queue was actually dropped.
+drained=""
+deadline=$(( $(date +%s) + 10 ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+    if docker logs "$CONTAINER" 2>&1 | grep -q "metering pipeline drained and committed"; then
+        drained=1
+        break
+    fi
+    sleep 0.25
+done
+if [ -n "$drained" ]; then
     ok "the drain sequence completed on SIGTERM"
 else
     bad "no completed drain in the logs; the metering queue may have been dropped"
