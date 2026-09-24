@@ -79,6 +79,16 @@ allow = [
     "CC0-1.0",
     "MPL-2.0",
     "BSL-1.0",
+    # webpki-roots 1.x (via hyper-rustls → rustls) carries Mozilla's root CA
+    # store, which is data rather than code, and upstream relicensed it from
+    # MPL-2.0 to CDLA-Permissive-2.0 at the 1.0 release. The permissive half of
+    # the CDLA pair allows redistribution and modification with notice
+    # preservation, and has no copyleft and no share-alike — the obligations
+    # are the same class as the MIT/BSD entries above, applied to a store we
+    # embed unmodified. Its sibling CDLA-Sharing would NOT be allowed here.
+    # The path not taken was rustls-native-certs (the OS trust store), which
+    # is a runtime behaviour change for a licence entry and was rejected.
+    "CDLA-Permissive-2.0",
 ]
 [[licenses.clarify]]
 # `ring` (via rustls/hyper) ships a licence file rather than SPDX metadata in its
