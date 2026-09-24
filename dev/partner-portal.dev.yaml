@@ -1,0 +1,106 @@
+# Development configuration for the local dev loop.
+#
+# Started by `scripts/dev-up.sh`, which runs this file through a native binary
+# (not a container) alongside `dev/mock-upstream-dev.py`. Nothing here is a
+# deployment fixture and nothing here is a secret: the upstream is a local stub,
+# and both credentials below are literals you are expected to type into a login
+# screen.
+#
+# It differs from `deploy/config/partner-portal.smoke.yaml` in three ways, each
+# deliberate:
+#
+#   * the proxy binds 127.0.0.1, not 0.0.0.0, so it is reachable only from this
+#     machine. The listen address is an environment property, never config
+#     (src/config/listen.rs): `scripts/dev-lib.sh` exports
+#     `PARTNER_PORTAL_LISTEN=127.0.0.1:$PROXY_PORT` before spawning the proxy.
+#   * `cors_allow_origins` names the vite dev server. The dashboard in a dev
+#     loop is served from :5173, not from the proxy, so without this the browser
+#     refuses the API calls before they leave. (With the production bundle
+#     embedded, the dashboard and the API are one origin and this stays empty.)
+#   * the keys and the manager password are memorable, so nobody has to read
+#     them out of a file to get into the dashboard.
+#
+# The full field reference is `config.example.yaml`.
+
+server:
+  graceful_shutdown: true
+  shutdown_grace_secs: 5
+
+  # `pnpm --dir dashboard dev` serves on 5173. The proxy strips the Origin
+  # check for its own dashboard bundle (same origin); this entry is for the dev
+  # server only.
+  cors_allow_origins:
+    - "http://localhost:5173"
+    - "http://127.0.0.1:5173"
+
+upstream:
+  # dev/mock-upstream-dev.py, started by scripts/dev-up.sh. `close` and `hang`
+  # are 127.0.0.1-only paths, which is another reason this binds loopback.
+  base_url: "http://127.0.0.1:9100"
+  api_key: "dev-upstream-key"
+  timeout_secs: 30
+  connect_timeout_secs: 5
+
+keys:
+  # Two keys on one consumer, deliberately: the dashboard login takes either,
+  # and the dashboard then shows a single combined usage view — which is the
+  # behaviour a key rotation is supposed to produce.
+  - key: "dev-key"
+    name: "dev-acme"
+    consumer_id: "acme"
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "claude-sonnet-4-20250514"
+      - "gpt-4.1"
+
+  - key: "dev-key-2"
+    name: "dev-acme-rotated"
+    consumer_id: "acme"
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "claude-sonnet-4-20250514"
+      - "gpt-4.1"
+
+  # A second consumer, so the consumer filter in the dashboard has something to
+  # filter. The manager password is what can see it; neither key can see the
+  # other, and that separation is invariant 7.
+  - key: "dev-key-beta"
+    name: "dev-beta"
+    consumer_id: "beta"
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "claude-sonnet-4-20250514"
+      - "gpt-4.1"
+
+manager:
+  # The cross-consumer view: a manager sees every consumer, and the dashboard's
+  # consumer selector — fed from the ledger — narrows it (docs/adr/0013).
+  password: "dev-manager"
+
+database:
+  # Git-ignored, kept between runs on purpose: the point of the load script is
+  # to accumulate a history you can page through, not to reset it each time.
+  path: "./target/dev/partner-portal-dev.db"
+  retention_days: 60
+  queue_size: 10000
+
+  # The production defaults are batch_size 100 and batch_timeout_ms 1000, and
+  # they are right in production: they amortise a COMMIT over a hundred
+  # records so a busy proxy pays far fewer fsyncs. In a dev loop they are wrong,
+  # and measurably so.
+  #
+  # A batch is committed when it is full, or when the window elapses
+  # (writer.rs::writer_loop). `finalize` is awaited before the client gets its
+  # response, so at dev-loop concurrency a batch never fills and *every request
+  # waits out the whole window* — measured at 1.02s per request with the
+  # production values, against ~20ms with these. Nothing is wrong and nothing is
+  # dropped; the ledger is just making a dev edit feel like a network call.
+  #
+  # So: a small window, because the loop is the consumer, not throughput. The
+  # meter in the dashboard still updates, because the window is the cadence it
+  # updates on.
+  batch_size: 8
+  batch_timeout_ms: 20

@@ -53,6 +53,10 @@ deploy/config/partner-portal.local.yaml
 
 # --- Deployment and CI (referenced by the operator, not by the build) ------
 deploy
+# The local dev fixtures, for the same reason: a developer runs them, the image
+# does not. `dev/partner-portal.dev.yaml` carries plaintext dev credentials, and
+# a config in a layer is a credential that survives deleting the file.
+dev
 docker-compose.yml
 docker-compose.*.yml
 deny.toml
