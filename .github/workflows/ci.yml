@@ -279,15 +279,31 @@ jobs:
       # ---------------------------------------------------------------------
       # Secrets in the tree and in history.
       # ---------------------------------------------------------------------
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: gitleaks
+      # The binary is downloaded directly, pinned and checksum-verified,
+      # because taiki-e/install-action no longer carries gitleaks (run
+      # 36074780311: "install-action does not support gitleaks", the
+      # cargo-binstall fallback then died on "gitleaks is not found") — the
+      # same reason every other repository in the organisation drives the
+      # binary directly. The curl fetch retries bounded (10 × 15s): release
+      # asset CDN 504s come in stretches; the checksum line stays outside
+      # the retry and fails loudly on a wrong or partial download.
+      - name: Install gitleaks 8.24.3
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 10 --retry-all-errors --retry-delay 15 \
+            "https://github.com/zricethezav/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz" \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  $RUNNER_TEMP/gitleaks.tar.gz" \
+            | sha256sum --check --strict -
+          tar --extract --gzip --file "$RUNNER_TEMP/gitleaks.tar.gz" --directory "$RUNNER_TEMP" gitleaks
 
       - name: gitleaks
         # --redact so a real finding is not echoed into a public build log; the
         # report file names the commit and the rule instead.
+        env:
+          GITLEAKS_BIN: ${{ runner.temp }}/gitleaks
         run: |
-          gitleaks detect \
+          "$GITLEAKS_BIN" detect \
             --source . \
             --report-format sarif \
             --report-path gitleaks.sarif \
