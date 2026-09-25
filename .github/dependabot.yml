@@ -1,0 +1,129 @@
+# Dependency updates.
+#
+# Dependabot rather than Renovate, on one criterion: this repository has exactly
+# four dependency surfaces — Cargo, the dashboard's pnpm lockfile, the container
+# images, and the GitHub Actions — and Dependabot covers all four natively, with
+# no app to install, no token to hold beyond the default one, and no config to
+# keep in step with a runner. Renovate's advantages (regex managers,
+# per-dependency scheduling, a shared preset) are real and none of them are
+# needed here yet; adopting it later is a config change, not a migration.
+#
+# Every ecosystem is grouped by update type. A weekly PR that bumps five
+# patch-level crates together is reviewable; five separate PRs that each change
+# one line of Cargo.lock are how a dependency queue becomes something people
+# stop reading. Majors deliberately stay ungrouped: a major is a decision, not
+# maintenance.
+#
+# Security updates are not configured here — they come from Dependabot alerts
+# and are opened as soon as the advisory lands, whatever this schedule says.
+
+version: 2
+updates:
+  # ---------------------------------------------------------------------------
+  # The binary. `cargo audit` and `cargo deny` (see deny.toml) judge what is
+  # already resolved; this is what proposes the move.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Ho_Chi_Minh
+    open-pull-requests-limit: 5
+    commit-message:
+      # Matches the scope list in commitlint.config.mjs, so a dependency PR
+      # passes the same commit-msg hook every hand-written commit does.
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    groups:
+      cargo-minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ---------------------------------------------------------------------------
+  # The dashboard. Dependabot reads pnpm-lock.yaml; `--frozen-lockfile` in CI
+  # and in the Dockerfile is what makes the lockfile the thing that matters.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Ho_Chi_Minh
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(dashboard-ui)"
+    labels:
+      - dependencies
+    groups:
+      dashboard-minor-and-patch:
+        applies-to: version-updates
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # ---------------------------------------------------------------------------
+  # The base images. A browser engine or a libc under the runtime image is a
+  # dependency like any other, and one that trivy (CI) will report on.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Ho_Chi_Minh
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: "chore(deploy)"
+    labels:
+      - dependencies
+    groups:
+      docker-images:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # The deployment stack's images (nginx, the stub upstream). Separate from the
+  # Dockerfile entry because a compose file pins differently: one is the artifact,
+  # the other is the fixture around it.
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Ho_Chi_Minh
+    open-pull-requests-limit: 4
+    commit-message:
+      prefix: "chore(deploy)"
+    labels:
+      - dependencies
+    groups:
+      deploy-images:
+        applies-to: version-updates
+        patterns: ["*"]
+
+  # ---------------------------------------------------------------------------
+  # The workflows themselves. A pinned action is a dependency, and the major
+  # versions this repository pins (checkout, rust-toolchain, build-push-action)
+  # are the ones that matter most when they move.
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Asia/Ho_Chi_Minh
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(ci)"
+    labels:
+      - dependencies
+    groups:
+      github-actions:
+        applies-to: version-updates
+        patterns: ["*"]

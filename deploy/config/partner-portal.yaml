@@ -1,0 +1,67 @@
+# Configuration for the two-instance deploy stack (deploy/docker-compose.yml).
+#
+# Both instances mount this one file: they are the same process shape, differing
+# only in the port the edge publishes them on. Nothing here may be per-instance
+# — in particular `database.path` must resolve to the same file for both, because
+# that single ledger is what makes the pair one logical service rather than two
+# competing ones.
+#
+# The full field reference, with defaults and rationale, is config.example.yaml
+# at the repository root; this file lists what the deployment actually sets.
+
+server:
+  # No listen address here: the image sets `PARTNER_PORTAL_LISTEN=0.0.0.0:8080`
+  # (the Dockerfile), which is the right value inside a container's own network
+  # namespace. The host-facing ports are the compose `ports:` entries.
+
+  # The edge stops routing to an instance before it stops accepting, so the
+  # listener must wait for requests it already accepted. Readiness flips at the
+  # start of this window; the balancer needs at least one poll interval to
+  # notice, which is what this covers.
+  graceful_shutdown: true
+  shutdown_grace_secs: 5
+
+  # No browser origin may call this proxy directly: the dashboard is served from
+  # the same origin as the API, and every other caller is server-side. An
+  # allow-list is deliberate — this proxy spends an upstream credential.
+  cors_allow_origins: []
+
+upstream:
+  # Replace with the real OpenAI-compatible endpoint. The smoke configuration
+  # (partner-portal.smoke.yaml) points this at the bundled mock instead.
+  base_url: "https://api.openai.com"
+  # A placeholder, not a secret. The real key is injected per deployment; this
+  # file is committed, so it must never hold one.
+  api_key: "REPLACE-WITH-UPSTREAM-KEY"
+  timeout_secs: 120
+  connect_timeout_secs: 10
+
+# Consumers of this proxy. Each key is an identity: the consumer_id it derives is
+# what every ledger row and every dashboard query is scoped by, and it is always
+# taken from this file, never from the request.
+keys:
+  - key: "REPLACE-WITH-A-PARTNER-KEY"
+    name: "partner-smoke"
+    # Models this key may call. Strict (docs/adr/0012): a key that omits the
+    # field serves `404 model_not_found` for every model, and `/v1/models`
+    # answers this same filtered list. Replace with what the real upstream
+    # serves and this partner may call.
+    allowed_models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+
+database:
+  # Absolute, and on the shared volume: the pair writes to one ledger.
+  #
+  # WAL is what makes two writer processes safe here — each instance serializes
+  # its own writes, and cross-process writes take the WAL write lock with a
+  # 5s busy timeout (src/ledger/mod.rs::configure_sqlite). The .db, .db-wal and
+  # .db-shm files are one unit: they must live on the same volume and be backed
+  # up together.
+  path: "/var/lib/partner-portal/partner-portal.db"
+  retention_days: 60
+  # Sized per instance: this is the in-memory queue before a request is refused
+  # with 503, not a shared budget.
+  queue_size: 10000
+  batch_size: 100
+  batch_timeout_ms: 1000

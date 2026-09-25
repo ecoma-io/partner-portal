@@ -1,0 +1,36 @@
+# Smoke configuration: identical to partner-portal.yaml except that the upstream
+# is the mock bundled with this directory, so the stack can be exercised end to
+# end without an upstream credential or an outbound call.
+#
+# Used by deploy/smoke-test.sh via PARTNER_PORTAL_CONFIG_FILE. It differs from
+# the production file in exactly one value, which is the point: the smoke test
+# proves the deployment path, not a different deployment.
+
+server:
+  graceful_shutdown: true
+  shutdown_grace_secs: 5
+  cors_allow_origins: []
+
+upstream:
+  # The `mock-upstream` service in docker-compose.yml, reachable by name on the
+  # compose network while the `smoke` profile is active.
+  base_url: "http://mock-upstream:9000"
+  api_key: "smoke-upstream-key"
+  timeout_secs: 30
+  connect_timeout_secs: 5
+
+keys:
+  - key: "smoke-key"
+    name: "partner-smoke"
+    # The gate is strict (docs/adr/0012): a key that omits the field serves
+    # `404 model_not_found` for every model and `/v1/models` answers an empty
+    # list. The bundled mock serves exactly one model; that is the list.
+    allowed_models:
+      - "mock-model"
+
+database:
+  path: "/var/lib/partner-portal/partner-portal.db"
+  retention_days: 60
+  queue_size: 10000
+  batch_size: 100
+  batch_timeout_ms: 1000

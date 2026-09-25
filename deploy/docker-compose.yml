@@ -1,0 +1,171 @@
+# Two partner-portal instances, one SQLite ledger, one edge — the rolling update
+# fixture for a single VPS.
+#
+# Why two instances of a proxy that is already a single binary: because the
+# update story has to hold without an orchestrator. One instance cannot be
+# replaced without a gap; two can, one at a time, with the survivor serving.
+#
+# Why they share a ledger: metering that is split across two databases is not
+# metering. Both instances write to one `usage_records` table over SQLite in WAL
+# mode (5s busy timeout, `synchronous = FULL` — see src/ledger/mod.rs). WAL lets
+# the writers serialize at the file level rather than corrupting each other's
+# pages, which is what makes two processes over one file a supported SQLite
+# configuration rather than a hopeful one.
+#
+# Crash recovery is per-owner, not global: a row is only resolved to
+# `interrupted` when the instance that wrote it is known to be gone
+# (src/ledger/instance.rs holds an advisory flock beside the database for the
+# life of each process, and src/ledger/recovery.rs probes it). A newly started
+# instance therefore does not clobber the in-flight rows of a live peer, which is
+# what makes this fixture a supported topology rather than a hopeful one.
+#
+# The one remaining uncertainty is a row whose owner cannot be probed at all —
+# rows written before instance ownership existed, or an owner on a platform
+# without flock. Those are recovered only once they are older than
+# DEFAULT_UNKNOWN_OWNER_GRACE (30s), so the transitional cost of the very first
+# rollout from a pre-ownership build is bounded to a stream that has been running
+# for longer than that. deploy/README.md states it.
+#
+# Usage:
+#   cd deploy
+#   PARTNER_PORTAL_IMAGE=partner-portal:local docker compose up -d
+#   PARTNER_PORTAL_IMAGE=partner-portal:local docker compose --profile smoke up -d
+#
+#   edge        http://127.0.0.1:8080   (the address clients use)
+#   portal-a    http://127.0.0.1:8081   (direct, for probing one instance)
+#   portal-b    http://127.0.0.1:8082
+#
+# Those three host ports are overridable (EDGE_PORT, PORTAL_A_PORT,
+# PORTAL_B_PORT) for a machine where something already holds 8080 — the ports
+# inside the containers never change, and neither does anything else.
+#
+# The instance ports are published on 127.0.0.1 only: they are for the operator
+# and the probe scripts, and must not be a second way in past the edge.
+
+name: partner-portal-deploy
+
+x-portal: &portal
+  image: ${PARTNER_PORTAL_IMAGE:-partner-portal:local}
+  restart: unless-stopped
+
+  # Must exceed server.shutdown_grace_secs (5) plus the time the drain of the
+  # metering queue takes. Docker's default of 10s would SIGKILL mid-drain on a
+  # busy instance, which is precisely the failure this product exists to avoid:
+  # accepted usage that is never committed.
+  stop_grace_period: 30s
+
+  environment:
+    # Selects which config inside ./config is mounted as the active one. The
+    # smoke test sets this to partner-portal.smoke.yaml; nothing else should.
+    PARTNER_PORTAL_CONFIG: /etc/partner-portal/${PARTNER_PORTAL_CONFIG_FILE:-partner-portal.yaml}
+
+  volumes:
+    # Read-only: the configuration is re-read every second, and a container that
+    # can write its own config has a config that no longer describes the
+    # deployment. Both instances mount the same file — they must agree on the
+    # database path, which is the whole point of the pair.
+    - ./config:/etc/partner-portal:ro
+    # Read-write, shared: one ledger, one set of WAL files. Never bind this to a
+    # host path that is itself a network filesystem — SQLite's locking does not
+    # survive NFS, and the failure mode is a corrupted ledger rather than an
+    # error.
+    - portal-data:/var/lib/partner-portal
+
+  # Readiness, not liveness, is the gate for receiving traffic: /readyz fails
+  # while the metering queue is full or shutdown has begun, which is exactly the
+  # window in which this instance must not be sent work.
+  healthcheck:
+    test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+    interval: 5s
+    timeout: 3s
+    retries: 3
+    start_period: 10s
+
+  # The proxy binds 8080, serves static bytes and dials out; it needs no Linux
+  # capability at all. It also never writes outside its data volume, so the
+  # image filesystem can stay read-only.
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs:
+    - /tmp
+
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  portal-a:
+    <<: *portal
+    container_name: partner-portal-a
+    ports:
+      # Overridable so a machine that already has something on these ports can
+      # still run the stack — including a CI runner, and the smoke test, which
+      # has to coexist with whatever else is listening.
+      - "127.0.0.1:${PORTAL_A_PORT:-8081}:8080"
+
+  portal-b:
+    <<: *portal
+    container_name: partner-portal-b
+    ports:
+      - "127.0.0.1:${PORTAL_B_PORT:-8082}:8080"
+
+  # The edge. Its configuration is two files: nginx.conf (routing rules, static)
+  # and nginx/upstream.d/upstream.conf (which instances are in rotation, rewritten
+  # by rolling-update.sh). Both are mounted from the host so the switch is a file
+  # edit the operator can see and diff, not a shell command against a live
+  # container that leaves no trace.
+  edge:
+    image: nginx:1.27-alpine
+    container_name: partner-portal-edge
+    restart: unless-stopped
+    ports:
+      - "${EDGE_PORT:-8080}:8080"
+    volumes:
+      # The configuration *directory*, mounted whole, and read with `-c` below.
+      #
+      # A file bind mount (`./nginx/nginx.conf:/etc/nginx/nginx.conf`) pins the
+      # inode: it is resolved once, when the container starts. Anything that
+      # rewrites the file by rename — most editors, `sed -i`, `mv` — leaves the
+      # container reading the old inode, and the reload then reloads the old
+      # configuration while the operator sees the new file on disk. A directory
+      # mount resolves the name on each open, so what the reload reads is what
+      # the operator wrote. That property is what the traffic switch in
+      # rolling-update.sh is built on, and it is also why the script edits
+      # upstream.conf in place rather than replacing it.
+      - ./nginx:/etc/portal-edge:ro
+    # The stock /etc/nginx stays untouched, so the image's own entrypoint scripts
+    # keep working; only the configuration this deployment owns is overridden.
+    command: ["nginx", "-c", "/etc/portal-edge/nginx.conf", "-g", "daemon off;"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    depends_on:
+      - portal-a
+      - portal-b
+
+  # Never part of a production stack: an OpenAI-shaped stub so the smoke test can
+  # drive the whole path — edge, proxy, metering, ledger — with no upstream
+  # credential and no outbound call. `--profile smoke` is the only way it starts,
+  # so a plain `docker compose up -d` cannot accidentally deploy it.
+  mock-upstream:
+    image: python:3.13-alpine
+    container_name: partner-portal-mock-upstream
+    profiles: ["smoke"]
+    restart: "no"
+    command: ["python", "/app/mock-upstream.py"]
+    environment:
+      PORT: "9000"
+    volumes:
+      - ./mock-upstream.py:/app/mock-upstream.py:ro
+    expose:
+      - "9000"
+
+volumes:
+  portal-data:
+    name: partner-portal-deploy_portal-data

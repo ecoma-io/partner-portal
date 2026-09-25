@@ -1,0 +1,56 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# Note: Cargo.lock is intentionally committed. This is a deployable binary,
+# not a library, so the lockfile is what makes a release reproducible.
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Database (development)
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+
+# Instance ownership locks, written beside the database by the running process.
+# A stale one is meaningless — the kernel releases the flock on exit and the
+# file is reused or ignored — so it must never be committed.
+.partner-portal-instance-*.lock
+
+# The operator's live configuration. It carries the local API keys and the
+# upstream credential, so it is never committed; `config.example.yaml` is the
+# tracked template.
+/config.yaml
+config.yaml
+
+# Logs
+logs/
+*.log
+
+# Test outputs
+/coverage/
+/test-output/
+
+# Dashboard build
+/dashboard/dist/
+/dashboard/node_modules/
+
+# Temporary
+/tmp/
+*.tmp
+__pycache__

@@ -1,0 +1,25 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    // `vue-tsc -b` builds this project, and a composite project with emit
+    // enabled writes `vite.config.js`, `vite.config.d.ts` and
+    // `tsconfig.node.tsbuildinfo` next to the source on every build — where
+    // `eslint .` then lints the compiled copy, and where they are one `git add
+    // .` away from being committed. `noEmit` is not an option: TypeScript
+    // rejects it in a project referenced by another one (TS6310). Emitting
+    // declarations into the ignored build directory instead keeps the source
+    // tree clean while still type checking the Vite config.
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "outDir": "./node_modules/.tmp/types",
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.node.tsbuildinfo",
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true,
+    "strict": true,
+    // `vite.config.ts` uses `path` and `__dirname`, which are Node globals.
+    "types": ["node"]
+  },
+  "include": ["vite.config.ts"]
+}

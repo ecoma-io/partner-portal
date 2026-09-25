@@ -1,0 +1,9 @@
+# Blank issues stay enabled: a report that does not fit either template is
+# still a report, and a form that refuses to accept it loses it entirely.
+blank_issues_enabled: true
+
+contact_links:
+  # A vulnerability must not arrive as a public issue — see SECURITY.md.
+  - name: Report a security vulnerability
+    url: https://github.com/ecoma-io/partner-portal/security/advisories/new
+    about: Privately, through GitHub's advisory form. Never as a public issue.

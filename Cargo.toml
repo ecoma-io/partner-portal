@@ -1,0 +1,99 @@
+[package]
+name = "partner-portal"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["John Martin <john@ecoma-io>"]
+description = "Lightweight OpenAI-compatible reverse proxy with durable metering and embedded Vue dashboard"
+repository = "https://github.com/ecoma-io/partner-portal"
+publish = false
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "fs", "net", "io-util"] }
+
+# HTTP
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["typed-header"] }
+hyper = { version = "1.6", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
+http-body-util = "0.1"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "limit", "trace", "request-id", "sensitive-headers"] }
+
+# TLS for the upstream connector. The product deliberately sits in front of one
+# OpenAI-compatible API (docs/adr/0001); real ones are https://, so a plain-HTTP
+# connector cannot reach them. rustls + webpki-roots is chosen over native-tls:
+# pure-Rust, no OpenSSL dependence at build or run time, and the webpki-roots
+# bundle makes the binary work in a minimal container without a CA store on
+# disk. This is the only new dependency the fix needs; it does not open routing
+# or multi-provider doors (the ADR still holds).
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "webpki-roots", "ring"], optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# SQLite
+rusqlite = { version = "0.37", features = ["bundled", "serde_json"] }
+
+# Time
+time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+
+# Utils
+thiserror = "2.0"
+anyhow = "1.0"
+uuid = { version = "1.18", features = ["v7", "serde"] }
+sha2 = "0.10"
+hex = "0.4"
+parking_lot = "0.12"
+dashmap = "6.1"
+tokio-stream = "0.1"
+futures = "0.3"
+pin-project-lite = "0.2"
+bytes = "1.10"
+memchr = "2.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+http-body = "1.1.0"
+async-stream = "0.3.6"
+http = "1.5.0"
+
+# Advisory file locking for the instance-liveness probe (see
+# `src/ledger/instance.rs`). Unix-only: the probe degrades to a time-based
+# decision elsewhere, and so does the platform support for this product.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3.20"
+criterion = "0.6"
+proptest = "1.7"
+tokio-test = "0.4"
+wiremock = "0.6"
+pretty_assertions = "1.4"
+fastrand = "2.3"
+# The integration/fault suites drive the real binary as a child process: signals
+# to kill it mid-request, and a process-wide view of the ledger it leaves behind.
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[[bin]]
+name = "partner-portal"
+path = "src/main.rs"
+
+# The metering benchmarks drive the real LedgerWriter, so they need their own
+# `main` (criterion's `criterion_main!` is not used: the suite also prints a
+# p50/p95/p99 commit-ack latency table, which criterion's harness cannot emit).
+[[bench]]
+name = "ledger_write"
+harness = false
+
+[features]
+hyper-rustls = ["dep:hyper-rustls"]
