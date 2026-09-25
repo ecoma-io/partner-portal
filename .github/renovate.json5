@@ -50,10 +50,16 @@
       extractVersionTemplate: "^cargo-audit/v(?<version>.*)$",
     },
     {
+      // gitleaks is downloaded by URL, checksum-verified — not anything
+      // Renovate tracks by default — so this manager owns the version in the
+      // URL. The sha256 on the line below the download is deliberately NOT
+      // matched: Renovate cannot compute an artifact digest, so a version-only
+      // bump must fail the sha256sum gate and get the new checksum added by
+      // hand in the same pull request rather than pass silently.
       customType: "regex",
       fileMatch: ["^\\.github/workflows/ci\\.ya?ml$"],
       matchStrings: [
-        "tool:\\s*gitleaks@(?<currentValue>[0-9.]+)",
+        "https://github.com/zricethezav/gitleaks/releases/download/v(?<currentValue>[^/]+)/gitleaks",
       ],
       depNameTemplate: "zricethezav/gitleaks",
       datasourceTemplate: "github-releases",

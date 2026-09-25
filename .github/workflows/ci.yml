@@ -325,9 +325,25 @@ jobs:
       # ---------------------------------------------------------------------
       # Secrets in the tree and in history.
       # ---------------------------------------------------------------------
-      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
-        with:
-          tool: gitleaks@8.30.1
+      # The binary is downloaded directly rather than installed through
+      # taiki-e/install-action: gitleaks is no longer in that action's
+      # manifest (both the floating @v2 and the pinned v2.87.20 answer
+      # "install-action does not support gitleaks", and the cargo-binstall
+      # fallback finds no crate of that name) — the reason every other
+      # repository in the organisation drives the binary directly. Version
+      # pinned and verified against the checksum the release publishes;
+      # Renovate bumps the version in the URL, and the checksum moves in the
+      # same pull request by hand — the sha256sum gate below makes a
+      # version-only bump fail loudly instead of passing with a stale digest.
+      - name: Install gitleaks 8.24.3
+        run: |
+          curl --fail --silent --show-error --location \
+            --retry 10 --retry-all-errors --retry-delay 15 \
+            "https://github.com/zricethezav/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz" \
+            --output "$RUNNER_TEMP/gitleaks.tar.gz"
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  $RUNNER_TEMP/gitleaks.tar.gz" \
+            | sha256sum --check --strict -
+          tar --extract --gzip --file "$RUNNER_TEMP/gitleaks.tar.gz" --directory "$RUNNER_TEMP" gitleaks
 
       - name: gitleaks
         # --redact so a real finding is not echoed into a public build log; the
