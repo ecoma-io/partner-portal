@@ -20,7 +20,7 @@ hyper = { version = "1.6", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 http-body-util = "0.1"
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "limit", "trace", "request-id", "sensitive-headers"] }
+tower-http = { version = "0.7", features = ["cors", "limit", "trace", "request-id", "sensitive-headers"] }
 
 # TLS for the upstream connector. The product deliberately sits in front of one
 # OpenAI-compatible API (docs/adr/0001); real ones are https://, so a plain-HTTP
