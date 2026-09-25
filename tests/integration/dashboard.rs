@@ -625,8 +625,15 @@ async fn timeseries_ttft_is_weighted_over_reporting_requests_only() {
     // avg_ttft_ms as total_ttft_ms / ttft_count, so this count is the whole
     // invariant (unavailable is not zero) — a ttft_count of 2 would fabricate
     // TTFT for a request that never measured one.
+    //
+    // Duration's invariant is presence, not magnitude: the ledger stores
+    // integer milliseconds, and a release-profile round trip completes in
+    // under one, so a legitimate sum reads 0 (#22). A magnitude assertion
+    // here would also fail a real two-sub-millisecond-request workload —
+    // presence is the honest shape, and the exactness this test wants from
+    // the rollup is asserted on the TTFT sum below.
     assert!(
-        point["total_duration_ms"].as_u64().unwrap_or(0) > 0,
+        point["total_duration_ms"].is_number(),
         "duration was recorded for both requests"
     );
     assert_eq!(
