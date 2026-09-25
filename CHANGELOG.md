@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1](https://github.com/ecoma-io/partner-portal/compare/v0.1.0...v0.1.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **release:** stop uploading the buildx build record that aborted every release ([ebc7f72](https://github.com/ecoma-io/partner-portal/commit/ebc7f7269a3f633c970b62bf4c96f7a39fc50894))
+* **release:** stop uploading the buildx build record that aborted every release ([bf584db](https://github.com/ecoma-io/partner-portal/commit/bf584db579edb7ec969a3dad4c8994da0df5baf9)), closes [#23](https://github.com/ecoma-io/partner-portal/issues/23)
+
 ## 0.1.0 (2026-09-25)
 
 
