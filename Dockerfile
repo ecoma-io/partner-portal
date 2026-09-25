@@ -141,6 +141,12 @@ FROM ${RUNTIME_IMAGE} AS runtime
 ARG GIT_COMMIT=unknown
 ARG BUILD_TIME=unknown
 ARG VERSION=0.0.0
+# Busted by CI (run id) so the apt layer below can never be served stale from
+# the layer cache: the RUN line is constant, so buildkit would otherwise hit
+# the cached layer forever, and a Debian advisory published after it was first
+# built would ride every later build with no diff to fix it (#9). The default
+# keeps local builds cacheable.
+ARG CACHEBUST=1
 
 LABEL org.opencontainers.image.title="partner-portal" \
       org.opencontainers.image.description="OpenAI-compatible reverse proxy with durable metering and an embedded dashboard" \
@@ -155,8 +161,16 @@ LABEL org.opencontainers.image.title="partner-portal" \
 # worth losing a debuggable base for. Recommendation: apt is left usable (no
 # lists removed beyond the install) so `docker run --user root` can still
 # install a probe when debugging a production container.
-RUN apt-get update \
+#
+# The upgrade in the same layer is what keeps the image scannable: the base
+# image ships a package snapshot that ages, and the image scan (trivy,
+# exit-code 1 on any advisory with a published fix) holds the runtime to zero
+# of them. Upgrading from the current index at build time is how that gate
+# stays green without waiting for the base image to be rebuilt.
+RUN echo "cache-bust ${CACHEBUST}" \
+    && apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates curl \
+    && apt-get upgrade --yes \
     && rm -rf /var/lib/apt/lists/*
 
 # Numeric uid/gid, fixed, so a bind mount or a volume can be pre-owned on the
