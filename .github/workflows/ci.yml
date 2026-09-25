@@ -234,10 +234,14 @@ jobs:
           context: .
           load: true
           tags: partner-portal:ci
+          # CACHEBUST (Dockerfile) busts the apt layer per run so the image's
+          # package patch level stays current; the security job's rebuild
+          # must receive the same value or it re-keys the layer.
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             BUILD_TIME=${{ env.BUILD_TIME }}
             VERSION=0.0.0-ci
+            CACHEBUST=${{ github.run_id }}
           # The build is a full release compile of the dependency tree; without
           # the layer cache every PR pays for it from scratch.
           cache-from: type=gha,scope=partner-portal-image
@@ -392,6 +396,12 @@ jobs:
           context: .
           load: true
           tags: partner-portal:scan
+          # The same run-id bust the container job passes: the apt layer's
+          # cache key carries it, and only a matching value restores the layer
+          # that build just stored. A default here would re-key the layer and
+          # scan a coincidentally-fresher image than the one that ships (#9).
+          build-args: |
+            CACHEBUST=${{ github.run_id }}
           cache-from: type=gha,scope=partner-portal-image
 
       - name: Trivy image scan
