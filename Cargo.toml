@@ -69,7 +69,7 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.20"
-criterion = "0.6"
+criterion = "0.7"
 proptest = "1.7"
 tokio-test = "0.4"
 wiremock = "0.6"
