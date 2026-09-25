@@ -15,7 +15,7 @@ tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "signal", "
 
 # HTTP
 axum = { version = "0.8", features = ["macros"] }
-axum-extra = { version = "0.10", features = ["typed-header"] }
+axum-extra = { version = "0.12", features = ["typed-header"] }
 hyper = { version = "1.6", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio"] }
 http-body-util = "0.1"
