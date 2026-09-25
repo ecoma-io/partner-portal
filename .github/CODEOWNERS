@@ -1,0 +1,5 @@
+# Every path, one owner: the repository is maintained by one person, and a
+# code-owner review requirement with an empty owner list would be a rule that
+# never binds. Review requests land on @johnitvn automatically for any pull
+# request touching anything.
+* @johnitvn
