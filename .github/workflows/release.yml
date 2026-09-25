@@ -364,6 +364,14 @@ jobs:
       - name: Build and push
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          # The build record this action uploads by default is an internal
+          # buildx bundle with an `*.dockerbuild` artifact name — not one of the
+          # four things a deployment needs, and the one artifact the release
+          # job's bare download-artifact cannot fetch (#23). Nothing reads it
+          # that the digest, the registry attestations and the job summary do
+          # not already say; it stays unuploaded.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -448,6 +456,11 @@ jobs:
             exit 1
           fi
 
+      # Every artifact this job needs and nothing else, which is exactly the
+      # four the header promises. The `oci` job's build no longer uploads a
+      # build record (#23), so this bare download is the whole run — if another
+      # artifact ever is, a `pattern:` here names what the release consumes and
+      # an unrelated one can no longer abort a release on its own.
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           path: artifacts
