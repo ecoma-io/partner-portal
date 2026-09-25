@@ -5,6 +5,40 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.1.0 (2026-09-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* **config:** a config naming server.listen or keys[].metadata now fails to parse instead of being ignored, and every key must declare allowed_models - a key without one serves 404 for every model.
+
+### Features
+
+* **config:** gate models per key, add a manager credential, move listen to env ([6853cff](https://github.com/ecoma-io/partner-portal/commit/6853cffc6673fbe8810a4572a95d5a68cec9375b))
+* core proxy, ledger, dashboard, SSE baseline ([a1dee35](https://github.com/ecoma-io/partner-portal/commit/a1dee35cd96ce794adc3376d3dec3fb3f0329818))
+* **dashboard-ui:** an embeddable dashboard with an authenticated live stream ([09b0337](https://github.com/ecoma-io/partner-portal/commit/09b03379e159fb9b831d7f58c6430b666d484ec7))
+* **dashboard-ui:** redesign the stats views around the new API ([bbe2989](https://github.com/ecoma-io/partner-portal/commit/bbe2989dcbc9cedd2d59d27ab85a2c7e1397220d))
+* **dashboard:** keyset pagination, filters and a weighted timeseries ([bb9b7f8](https://github.com/ecoma-io/partner-portal/commit/bb9b7f87021ec0cec09f118f52dce9a49eb327e1))
+* **ledger:** persist bounded upstream error bodies (schema v4) ([0bd5cc6](https://github.com/ecoma-io/partner-portal/commit/0bd5cc61c8ccf72e2c1dbaa7eff8d0ffc6aa0df5))
+* **proxy:** reach https upstreams with a TLS connector ([e70c84e](https://github.com/ecoma-io/partner-portal/commit/e70c84ea67dfd13a0d8319bcc5059fbd17568c97))
+* **repo:** add a native dev loop for edit-see-change cycles ([dae8cbe](https://github.com/ecoma-io/partner-portal/commit/dae8cbe1ea92e05a5b9f94574f6d645c391bb900))
+
+
+### Bug Fixes
+
+* close the metering, streaming and credential gaps found in review ([4523695](https://github.com/ecoma-io/partner-portal/commit/45236958fce18c13285146147c8a55c4895d1aee))
+* **dashboard:** let the isolation e2e run against a no-dashboard build ([89de3e5](https://github.com/ecoma-io/partner-portal/commit/89de3e59a03ec0ed0c55c73dc55735203999ff91)), closes [#7](https://github.com/ecoma-io/partner-portal/issues/7)
+* **dashboard:** require a local API key to log in, and scope every view to it ([b3c5747](https://github.com/ecoma-io/partner-portal/commit/b3c57473f0f585dc49db48da9eb19f23f04cff10))
+* **deploy:** keep the runtime image's packages at the current patch level ([b895b19](https://github.com/ecoma-io/partner-portal/commit/b895b199e3e43fd967435a94d1609b9c9cf8d42b)), closes [#9](https://github.com/ecoma-io/partner-portal/issues/9)
+* **deploy:** let the smoke paths pass the model gate and assert its refusal ([1501297](https://github.com/ecoma-io/partner-portal/commit/150129721cb80d5a17be4397b68d7d81da43633b))
+* **deploy:** poll for the drain line instead of one post-stop read ([0174ce4](https://github.com/ecoma-io/partner-portal/commit/0174ce4169c570dd8217456d033810f7a34c4762)), closes [#6](https://github.com/ecoma-io/partner-portal/issues/6)
+* harden metering durability, streaming and request accounting ([9d34fea](https://github.com/ecoma-io/partner-portal/commit/9d34feac1dc43f6e5d60d371b30d1eeaf2464c38))
+
+
+### Documentation
+
+* bring the README, AGENTS and architecture pages to the new shape ([b05f7c4](https://github.com/ecoma-io/partner-portal/commit/b05f7c4dcd7c03cc33a3c8755c69773a91e9f986))
+
 ## [Unreleased]
 
 ### Added
