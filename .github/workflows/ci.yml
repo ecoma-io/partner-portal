@@ -5,16 +5,23 @@ name: CI
 # rather than a subset.
 on:
   pull_request:
+  # The merge queue's candidate ref fires merge_group, not pull_request —
+  # without this trigger the queue's required checks never start on the
+  # candidate and the entry sits in AWAITING_CHECKS forever.
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
 
-# One run per ref. A force-push supersedes the run it replaced: the older run's
-# result describes a commit nobody is looking at any more, and leaving it alive
-# only competes for runners with the run that matters.
+# One run per ref. A force-push to a pull request supersedes the run it
+# replaced: the older run's result describes a commit nobody is looking at any
+# more, and leaving it alive only competes for runners with the run that
+# matters. Pushes to main and merge-queue candidates are grouped per commit and
+# never cancelled — a cancelled main run is a hole in the record a release is
+# cut from.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Read-only by default. `permissions:` is set per job where a job needs more, so
 # a compromised dependency in one step cannot inherit write access to the repo.
@@ -35,13 +42,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v5
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          # Pinned refs carry no branch name, so the toolchain must be given
+          # here rather than left to the ref (`@stable`) — without it the
+          # action fails with "'toolchain' is a required input".
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: rust
 
@@ -62,8 +75,16 @@ jobs:
       # upstream container). This runs every target, including the spawned-binary
       # suites; the next job runs those same suites against the *release* build
       # and the dashboard the frontend job just produced, which is what ships.
-      - name: cargo test
-        run: cargo test --locked --all-features
+      #
+      # The e2e suite runs under its serial contract (--test-threads=1): its
+      # cases own OS-level state — ports, signals, a rolling update — and a
+      # parallel run is a race the suite was never written to win. The other
+      # suites have no such contract and run at full width.
+      - name: cargo test (lib, integration, fault)
+        run: cargo test --locked --all-features --lib --test integration --test fault
+
+      - name: cargo test (e2e, serial)
+        run: cargo test --locked --all-features --test e2e -- --test-threads=1
 
   # ---------------------------------------------------------------------------
   # The dashboard. Lint and typecheck are separate steps from the build so a
@@ -77,15 +98,17 @@ jobs:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The version is pinned here as well as in the Dockerfile: the image and CI
       # must resolve the same dependency graph from the same lockfile.
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 12.3.4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
           cache: pnpm
@@ -107,7 +130,7 @@ jobs:
 
       # Handed to the integration job so the binary it builds is the artifact
       # that ships — dashboard embedded — rather than a placeholder-page build.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: dashboard-dist
           path: dashboard/dist
@@ -123,15 +146,19 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: integration
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: dashboard-dist
           path: dashboard/dist
@@ -151,10 +178,13 @@ jobs:
           set -euo pipefail
           # A suite is a directory with a main.rs — cargo's rule for an
           # integration-test target, which lets a suite keep its cases in
-          # separate files under tests/<name>/.
+          # separate files under tests/<name>/. The e2e suite is excluded here:
+          # it has its own step, below, and its own contract.
           suites=()
           while IFS= read -r dir; do
-            suites+=("$(basename "$dir")")
+            suite="$(basename "$dir")"
+            if [ "$suite" = "e2e" ]; then continue; fi
+            suites+=("$suite")
           done < <(find tests -mindepth 2 -maxdepth 2 -name main.rs -printf '%h\n' 2>/dev/null | sort)
 
           if [ "${#suites[@]}" -eq 0 ]; then
@@ -170,6 +200,13 @@ jobs:
           echo "running suites: ${suites[*]}"
           cargo test --locked --release "${args[@]}"
 
+      # The e2e suite's cases share OS-level state — signals, a rolling update,
+      # crash recovery — and the suite's contract is one test at a time
+      # (AGENTS.md, CONTRIBUTING.md). Parallel here is not faster, it is a
+      # different, racy test.
+      - name: Run the end-to-end suite (serial by contract)
+        run: cargo test --locked --release --test e2e -- --test-threads=1
+
   # ---------------------------------------------------------------------------
   # The image, built and then run.
   # ---------------------------------------------------------------------------
@@ -178,9 +215,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       # The build metadata `GET /version` reports. Computed here rather than read
       # from `github.run_started_at`, which actionlint's context data does not
@@ -190,7 +229,7 @@ jobs:
         run: echo "BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >>"$GITHUB_ENV"
 
       - name: docker build
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -210,12 +249,13 @@ jobs:
 
       # The same script an operator can run against a tag before promoting it:
       # the image's runtime contract, liveness, readiness, auth, an end-to-end
-      # proxied request, the embedded dashboard, and the SIGTERM drain.
+      # proxied request, the model gate's refusal, the embedded dashboard, and
+      # the SIGTERM drain.
       - name: Image smoke test
         run: ./scripts/docker-smoke-test.sh partner-portal:ci
 
-      # The deployment shape, not just the image: two instances of this build
-      # over one SQLite ledger, behind the edge. It asserts what the pair exists
+      # The deployment shape, not only the built image — two instances of this
+      # build over one SQLite ledger, behind the edge. It asserts what the pair exists
       # for — every request reaches the upstream once and lands in the ledger
       # once — and that taking a slot out of rotation moves the traffic rather
       # than dropping it. Ports are passed explicitly so the job cannot collide
@@ -241,15 +281,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # gitleaks reads history, not just the working tree: the secret that
           # matters is usually the one that was committed and then removed.
           fetch-depth: 0
+          persist-credentials: false
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           shared-key: rust
 
@@ -257,7 +300,7 @@ jobs:
       # Licences, bans, sources and advisories for the Rust dependency graph.
       # ---------------------------------------------------------------------
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           command: check
           arguments: --all-features
@@ -269,9 +312,12 @@ jobs:
       # ---------------------------------------------------------------------
       # The RustSec advisory database, independently of deny.toml's policy.
       # ---------------------------------------------------------------------
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
         with:
-          tool: cargo-audit
+          # Pinned to a version, not left at whatever `latest` resolves to
+          # today: a scanner that moves between two runs of the same commit
+          # makes green mean nothing. Renovate bumps the pins.
+          tool: cargo-audit@0.22.2
 
       - name: cargo-audit
         # RUSTSEC-2026-0009 (`time` < 0.3.47) is ignored with a written
@@ -283,14 +329,16 @@ jobs:
       # ---------------------------------------------------------------------
       # Secrets in the tree and in history.
       # ---------------------------------------------------------------------
-      # The binary is downloaded directly, pinned and checksum-verified,
-      # because taiki-e/install-action no longer carries gitleaks (run
-      # 36074780311: "install-action does not support gitleaks", the
-      # cargo-binstall fallback then died on "gitleaks is not found") — the
-      # same reason every other repository in the organisation drives the
-      # binary directly. The curl fetch retries bounded (10 × 15s): release
-      # asset CDN 504s come in stretches; the checksum line stays outside
-      # the retry and fails loudly on a wrong or partial download.
+      # The binary is downloaded directly rather than installed through
+      # taiki-e/install-action: gitleaks is no longer in that action's
+      # manifest (both the floating @v2 and the pinned v2.87.20 answer
+      # "install-action does not support gitleaks", and the cargo-binstall
+      # fallback finds no crate of that name) — the reason every other
+      # repository in the organisation drives the binary directly. Version
+      # pinned and verified against the checksum the release publishes;
+      # Renovate bumps the version in the URL, and the checksum moves in the
+      # same pull request by hand — the sha256sum gate below makes a
+      # version-only bump fail loudly instead of passing with a stale digest.
       - name: Install gitleaks 8.24.3
         run: |
           curl --fail --silent --show-error --location \
@@ -314,7 +362,7 @@ jobs:
             --redact \
             --verbose
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: gitleaks-sarif
@@ -325,7 +373,7 @@ jobs:
       # SBOM of the source tree — the dependency graph a release was built from.
       # ---------------------------------------------------------------------
       - name: SBOM (syft, SPDX JSON)
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: .
           format: spdx-json
@@ -340,10 +388,10 @@ jobs:
       # container job (a loaded image does not survive a job boundary); the
       # shared cache scope means this is a cache restore, not a second compile.
       # ---------------------------------------------------------------------
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Rebuild the image for scanning
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -357,7 +405,7 @@ jobs:
           cache-from: type=gha,scope=partner-portal-image
 
       - name: Trivy image scan
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: partner-portal:scan
           format: sarif
@@ -369,7 +417,7 @@ jobs:
           exit-code: "1"
 
       - name: Trivy filesystem scan (config and dependencies)
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
@@ -378,9 +426,27 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: trivy-sarif
           path: trivy-image.sarif
           if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # The one check a branch ruleset can require while the roster above it
+  # evolves: add a job to `needs` and the gate tightens without touching
+  # repository settings. `needs` alone would let a skipped or cancelled job
+  # pass as green — only `failure` blocks a dependent job by default — and a
+  # job-level skip is never legitimate here.
+  # ---------------------------------------------------------------------------
+  ci-gate:
+    name: ci-gate
+    needs: [rust, frontend, integration, container, security]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Fail unless every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1

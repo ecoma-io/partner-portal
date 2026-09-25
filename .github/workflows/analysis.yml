@@ -1,0 +1,128 @@
+name: Analysis
+
+# Static analysis, not "security" — the name matters because what runs here
+# is wider than vulnerabilities, and a workflow called Security makes the next
+# reader either mis-file a correctness finding or leave it out.
+#
+# The analyser that runs here is Semgrep under the organisation's own
+# workflow-hygiene rules (.github/semgrep/, byte-identical across the org's
+# repositories, each pinned by a fixture in `semgrep --test`): what this
+# repository's workflows do that the org has specifically decided they must
+# not. Secrets are covered by the gitleaks step in ci.yml's `security` job —
+# that job already reads history and produces the SARIF, so a second scanner
+# here would be the same check wearing a different job name. CodeQL is a
+# deliberate absence for now: the Rust extractor's build-mode `none` and the
+# `actions` language leg both need measuring against this tree before they
+# become a required check, and that is follow-up work, not an omission to
+# backfill silently.
+#
+# Nothing is declared above the jobs except read permissions, and each job's
+# extra write stays at its own job level — a job-level `permissions` block
+# REPLACES the workflow-level one rather than merging with it, so read access
+# has to be restated there.
+
+on:
+  push:
+    # `main` — the one development line — runs analysis on every push, for
+    # the same reason `ci.yml` runs there: the merged tree is measured, and
+    # a red push names its commit.
+    branches: [main]
+  # Unfiltered, for the same reason `ci.yml` is: these are the checks a
+  # branch ruleset will require, and a `branches: [main]` filter
+  # here would skip this workflow entirely on a stacked pull request —
+  # leaving that check pending forever rather than failing, which is a
+  # block with nothing to fix.
+  pull_request:
+  # Same reason as ci.yml: the merge queue's candidate ref fires
+  # merge_group, and without this trigger its analysis checks never start,
+  # leaving the queue entry pending forever.
+  merge_group:
+  workflow_dispatch:
+
+# A push to main gets a run of its own per commit; a new push to a pull
+# request supersedes the in-flight run for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions: read-all
+
+jobs:
+  semgrep:
+    name: Semgrep
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    # Written as `tag@digest` so the version stays readable while the digest
+    # is what actually resolves — the analyser cannot change under a rerun,
+    # and Renovate bumps both halves together.
+    container:
+      image: semgrep/semgrep:1.177.0@sha256:acaac22ffc7b7cc5926de0751b223bce0b2491c33d18422fa72f632c78d81198
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `.github/semgrep/` holds the rules AND their fixtures — files whose
+      # entire job is to be reported — so it is excluded from every scan of
+      # the repository and checked by `semgrep --test` instead. This runs
+      # first: a rule that has quietly stopped matching passes every scan
+      # below by finding nothing.
+      - name: Test the rules against their fixtures
+        run: semgrep --test --config .github/semgrep .github/semgrep
+
+      # Reporting pass. Two registry packs, both carried as a wide net rather
+      # than a gate — a pack can gain a rule overnight and must never turn
+      # main red for a change nobody made; the blocking step below stays the
+      # repository's own rules only.
+      #
+      # `p/rust` is for the whole of this repository that executes; `p/github-actions`
+      # covers workflow defect classes these own rules do not hand-write
+      # (credential handling, cache and artifact shapes).
+      - name: Scan
+        run: >-
+          semgrep scan --config .github/semgrep --config p/rust
+          --config p/github-actions --exclude .github/semgrep --sarif
+          --output semgrep.sarif
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+      # Blocking pass, and deliberately the repository's own rules only: a
+      # registry pack can gain a rule overnight and turn main red for a
+      # change nobody made, whereas everything under `.github/semgrep/` is
+      # reviewed here and pinned by a test. Runs after the upload so findings
+      # reach the Security tab even when this step fails the job.
+      #
+      # No `--quiet`: a workflow file this scan cannot parse is reported as
+      # an error in the log while the exit code still comes back clean — the
+      # one silent direction left in this gate, and the reason its output
+      # stays readable. `--timeout 60` with `--timeout-threshold 1` turns
+      # whatever overruns into a red job — a rule that gave up on a file must
+      # never be indistinguishable from one that looked and found nothing.
+      - name: Enforce the repository's own rules
+        run: >-
+          semgrep scan --config .github/semgrep --exclude .github/semgrep
+          --error --timeout 60 --timeout-threshold 1
+
+  # The single check name a branch ruleset requires, mirroring `ci-gate`:
+  # the required-check name stays stable while the job list is not — add a
+  # job to `needs` and the gate tightens without editing repository
+  # settings.
+  analysis-gate:
+    name: analysis-gate
+    needs: [semgrep]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      # `needs` alone would let a skipped or cancelled job pass as green,
+      # since only `failure` blocks a dependent job by default.
+      - name: Fail unless every job succeeded
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'skipped')
+        run: exit 1
