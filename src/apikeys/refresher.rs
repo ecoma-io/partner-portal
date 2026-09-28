@@ -1,29 +1,35 @@
-//! Multi-instance snapshot refresh.
+//! Snapshot refresh.
 //!
 //! # The problem
 //!
 //! Authentication reads an in-memory [`ApiKeySnapshot`], and the snapshot is
-//! rebuilt only when something tells the instance the key set moved. An
-//! administrator who revokes a key through *this* process is seen immediately —
-//! [`ApiKeyStore::mutate`] refreshes before returning. A second instance running
-//! against the same database sees nothing at all, and would keep authenticating a
-//! revoked key until it was restarted. During a rolling update both instances
-//! exist at once, so that is the normal case, not an edge one.
+//! rebuilt only when something rebuilds it. An administrator who revokes a key
+//! through *this* process is seen immediately — [`ApiKeyStore::mutate`] refreshes
+//! before returning. A second instance running against the same database sees
+//! nothing at all, and would keep authenticating a revoked key until it was
+//! restarted. During a rolling update both instances exist at once, so that is
+//! the normal case, not an edge one.
 //!
-//! # The signal
+//! # Why the reload is periodic and unconditional
 //!
-//! `PRAGMA data_version` changes when **another** connection commits a write,
-//! which makes it an exact change signal that works across processes. The
-//! consequence that dictates the shape of this file: the poller needs its *own*
-//! connection, because `data_version` deliberately ignores writes made by the
-//! connection that performs the query. Sharing the metering writer's connection
-//! would mean a local write never moved its own version — and worse, it would put
-//! a pragma poll on the lock every request's write contends for.
+//! The obvious design is change detection: poll `PRAGMA data_version`, which
+//! moves when **another** connection commits a write, and reload when it moves.
+//! That design is wrong here, and the reason is expiry. A key's lifetime runs
+//! out with no write anywhere — no event, no row change, no moved version. The
+//! expiry test itself is in `load_active`'s SQL, so a key that has gone stale
+//! simply stops being selected, and nothing announces that it happened. Only a
+//! periodic reload can drop it, and a reload that waits for a change signal is a
+//! reload that never comes for the one transition an operator most needs to
+//! happen on time.
 //!
-//! The connection is opened `query_only`, so it cannot write even by accident,
-//! and it is not the pool's: [`LedgerPool::reader`] opens and closes a connection
-//! per call, which is right for a dashboard query and wrong for a poll that runs
-//! once a second for the life of the process.
+//! So every tick reloads. What that costs is one indexed `SELECT` over
+//! `status = 'active'`, on a table measured in dozens of rows, through a fresh
+//! read-only connection from [`LedgerPool::read`] — the same connection the
+//! dashboard opens per query. The interval is the propagation bound in both
+//! directions: the delay before a sibling's revoke reaches this instance, and
+//! the delay before an expiry does. It is configurable because the trade-off is
+//! deployment-specific — a single instance has nothing to wait for, and a test
+//! needs a smaller number.
 //!
 //! # What a failed reload does
 //!
@@ -34,57 +40,32 @@
 //! failure starts serving a key set nobody chose — that would be a fallback hiding
 //! a failure, and a credential that outlives its revocation is the failure this
 //! module exists to prevent.
-//!
-//! # The interval reloads on, and the two things that forces
-//!
-//! `data_version` moves **only when another connection commits a write**. It is
-//! a change *signal*, and two states that must not wait for one both require an
-//! unconditional reload:
-//!
-//! * **Expiry.** A key's lifetime runs out with no write anywhere — no event, no
-//!   row change. The expiry test itself is in `load_active`'s SQL, so a key that
-//!   has gone stale simply stops being selected; nothing announces that it
-//!   happened. Only a periodic reload can drop it.
-//! * **The window before the first poll.** A key committed between the store's
-//!   initial load and the poller's first read moves the version *before* the
-//!   baseline is taken, so it is never seen as a change. Starting with a null
-//!   baseline and reloading on the first tick closes that window rather than
-//!   leaving it to the first write after startup to discover.
-//!
-//! So every tick that reports a change is a full reload, and so is the first
-//! one. That costs one indexed read of a table that is a few dozen rows at most —
-//! which is what makes the interval configurable rather than a property to
-//! engineer around.
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-use rusqlite::Connection;
 use tracing::{debug, warn};
 
 use crate::apikeys::store::ApiKeyStore;
 
-/// Lower bound on the poll interval, mirroring [`crate::dashboard::sse`].
+/// Lower bound on the poll interval.
 ///
 /// A configured zero would not mean "as fast as possible", it would mean a task
-/// that spins on the pragma and competes with the metering writer for CPU.
+/// that reloads in a tight loop and competes with the metering writer for the
+/// single write lock. The floor exists so a zero is a slow instance rather than
+/// a busy one.
 pub const MIN_REFRESH_INTERVAL_MS: u64 = 1;
 
 /// Default poll interval, in milliseconds.
 ///
 /// One second is the bound this instance accepts between a state change and its
 /// effect on this instance's authentication — a sibling's commit, or a key's own
-/// expiry — and it is documented in ADR 0014. It is configurable because the
-/// trade-off is deployment-specific: a single instance has nothing to wait for,
-/// and a test needs a smaller number.
+/// expiry — and it is documented in ADR 0014.
 pub const DEFAULT_REFRESH_INTERVAL_MS: u64 = 1_000;
 
-/// Polls SQLite's `data_version` on a dedicated connection and reloads the key
-/// snapshot when another connection commits.
+/// Rebuilds the key snapshot from the database on an interval.
 pub struct ApiKeyRefresher {
-    poll_conn: Arc<Mutex<Connection>>,
     store: Arc<ApiKeyStore>,
     interval: Duration,
     /// Keys loaded by [`ApiKeyRefresher::new`], for the start-up log line.
@@ -92,40 +73,27 @@ pub struct ApiKeyRefresher {
 }
 
 impl ApiKeyRefresher {
-    /// Open the poll connection and load the first snapshot.
+    /// Load the first snapshot and prepare the poller.
     ///
-    /// The load is here rather than left to the poller's first tick for two
-    /// reasons: the instance must fail to start if it cannot read its own key
-    /// set (a silent empty key set is a total outage that looks like a config
-    /// mistake), and a key committed by a sibling *during* this call is picked
-    /// up by the very next poll instead of waiting for the write after it.
+    /// The initial load is here rather than left to the poller's first tick for
+    /// one reason: the instance must fail to start if it cannot read its own key
+    /// set. A silent empty key set is a total outage that looks like a
+    /// configuration mistake, and every 401 it produces would point at the wrong
+    /// file.
     ///
-    /// Separate from [`ApiKeyStore::new`] on purpose: the store is constructed in
-    /// unit tests that never want a second connection, and the refresher is
-    /// constructed only by the process that has a database path.
+    /// `db_path` is taken as well as the store so the start-up failure can name
+    /// the file it could not read.
     pub fn new(
         db_path: &Path,
         store: Arc<ApiKeyStore>,
         interval_ms: u64,
     ) -> Result<Self, StartupError> {
-        let poll_conn = Connection::open(db_path)?;
-
-        // WAL so the poll never blocks the writer, `query_only` so this
-        // connection cannot write even by mistake, and the same busy timeout the
-        // pool uses — a poll that gives up early would report a spurious change
-        // and a reload that fails for the same reason.
-        poll_conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA query_only = ON;
-             PRAGMA busy_timeout = 5000;",
-        )?;
-
-        // Startup's contract: this instance knows which keys it will accept, or
-        // it does not run. The caller turns this error into a start-up failure.
-        let initial_keys = store.refresh()?;
+        let initial_keys = store.refresh().map_err(|source| StartupError::KeySet {
+            path: db_path.to_path_buf(),
+            source,
+        })?;
 
         Ok(Self {
-            poll_conn: Arc::new(Mutex::new(poll_conn)),
             store,
             interval: Duration::from_millis(interval_ms.max(MIN_REFRESH_INTERVAL_MS)),
             initial_keys,
@@ -141,95 +109,76 @@ impl ApiKeyRefresher {
         self.initial_keys
     }
 
-    /// Spawn the polling task.
+    /// Spawn the polling task. Returns immediately.
     pub fn start(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let interval = this.interval;
 
         tokio::spawn(async move {
+            // The first reload waits one interval, because the constructor
+            // already performed one. A key committed in between is picked up by
+            // this tick, and a key committed *before* the constructor's load is
+            // in the snapshot already — so there is no window in which a
+            // committed key is invisible for longer than one interval.
             loop {
                 tokio::time::sleep(interval).await;
-
-                // Read the version *before* the reload, not after: the snapshot
-                // is then, at worst, as stale as the version that was sampled
-                // before it was built. Reading it afterwards would race a commit
-                // that lands mid-reload — the new key would be in the snapshot
-                // but its version would look already-seen, and the commit that
-                // arrived in between would be lost until the next one.
-                let _version_sampled_before = this.data_version();
-                this.reload_if_changed().await;
+                this.reload().await;
             }
         });
     }
 
-    /// Reload the snapshot because the database moved.
+    /// Rebuild the snapshot from the database.
     ///
-    /// The reload runs on the blocking pool: it opens a SQLite connection, and
-    /// the metering writer holds the single write lock and a saturated request
-    /// path should not be paying for a pragma read on its own executor thread.
-    pub async fn reload_if_changed(self: &Arc<Self>) {
+    /// Runs on the blocking pool: it opens a SQLite connection, and a saturated
+    /// request path should not be paying for that on its own executor thread.
+    ///
+    /// Public because the tests drive it directly — a poller whose only entry
+    /// point is a spawned task cannot be asserted on without sleeping.
+    pub async fn reload(self: &Arc<Self>) {
         let this = Arc::clone(self);
         let outcome = tokio::task::spawn_blocking(move || this.store.refresh()).await;
 
         match outcome {
             Ok(Ok(count)) => debug!(keys = count, "api key snapshot reloaded"),
-            // The task cannot panic — `refresh` is ordinary fallible code — but
-            // treating a JoinError as "unchanged" would be a silent gap in
-            // coverage, so it is reported.
             Ok(Err(e)) => {
                 warn!(error = %e, "api key snapshot reload failed; keeping the last good key set")
             }
+            // The task cannot panic — `refresh` is ordinary fallible code — but
+            // treating a JoinError as "nothing to do" would be a silent gap in
+            // coverage, so it is reported.
             Err(e) => warn!(error = %e, "api key snapshot reload task did not finish"),
         }
     }
 
-    /// Current `data_version` as this connection sees it.
-    pub fn data_version(&self) -> Option<i64> {
-        get_data_version(&self.poll_conn.lock())
-    }
-}
-
-fn get_data_version(conn: &Connection) -> Option<i64> {
-    match conn.query_row("PRAGMA data_version", [], |row| row.get(0)) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            // `None` rather than a constant: returning a sentinel would risk a
-            // stale version comparing equal to a later real one and silently
-            // skipping a refresh. A caller that cannot read the pragma must
-            // reload — that is the safe direction to be wrong in.
-            warn!(error = %e, "could not read PRAGMA data_version");
-            None
-        }
+    /// The interval the poller runs at, after the floor was applied. Exposed so
+    /// a test can assert the floor without sleeping for it.
+    pub fn interval(&self) -> Duration {
+        self.interval
     }
 }
 
 /// Why this instance cannot start with a key refresher.
 ///
-/// Distinct from [`crate::apikeys::store::ApiKeyError`] so a caller can tell
-/// "the key store failed" from "the thing that watches it could not start", and
-/// so a start-up failure is never reported as a routine store error. Both
-/// variants are fatal: neither leaves an instance that could serve correctly.
+/// Fatal on purpose, and never downgraded to an empty snapshot: an instance
+/// that cannot say which keys it accepts would answer every request with a 401
+/// that points at the configuration file instead of at the database.
 #[derive(Debug)]
 pub enum StartupError {
-    /// The poll connection could not be opened or configured.
-    Connection(rusqlite::Error),
-    /// The key set could not be read.
-    ///
-    /// Fatal on purpose, and never downgraded to an empty snapshot: an instance
-    /// that cannot say which keys it accepts would answer every request with a
-    /// 401 that points at the configuration file instead of at the database.
-    KeySet(crate::apikeys::store::ApiKeyError),
+    /// The key set could not be read from the database.
+    KeySet {
+        path: std::path::PathBuf,
+        source: crate::apikeys::store::ApiKeyError,
+    },
 }
 
 impl std::fmt::Display for StartupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            StartupError::Connection(e) => {
-                write!(f, "could not open the api key refresh connection: {e}")
-            }
-            StartupError::KeySet(e) => {
-                write!(f, "could not load the partner api key set: {e}")
-            }
+            StartupError::KeySet { path, source } => write!(
+                f,
+                "could not load the partner api key set from {}: {source}",
+                path.display()
+            ),
         }
     }
 }
@@ -237,28 +186,17 @@ impl std::fmt::Display for StartupError {
 impl std::error::Error for StartupError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            StartupError::Connection(e) => Some(e),
-            StartupError::KeySet(e) => Some(e),
+            StartupError::KeySet { source, .. } => Some(source),
         }
-    }
-}
-
-impl From<rusqlite::Error> for StartupError {
-    fn from(e: rusqlite::Error) -> Self {
-        StartupError::Connection(e)
-    }
-}
-
-impl From<crate::apikeys::store::ApiKeyError> for StartupError {
-    fn from(e: crate::apikeys::store::ApiKeyError) -> Self {
-        StartupError::KeySet(e)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apikeys::store::ApiKeyError;
     use crate::ledger::LedgerPool;
+    use std::sync::Arc;
 
     const SECRET: &[u8] = b"a-refresher-test-secret-of-32-bytes!!";
     /// Short enough to keep the test fast, long enough that the `max(1)` floor
@@ -269,7 +207,7 @@ mod tests {
         // The temp dir owns the database file; dropping it would delete it.
         _dir: tempfile::TempDir,
         refresher: Arc<ApiKeyRefresher>,
-        /// The instance under test: its own pool, its own poll connection.
+        /// The instance under test: its own pool, its own snapshot.
         store: Arc<ApiKeyStore>,
         /// A second pool on the same file, standing in for a sibling instance.
         sibling_pool: Arc<LedgerPool>,
@@ -295,8 +233,8 @@ mod tests {
 
             Self {
                 _dir: dir,
-                store,
                 refresher,
+                store,
                 sibling_pool,
             }
         }
@@ -327,34 +265,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_the_poll_connection_sees_another_connections_write() {
+    /// The reload happens on the timer rather than on a change signal, and this
+    /// is why: an expiry produces no write at all.
+    ///
+    /// A change-driven poller passes every other test in this file and fails
+    /// this one, which is the point of having it.
+    #[tokio::test]
+    async fn test_a_stored_expiry_stops_authenticating_on_its_own() {
         let f = Fixture::new();
-        let before = f.refresher.data_version().expect("pragma must read");
+        let (_row, plaintext) = f
+            .store
+            .create(
+                "brief",
+                "acme",
+                vec![],
+                Some(time::OffsetDateTime::now_utc() + time::Duration::milliseconds(50)),
+            )
+            .unwrap();
+        assert!(f.store.authenticate(&plaintext).is_some());
 
-        f.sibling_creates("from-a-sibling", "acme");
-
-        let after = f.refresher.data_version().expect("pragma must read");
-        assert_ne!(
-            before, after,
-            "a commit by another connection must move data_version, or a \
-             sibling's revoke would never reach this instance"
-        );
-    }
-
-    #[test]
-    fn test_the_poll_connection_is_query_only() {
-        // The refresher is a reader by construction. A write attempt on its
-        // connection must fail, because a refresher that could write would be
-        // able to commit — and a commit would not move its own data_version, so
-        // it would never see its own effect and would reload forever.
-        let f = Fixture::new();
-        let result = f
-            .refresher
-            .poll_conn
-            .lock()
-            .execute("UPDATE api_keys SET name = 'tampered'", []);
-        assert!(result.is_err(), "the poll connection must not be writable");
+        f.refresher.start();
+        f.wait_for("the key to expire and be dropped", || {
+            f.store.authenticate(&plaintext).is_none()
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -392,8 +326,8 @@ mod tests {
         })
         .await;
 
-        // Revoke through the sibling, so the commit lands on a connection the
-        // refresher is not watching.
+        // Revoke through the sibling, so the commit lands on a connection this
+        // instance's own mutation path never touched.
         let sibling = ApiKeyStore::new(Arc::clone(&f.sibling_pool), SECRET.to_vec());
         let id = sibling.list().unwrap()[0].id;
         sibling.revoke(id).unwrap();
@@ -421,30 +355,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_stored_expiry_stops_authenticating_on_its_own() {
-        // Expiry is filtered at load time, so the only thing that ends a key's
-        // life on schedule is the reload. This is the test that would go red if
-        // the refresher were removed rather than merely broken.
-        let f = Fixture::new();
-        let (_row, plaintext) = f
-            .store
-            .create(
-                "brief",
-                "acme",
-                vec![],
-                Some(time::OffsetDateTime::now_utc() + time::Duration::milliseconds(50)),
-            )
-            .unwrap();
-        assert!(f.store.authenticate(&plaintext).is_some());
-
-        f.refresher.start();
-        f.wait_for("the key to expire and be dropped", || {
-            f.store.authenticate(&plaintext).is_none()
-        })
-        .await;
-    }
-
-    #[tokio::test]
     async fn test_a_failed_reload_keeps_the_last_good_snapshot() {
         // A poll that fails must not empty the key set: that would take every
         // partner offline because of one bad read. The snapshot is the last
@@ -459,17 +369,35 @@ mod tests {
 
         // Rename the table out from under the snapshot, which is exactly what
         // `tests/fault/writer_failure.rs` does to the ledger.
-        f.refresher
-            .poll_conn
-            .lock()
-            .execute_batch("DROP TABLE api_keys")
-            .ok();
+        f.sibling_pool
+            .write(|conn| {
+                conn.execute_batch("ALTER TABLE api_keys RENAME TO api_keys_offline")?;
+                Ok(())
+            })
+            .unwrap();
 
-        f.refresher.reload_if_changed().await;
+        f.refresher.reload().await;
         assert!(
             f.store.authenticate(&plaintext).is_some(),
             "a reload that fails must leave the last good key set in place"
         );
+
+        // And the recovery is not a latch: restoring the table lets the poller
+        // catch up rather than leaving the process stuck on a stale set.
+        f.sibling_pool
+            .write(|conn| {
+                conn.execute_batch("ALTER TABLE api_keys_offline RENAME TO api_keys")?;
+                Ok(())
+            })
+            .unwrap();
+        let late = f.sibling_creates("issued-while-broken", "acme");
+
+        f.refresher.reload().await;
+        assert!(
+            f.store.authenticate(&late).is_some(),
+            "a reload after the failure must pick the database back up"
+        );
+        assert!(f.store.authenticate(&plaintext).is_some());
     }
 
     #[test]
@@ -509,7 +437,10 @@ mod tests {
             .unwrap();
 
         match ApiKeyRefresher::new(&path, broken, INTERVAL_MS) {
-            Err(StartupError::KeySet(_)) => {}
+            Err(StartupError::KeySet {
+                source: ApiKeyError::Database(_),
+                ..
+            }) => {}
             Err(other) => panic!("expected a key-set failure, got {other}"),
             Ok(_) => panic!(
                 "an instance that cannot read its keys must fail to start, \
@@ -529,7 +460,7 @@ mod tests {
 
         let refresher = ApiKeyRefresher::new(&path, store, 0).unwrap();
         assert_eq!(
-            refresher.interval,
+            refresher.interval(),
             Duration::from_millis(MIN_REFRESH_INTERVAL_MS),
             "a zero interval must not become a spinning task"
         );
