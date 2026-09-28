@@ -49,6 +49,11 @@ export default {
         "web",
         "config",
         "telemetry",
+        // the partner API key surface: hashing and the store, the keyed digest
+        // both it and the dashboard share, and the provisioning subcommand
+        "apikeys",
+        "crypto",
+        "keygen",
         // dashboard/
         "dashboard-ui",
         // repository-level

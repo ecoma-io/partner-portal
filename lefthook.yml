@@ -51,7 +51,7 @@ commit-msg:
         esac
 
         TYPES='feat|fix|docs|chore|refactor|test|perf|build|ci|revert'
-        SCOPES='proxy ledger auth dashboard admin web config telemetry dashboard-ui deploy docs deps ci release repo'
+        SCOPES='proxy ledger auth dashboard admin web config telemetry apikeys crypto keygen dashboard-ui deploy docs deps ci release repo'
 
         if ! printf '%s' "$MSG" | grep -Eq "^($TYPES)(\([a-z0-9._/-]+\))?!?: .+"; then
           printf 'commit-msg: not a Conventional Commit:\n  %s\nexpected: <type>(<scope>): <subject>\ntypes: %s\n' "$MSG" "$TYPES" >&2
