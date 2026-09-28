@@ -3,8 +3,15 @@
 # Started by `scripts/dev-up.sh`, which runs this file through a native binary
 # (not a container) alongside `dev/mock-upstream-dev.py`. Nothing here is a
 # deployment fixture and nothing here is a secret: the upstream is a local stub,
-# and both credentials below are literals you are expected to type into a login
-# screen.
+# and the manager password below is a literal you are expected to type into a
+# login screen.
+#
+# Notably absent: partner API keys. They are rows in the ledger database
+# (ADR 0014), not configuration, so this file has no `keys:` block and cannot
+# have one — `Config` is `deny_unknown_fields`, and a leftover block is a parse
+# error rather than a silent second source of truth. `scripts/dev-seed-keys.sh`
+# writes this loop's three memorable keys into the database, with the same
+# plaintexts `scripts/dev-load.sh` defaults to.
 #
 # It differs from `deploy/config/partner-portal.smoke.yaml` in three ways, each
 # deliberate:
@@ -17,8 +24,8 @@
 #     loop is served from :5173, not from the proxy, so without this the browser
 #     refuses the API calls before they leave. (With the production bundle
 #     embedded, the dashboard and the API are one origin and this stays empty.)
-#   * the keys and the manager password are memorable, so nobody has to read
-#     them out of a file to get into the dashboard.
+#   * the manager password is memorable, so nobody has to read it out of a file
+#     to get into the dashboard.
 #
 # The full field reference is `config.example.yaml`.
 
@@ -40,40 +47,6 @@ upstream:
   api_key: "dev-upstream-key"
   timeout_secs: 30
   connect_timeout_secs: 5
-
-keys:
-  # Two keys on one consumer, deliberately: the dashboard login takes either,
-  # and the dashboard then shows a single combined usage view — which is the
-  # behaviour a key rotation is supposed to produce.
-  - key: "dev-key"
-    name: "dev-acme"
-    consumer_id: "acme"
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
-      - "claude-sonnet-4-20250514"
-      - "gpt-4.1"
-
-  - key: "dev-key-2"
-    name: "dev-acme-rotated"
-    consumer_id: "acme"
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
-      - "claude-sonnet-4-20250514"
-      - "gpt-4.1"
-
-  # A second consumer, so the consumer filter in the dashboard has something to
-  # filter. The manager password is what can see it; neither key can see the
-  # other, and that separation is invariant 7.
-  - key: "dev-key-beta"
-    name: "dev-beta"
-    consumer_id: "beta"
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
-      - "claude-sonnet-4-20250514"
-      - "gpt-4.1"
 
 manager:
   # The cross-consumer view: a manager sees every consumer, and the dashboard's

@@ -130,7 +130,11 @@ if ! curl -fsS --max-time 3 -H "Authorization: Bearer $KEY" \
     "$PROXY/api/dashboard/summary?range=24h" >/dev/null 2>&1; then
   cat >&2 <<EOF
 The proxy is up but refused the key "$KEY".
-  Check the keys in dev/partner-portal.dev.yaml
+  The keys are rows in the dev ledger, not lines in dev/partner-portal.dev.yaml.
+  Write them with:  scripts/dev-seed-keys.sh
+  Or start the stack clean:  scripts/dev-up.sh --reset
+  A key that was revoked in the dashboard cannot be re-issued under the same
+  plaintext — --reset is the way back.
 EOF
   exit 1
 fi
