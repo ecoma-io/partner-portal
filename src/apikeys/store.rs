@@ -232,14 +232,59 @@ impl ApiKeyStore {
         allowed_models: Vec<String>,
         expires_at: Option<OffsetDateTime>,
     ) -> Result<(ApiKeyRow, String)> {
-        let name = require_text("name", name)?;
-        let consumer_id = require_text("consumer_id", consumer_id)?;
-        validate_models(&allowed_models)?;
-
         let plaintext = generate_plaintext()
             .map_err(|e| ApiKeyError::Invalid(format!("could not read system entropy: {e}")))?;
-        let hash = derive_key_hash(&self.secret, &plaintext);
-        let prefix = key_prefix_of(&plaintext);
+        let row =
+            self.create_with_plaintext(name, consumer_id, allowed_models, expires_at, &plaintext)?;
+        Ok((row, plaintext))
+    }
+
+    /// Issue a key whose plaintext the caller supplies, instead of generating
+    /// one.
+    ///
+    /// # Why this exists
+    ///
+    /// Two callers, both outside the request path, and neither of them an
+    /// alternative to [`create`] on the admin surface — which always generates
+    /// its plaintext and can never be asked for a chosen one:
+    ///
+    /// * **moving an existing key into the database.** A deployment that used
+    ///   to hold keys in `config.yaml` can register the same plaintexts here, so
+    ///   partners are not re-issued a key by a change of storage. A generated
+    ///   replacement would be a credential rotation, which is a different and
+    ///   much louder operation than a migration.
+    /// * **fixtures.** `scripts/dev-seed-keys.sh` and the test harnesses write
+    ///   memorable plaintexts (`dev-key`) so that a developer types one into a
+    ///   login screen rather than reading a random string out of a log.
+    ///
+    /// A supplied plaintext carries whatever entropy the caller gave it, which
+    /// is why the admin API does not expose this and why `keygen --plaintext`
+    /// says so. Everything else is identical to [`create`]: the plaintext is
+    /// hashed and never written, and the returned row carries the prefix only.
+    pub fn create_with_plaintext(
+        &self,
+        name: &str,
+        consumer_id: &str,
+        allowed_models: Vec<String>,
+        expires_at: Option<OffsetDateTime>,
+        plaintext: &str,
+    ) -> Result<ApiKeyRow> {
+        let name = require_text("name", name)?;
+        let consumer_id = require_text("consumer_id", consumer_id)?;
+        // Blank is rejected; otherwise the value is stored **exactly as given**.
+        // Trimming it the way the other fields are trimmed would mint a
+        // credential different from the one supplied, and the operator's only
+        // symptom would be a partner's 401 that points nowhere. The hashing
+        // secret is not trimmed either, for the same reason.
+        if plaintext.trim().is_empty() {
+            return Err(ApiKeyError::Invalid(
+                "plaintext must not be empty".to_string(),
+            ));
+        }
+        validate_models(&allowed_models)?;
+
+        let hash = derive_key_hash(&self.secret, plaintext);
+        let prefix = key_prefix_of(plaintext);
         let now = timefmt::format_ts(timefmt::now());
         let expires_at = expires_at.map(timefmt::format_ts);
 
@@ -264,7 +309,7 @@ impl ApiKeyStore {
             })?
             .done_or_missing()?;
 
-        Ok((created, plaintext))
+        Ok(created)
     }
 
     /// One key, or `None`.
@@ -929,6 +974,59 @@ mod tests {
             ));
         }
         assert_eq!(store.list().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_a_supplied_plaintext_is_stored_verbatim_and_authenticates() {
+        // The migration and fixture path: `keygen --plaintext` and the dev seed
+        // register a value the operator already has. The value must come back
+        // out of authentication *exactly*, because the operator is about to
+        // hand the same string to a partner or type it into a login screen.
+        let (_dir, store) = loaded();
+
+        // Deliberately not trimmed: the hashing secret is not trimmed either,
+        // and silently altering a credential produces a 401 that points nowhere.
+        let supplied = "  dev-key-with-spaces  ";
+        store
+            .create_with_plaintext("fixture", "acme", models(&["gpt-4o"]), None, supplied)
+            .unwrap();
+        store.refresh().unwrap();
+        assert!(
+            store.authenticate(supplied).is_some(),
+            "the supplied value must authenticate as itself"
+        );
+        assert!(
+            store.authenticate("dev-key-with-spaces").is_none(),
+            "and a trimmed version of it must not — the value is stored as given, \
+             not normalised"
+        );
+
+        // Blank is still refused, and nothing was written.
+        for bad in ["", "   ", "\t\n"] {
+            assert!(matches!(
+                store.create_with_plaintext("fixture", "acme", models(&["gpt-4o"]), None, bad),
+                Err(ApiKeyError::Invalid(_))
+            ));
+        }
+        assert_eq!(store.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_a_supplied_plaintext_cannot_be_registered_twice() {
+        // Two rows with one hash would make authentication ambiguous, so the
+        // UNIQUE constraint refuses it. Worth asserting rather than assuming:
+        // it is what makes `scripts/dev-seed-keys.sh` check before it seeds,
+        // and what stops a migration run twice from silently issuing a second
+        // live key for the same credential.
+        let (_dir, store) = loaded();
+        store
+            .create_with_plaintext("first", "acme", models(&["gpt-4o"]), None, "dev-key")
+            .unwrap();
+        assert!(matches!(
+            store.create_with_plaintext("again", "beta", models(&["gpt-4o"]), None, "dev-key"),
+            Err(ApiKeyError::Database(_))
+        ));
+        assert_eq!(store.list().unwrap().len(), 1, "and it wrote nothing");
     }
 
     #[test]

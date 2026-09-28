@@ -33,6 +33,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod dashboard;
+pub mod keygen;
 pub mod ledger;
 pub mod proxy;
 pub mod telemetry;

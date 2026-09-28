@@ -58,8 +58,9 @@ use partner_portal::{
     admin::create_admin_router,
     apikeys::{self, ApiKeyRefresher, ApiKeyStore},
     auth::Authenticated,
-    config::{ConfigLoader, HotReloader, listen_addr},
+    config::{CONFIG_ENV, ConfigLoader, HotReloader, listen_addr},
     dashboard::{SseBroadcaster, create_dashboard_router},
+    keygen,
     ledger::{
         InstanceGuard, LedgerPool, LedgerWriter, LedgerWriterConfig, RecoveryContext,
         recover_in_flight, retention,
@@ -68,9 +69,6 @@ use partner_portal::{
     proxy::handler::{AppState, error_response},
     telemetry, web,
 };
-
-/// Environment variable that overrides the configuration path.
-const CONFIG_ENV: &str = "PARTNER_PORTAL_CONFIG";
 
 /// How long shutdown waits for in-flight requests **after the shutdown signal**,
 /// before it gives up on them and runs the metering drain anyway.
@@ -87,6 +85,15 @@ const MIN_DRAIN_BOUND: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `partner-portal keygen …` is a one-shot provisioning command, dispatched
+    // before anything else is built. It is deliberately the only subcommand, and
+    // the match is exact: no arguments at all means "be the server", because
+    // that is what this binary is, and a typo must not mint a credential.
+    let argv: Vec<String> = std::env::args().collect();
+    if keygen::requested(&argv) {
+        return run_keygen(&argv).map_err(anyhow::Error::msg);
+    }
+
     telemetry::init_telemetry();
 
     let config_path = config_path();
@@ -416,6 +423,39 @@ fn config_path() -> PathBuf {
         Ok(path) => PathBuf::from(path),
         Err(_) => PathBuf::from("config.yaml"),
     }
+}
+
+/// Run the `keygen` subcommand and return its exit status.
+///
+/// Returns `Ok(())` on success and prints nothing to stdout except the key, so
+/// `KEY=$(partner-portal keygen …)` captures the credential and only the
+/// credential. The report goes to stderr (see [`keygen::run`]).
+fn run_keygen(argv: &[String]) -> Result<(), String> {
+    // `--help` anywhere is a request for the usage text, not a provisioning run
+    // — and reading help must never write a key to stdout by accident.
+    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        print!("{}", keygen::usage());
+        return Ok(());
+    }
+
+    let request = match keygen::parse(argv) {
+        Ok(request) => request,
+        Err(e) => {
+            eprint!("partner-portal keygen: {e}\n\n{}", keygen::usage());
+            std::process::exit(keygen::EXIT_USAGE);
+        }
+    };
+
+    let config_path = config_path();
+    let db_path = keygen::database_path(&config_path).map_err(|e| e.to_string())?;
+    let secret = keygen::load_hashing_secret()?;
+
+    // Only the plaintext reaches stdout. Using `print!` and flushing explicitly
+    // rather than `println!` keeps the trailing newline with the key, so a
+    // captured value is trimmed by the shell the same way every other CLI's is.
+    let plaintext = keygen::run(&db_path, secret, &request).map_err(|e| e.to_string())?;
+    println!("{plaintext}");
+    Ok(())
 }
 
 /// Build the CORS layer, or `None` when no browser origins are allowed.
