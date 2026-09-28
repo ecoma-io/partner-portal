@@ -2,7 +2,6 @@
 
 use crate::config::Config;
 use http::Uri;
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use thiserror::Error;
@@ -26,22 +25,6 @@ pub enum ConfigError {
     #[error("YAML parse error: {0}")]
     YamlParse(String),
 
-    #[error("No keys configured")]
-    NoKeys,
-
-    /// Names the entries by position and by *name*, which is how an operator
-    /// finds them. A key value is a credential and this error reaches the log
-    /// (src/config/hot_reload.rs), so it never appears here.
-    #[error(
-        "duplicate key value: keys[{index}] (name '{name}') repeats keys[{first_index}] (name '{first_name}')"
-    )]
-    DuplicateKey {
-        index: usize,
-        name: String,
-        first_index: usize,
-        first_name: String,
-    },
-
     #[error("Invalid upstream URL: {0}")]
     InvalidUpstreamUrl(String),
 
@@ -58,11 +41,11 @@ impl From<serde_yaml::Error> for ConfigError {
 /// Replace every scalar a `serde_yaml` message echoed back with a placeholder.
 ///
 /// serde quotes the offending value two ways — double quotes for strings
-/// (`invalid type: string "pp-…", expected struct KeyConfig`) and backticks for
-/// everything else (`invalid type: integer `50000`, expected a sequence`). Both
-/// are values, and either can be a credential that was put in the wrong place.
-/// Backticked *identifiers* are field and variant names (`unknown field
-/// `queue_siz`, expected one of `upstream`, `keys``), which is exactly the part
+/// (`invalid type: string "sk-…", expected struct UpstreamConfig`) and backticks
+/// for everything else (`invalid type: integer `50000`, expected a sequence`).
+/// Both are values, and either can be a credential that was put in the wrong
+/// place. Backticked *identifiers* are field and variant names (`unknown field
+/// `queue_siz`, expected one of `upstream`, `server``), which is exactly the part
 /// that has to survive: they are what names the fault.
 fn redact_scalars(message: &str) -> String {
     let mut out = String::with_capacity(message.len());
@@ -144,27 +127,14 @@ impl ConfigLoader {
     }
 
     /// Validate configuration
+    ///
+    /// There is deliberately no key validation here: partner API keys are not
+    /// configuration. They are rows in `api_keys`, validated when they are
+    /// written and enforced against the database's own constraints. A config
+    /// that still carries a `keys:` block is rejected by serde as an unknown
+    /// field, which is the loud failure a pre-stable product should give rather
+    /// than a silent one.
     pub fn validate(config: &Config) -> Result<(), ConfigError> {
-        // Must have at least one key
-        if config.keys.is_empty() {
-            return Err(ConfigError::NoKeys);
-        }
-
-        // Check for duplicate keys, remembering *where* each value was first
-        // seen so the error can name both entries by position.
-        let mut seen_keys: HashMap<&str, usize> = HashMap::new();
-        for (index, key) in config.keys.iter().enumerate() {
-            if let Some(&first_index) = seen_keys.get(key.key.as_str()) {
-                return Err(ConfigError::DuplicateKey {
-                    index,
-                    name: key.name.clone(),
-                    first_index,
-                    first_name: config.keys[first_index].name.clone(),
-                });
-            }
-            seen_keys.insert(&key.key, index);
-        }
-
         validate_base_url(&config.upstream.base_url)?;
 
         // Validate upstream API key
@@ -172,38 +142,6 @@ impl ConfigLoader {
             return Err(ConfigError::Invalid(
                 "upstream.api_key cannot be empty".to_string(),
             ));
-        }
-
-        // Validate key values. The index is the only way to identify an entry
-        // here: one has no value to print and the other's name is the thing
-        // that is missing.
-        for (index, key) in config.keys.iter().enumerate() {
-            if key.key.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "keys[{index}] has an empty key value"
-                )));
-            }
-            if key.name.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "keys[{index}] has an empty name; a key is identified by its name in logs and resolves to it as its consumer_id"
-                )));
-            }
-        }
-
-        // A blank entry in `allowed_models` is a typo that silently lists
-        // nothing useful and can mask the key's real capability: an operator
-        // reading "gpt-4o, ,gpt-4o-mini" cannot tell which names are real, and
-        // a truncated line reads as if the missing name were allowed. Refuse
-        // it by position; model names are not credentials, so naming them is
-        // optional and the position suffices (ADR 0012).
-        for (key_index, key) in config.keys.iter().enumerate() {
-            for (model_index, model) in key.allowed_models.iter().enumerate() {
-                if model.trim().is_empty() {
-                    return Err(ConfigError::Invalid(format!(
-                        "keys[{key_index}].allowed_models[{model_index}] cannot be blank"
-                    )));
-                }
-            }
         }
 
         // The password must not be empty — an empty password parses, but
@@ -315,12 +253,6 @@ upstream:
   base_url: https://api.openai.com
   api_key: sk-test
 
-keys:
-  - key: local-key-1
-    name: Test Key 1
-  - key: local-key-2
-    name: Test Key 2
-    consumer_id: custom-consumer
 "#;
 
     /// A valid config with `upstream.base_url` replaced, for the URL cases.
@@ -334,50 +266,37 @@ keys:
     #[test]
     fn test_load_valid_config() {
         let config = ConfigLoader::parse_yaml(VALID_CONFIG).unwrap();
-        assert_eq!(config.keys.len(), 2);
         assert_eq!(config.upstream.base_url, "https://api.openai.com");
     }
 
+    /// The clean break, stated as a test rather than left to a changelog.
+    ///
+    /// A config carrying a `keys:` block is now a **parse error**, not a
+    /// deprecated field that quietly stops mattering. That is deliberate: the
+    /// project is pre-stable, an operator who upgrades and keeps the old file
+    /// must be told so by the process rather than discover it as a 401 on the
+    /// first request. The error names the field, and never any value in it.
     #[test]
-    fn test_reject_empty_keys() {
-        let yaml = r#"
-upstream:
-  base_url: https://api.openai.com
-  api_key: sk-test
-keys: []
-"#;
-        let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
-        assert!(matches!(err, ConfigError::NoKeys));
-    }
-
-    #[test]
-    fn test_reject_duplicate_keys() {
-        let yaml = r#"
-upstream:
-  base_url: https://api.openai.com
-  api_key: sk-test
-keys:
-  - key: same-key
-    name: Key 1
-  - key: same-key
-    name: Key 2
-"#;
-        let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
-        // Both entries are named by position and by name, and the *value* they
-        // share — a credential — is not in the message.
-        let ConfigError::DuplicateKey {
-            index,
-            name,
-            first_index,
-            first_name,
-        } = err
-        else {
-            panic!("expected DuplicateKey, got {err}");
-        };
-        assert_eq!(index, 1);
-        assert_eq!(name, "Key 2");
-        assert_eq!(first_index, 0);
-        assert_eq!(first_name, "Key 1");
+    fn test_a_keys_block_is_refused_by_name() {
+        for yaml in [
+            // The block an old file would carry.
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: pp_secret\n    name: Key 1\n",
+            // And the degenerate one, in case a tool generated it.
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys: []\n",
+        ] {
+            let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
+            let ConfigError::YamlParse(message) = &err else {
+                panic!("expected a parse error, got {err}");
+            };
+            assert!(
+                message.contains("keys"),
+                "the error must name the field it refused: {message}"
+            );
+            assert!(
+                !message.contains("pp_secret"),
+                "the error must not echo a credential: {message}"
+            );
+        }
     }
 
     #[test]
@@ -386,9 +305,6 @@ keys:
 upstream:
   base_url: not-a-url
   api_key: sk-test
-keys:
-  - key: key1
-    name: Key 1
 "#;
         let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidUpstreamUrl(_)));
@@ -400,9 +316,6 @@ keys:
 upstream:
   base_url: https://api.openai.com
   api_key: ""
-keys:
-  - key: key1
-    name: Key 1
 "#;
         let err = ConfigLoader::parse_yaml(yaml).unwrap_err();
         assert!(matches!(err, ConfigError::Invalid(_)));
@@ -470,7 +383,7 @@ keys:
     /// here instead.
     #[test]
     fn test_reject_zero_queue_size() {
-        let yaml = VALID_CONFIG.replace("keys:", "database:\n  queue_size: 0\nkeys:");
+        let yaml = format!("{VALID_CONFIG}\ndatabase:\n  queue_size: 0\n");
         let err = ConfigLoader::parse_yaml(&yaml).unwrap_err();
         assert!(
             err.to_string().contains("database.queue_size"),
@@ -480,7 +393,7 @@ keys:
 
     #[test]
     fn test_reject_zero_batch_size() {
-        let yaml = VALID_CONFIG.replace("keys:", "database:\n  batch_size: 0\nkeys:");
+        let yaml = format!("{VALID_CONFIG}\ndatabase:\n  batch_size: 0\n");
         let err = ConfigLoader::parse_yaml(&yaml).unwrap_err();
         assert!(
             err.to_string().contains("database.batch_size"),
@@ -492,7 +405,7 @@ keys:
     /// parse and then silently never authenticate. The error names the field.
     #[test]
     fn test_manager_block_must_have_a_password() {
-        let yaml = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\nmanager:\n  password: \"\"\n";
+        let yaml = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nmanager:\n  password: \"\"\n";
         let err = ConfigLoader::parse_yaml(yaml).expect_err("an empty password must not load");
         assert!(
             err.to_string().contains("manager.password"),
@@ -505,47 +418,78 @@ keys:
     }
 
     /// A blank entry in `allowed_models` is a typo that silently lists nothing
-    /// useful, so it is refused by position (ADR 0012). Model names are not
-    /// credentials, so the message may — and this test already relies on it —
-    /// name the offending position without echoing a secret.
+    /// useful, so it is refused (ADR 0012). The check is no longer a *config*
+    /// validation, and deleting the config keys must not have deleted the rule
+    /// with them: the enforcement point moved to [`ApiKeyStore`], and this
+    /// stands as the assertion that it is still enforced.
+    ///
+    /// Model names are not credentials, so the message may — and this test
+    /// already relies on it — name the offending entry without echoing a
+    /// secret.
     #[test]
-    fn test_reject_blank_allowed_models_entry() {
-        for (label, models_block) in [
-            ("empty", "allowed_models:\n    - \"\"\n"),
-            ("whitespace", "allowed_models:\n    - \"   \"\n"),
+    fn test_a_blank_allowed_models_entry_is_still_refused() {
+        use crate::apikeys::ApiKeyStore;
+        use crate::ledger::LedgerPool;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ApiKeyStore::new(
+            Arc::new(LedgerPool::new(dir.path().join("ledger.db")).unwrap()),
+            b"a-blank-model-test-secret-32-byt".to_vec(),
+        );
+
+        for (label, models) in [
+            ("empty", vec![String::new()]),
+            ("whitespace", vec!["gpt-4o".to_string(), "   ".to_string()]),
         ] {
-            let yaml = format!(
-                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n    {models_block}"
-            );
-            let err = ConfigLoader::parse_yaml(&yaml)
-                .expect_err(&format!("a {label} allowed_models entry must not load"));
+            let err = store
+                .create("blank", "acme", models, None)
+                .err()
+                .unwrap_or_else(|| panic!("a {label} allowed_models entry must be refused"));
             assert!(
-                err.to_string().contains("allowed_models[0]"),
-                "the error must name the offending model position: {err}"
+                err.to_string().contains("allowed_models"),
+                "the error must name the offending field: {err}"
             );
         }
     }
 
-    /// A real, non-empty list loads; the strict default (no list at all) also
-    /// loads — it means "no models", a config choice, not a config error.
+    /// The strict-by-default allow-list moved out of configuration with the
+    /// keys themselves, and the contract moved with it: an empty list is
+    /// `[]` in the database, not an omitted field in a file. This is the shape
+    /// the admin API stores and the proxy reads, so the row is the assertion.
     #[test]
-    fn test_allowed_models_list_loads_and_empty_list_is_a_valid_choice() {
-        let with_list = ConfigLoader::parse_yaml(
-            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
-        )
-        .unwrap();
+    fn test_the_allow_list_is_a_database_column_not_a_config_field() {
+        use crate::apikeys::ApiKeyStore;
+        use crate::ledger::LedgerPool;
+        use std::sync::Arc;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = ApiKeyStore::new(
+            Arc::new(LedgerPool::new(dir.path().join("ledger.db")).unwrap()),
+            b"an-allow-list-test-secret-32-bytes".to_vec(),
+        );
+
+        let (listed, _) = store
+            .create(
+                "listed",
+                "acme",
+                vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+                None,
+            )
+            .unwrap();
         assert_eq!(
-            with_list.keys[0].allowed_models,
+            listed.allowed_models,
             vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
         );
 
-        let omitted = ConfigLoader::parse_yaml(
-            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n",
-        )
-        .unwrap();
-        assert!(
-            omitted.keys[0].allowed_models.is_empty(),
-            "a key that omits the field gets the empty strict default"
+        // The strict default: no list means no model, and it survives a
+        // round trip through storage as an empty list rather than as `null` or
+        // as an absent value.
+        let (strict, _) = store.create("strict", "acme", Vec::new(), None).unwrap();
+        assert!(strict.allowed_models.is_empty());
+        assert_eq!(
+            store.get(strict.id).unwrap().unwrap().allowed_models,
+            Vec::<String>::new()
         );
     }
 
@@ -557,9 +501,6 @@ keys:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
-keys:
-  - key: key1
-    name: Key 1
 manager:
   password: mgr-valid-secret
 "#;
@@ -576,9 +517,6 @@ manager:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
-keys:
-  - key: key1
-    name: Key 1
 manager:
   password: secret
   pasword: typo
@@ -596,10 +534,7 @@ manager:
 
     #[test]
     fn test_accept_the_smallest_workable_batch_and_queue() {
-        let yaml = VALID_CONFIG.replace(
-            "keys:",
-            "database:\n  queue_size: 1\n  batch_size: 1\nkeys:",
-        );
+        let yaml = format!("{VALID_CONFIG}\ndatabase:\n  queue_size: 1\n  batch_size: 1\n");
         let config = ConfigLoader::parse_yaml(&yaml).unwrap();
         assert_eq!(config.database.queue_size, 1);
         assert_eq!(config.database.batch_size, 1);
@@ -610,7 +545,7 @@ manager:
     #[test]
     fn test_reject_unknown_fields_at_every_level() {
         let cases = [
-            ("queue_siz", "queue_siz: 50000\n"),
+            ("queue_siz", "database:\n  queue_siz: 50000\n"),
             (
                 "upstream",
                 "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n  timeout_secsX: 10\n",
@@ -621,20 +556,15 @@ manager:
             // config file that still carries it must fail loudly, not bind
             // somewhere the operator did not mean.
             ("listen", "server:\n  listen: \"0.0.0.0:8080\"\n"),
+            // And `keys` left it for the database; `test_a_keys_block_is_refused_by_name`
+            // states that break in full, here it is simply one more level whose
+            // guard must not have been dropped in the rewrite.
             ("keys", "keys:\n  - key: a\n    name: b\n    metadata: 1\n"),
         ];
         for (field, block) in cases {
-            let yaml = if block.starts_with("upstream:") {
-                format!("{block}keys:\n  - key: key1\n    name: Key 1\n")
-            } else if block.starts_with("keys:") {
-                format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n{block}"
-                )
-            } else {
-                format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: key1\n    name: Key 1\n{block}"
-                )
-            };
+            let yaml = format!(
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n{block}"
+            );
             let err = ConfigLoader::parse_yaml(&yaml)
                 .expect_err(&format!("the unknown field {field} must be refused"));
             assert!(
@@ -651,52 +581,53 @@ manager:
     #[test]
     fn test_example_config_loads() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.yaml");
-        let config = ConfigLoader::from_file(&path)
+        ConfigLoader::from_file(&path)
             .unwrap_or_else(|e| panic!("config.example.yaml must load: {e}"));
+        // And it must demonstrate *no* key: the example is what an operator
+        // copies, and a plaintext key in it would be a credential in version
+        // control and a file that the running process no longer reads.
+        let raw = std::fs::read_to_string(&path).unwrap();
         assert!(
-            !config.keys.is_empty(),
-            "the example must demonstrate at least one key"
+            !raw.contains("\nkeys:"),
+            "config.example.yaml must not carry a keys block; keys are issued \
+             through /api/admin/api-keys"
         );
     }
 
     /// The hard contract: an error for a config holding credentials must never
     /// render one. Every failure path in this file is checked, because the
     /// loader's errors are logged by the reload watcher.
+    ///
+    /// These used to be key-block cases — a duplicate key, an empty key, an
+    /// empty key name, an empty key list. Those failure modes moved to the
+    /// database with the keys, and the cases that remain are the ones a YAML
+    /// file can still produce: a credential written where a block belongs, and
+    /// a credential where a sequence is expected.
     #[test]
     fn test_no_error_renders_a_credential() {
         const VALUE: &str = "pp-local-key-do-not-log";
 
-        let cases: [(&str, String); 6] = [
-            (
-                "duplicate key value",
-                format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: {VALUE}\n    name: First\n  - key: {VALUE}\n    name: Second\n"
-                ),
-            ),
-            (
-                "empty key name",
-                format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: {VALUE}\n    name: \"\"\n"
-                ),
-            ),
-            (
-                "empty key value",
-                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: \"\"\n    name: Named\n".to_string(),
-            ),
-            (
-                "no keys",
-                format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys: []\n# {VALUE}\n"
-                ),
-            ),
+        let cases: [(&str, String); 4] = [
             (
                 "credential in the wrong place",
-                format!("upstream: {VALUE}\nkeys:\n  - key: key1\n    name: Key 1\n"),
+                format!("upstream: {VALUE}\n"),
             ),
             (
                 "credential where a list is expected",
                 format!(
-                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys: [{VALUE}]\n"
+                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nupstreams: [{VALUE}]\n"
+                ),
+            ),
+            (
+                "credential where a scalar is expected",
+                format!(
+                    "upstream:\n  base_url: https://api.openai.com\n  api_key: {VALUE}\nretention_days: {VALUE}\n"
+                ),
+            ),
+            (
+                "credential in a comment is still a file the operator should not have",
+                format!(
+                    "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\ndatabase:\n  batch_sise: 5 # {VALUE}\n"
                 ),
             ),
         ];
@@ -722,7 +653,7 @@ manager:
     fn test_no_error_renders_the_upstream_key() {
         const SECRET: &str = "sk-upstream-do-not-log";
         let yaml = format!(
-            "upstream:\n  base_url: https://api.openai.com\n  api_key: \"\"\n  api_keyX: {SECRET}\nkeys:\n  - key: key1\n    name: Key 1\n"
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: \"\"\n  api_keyX: {SECRET}\n"
         );
         let err = ConfigLoader::parse_yaml(&yaml).unwrap_err();
         assert!(
@@ -740,21 +671,21 @@ manager:
         // The two shapes serde produces, plus the identifiers that must survive.
         assert_eq!(
             redact_scalars(
-                r#"keys[0]: invalid type: string "sk-secret-here", expected struct KeyConfig at line 5 column 5"#
+                r#"database: invalid type: string "sk-secret-here", expected struct DatabaseConfig at line 3 column 11"#
             ),
-            r#"keys[0]: invalid type: string "<redacted>", expected struct KeyConfig at line 5 column 5"#
+            r#"database: invalid type: string "<redacted>", expected struct DatabaseConfig at line 3 column 11"#
         );
         assert_eq!(
             redact_scalars(
-                "keys: invalid type: integer `1234567890`, expected a sequence at line 4 column 7"
+                "database.queue_size: invalid type: integer `1234567890`, expected a sequence at line 4 column 7"
             ),
-            "keys: invalid type: integer `<redacted>`, expected a sequence at line 4 column 7"
+            "database.queue_size: invalid type: integer `<redacted>`, expected a sequence at line 4 column 7"
         );
         assert_eq!(
             redact_scalars(
-                "unknown field `queue_siz`, expected one of `upstream`, `keys`, `database` at line 7 column 1"
+                "unknown field `queue_siz`, expected one of `upstream`, `server` at line 7 column 1"
             ),
-            "unknown field `queue_siz`, expected one of `upstream`, `keys`, `database` at line 7 column 1"
+            "unknown field `queue_siz`, expected one of `upstream`, `server` at line 7 column 1"
         );
         // A negative number is a value even though it starts with a `-`.
         assert_eq!(redact_scalars("integer `-5`"), "integer `<redacted>`");

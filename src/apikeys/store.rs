@@ -868,6 +868,49 @@ mod tests {
         );
     }
 
+    /// The strict-by-default allow-list, which moved out of `config.yaml` with
+    /// the keys and must keep behaving exactly as it did.
+    ///
+    /// A declared list admits exactly its members; matching is literal, not
+    /// case-insensitive; and the empty list is the strict case — *no* model,
+    /// never "everything". The last one is the dangerous direction, so it is
+    /// asserted from the stored row rather than from a struct the test built.
+    #[test]
+    fn test_the_allow_list_is_strict_and_exact() {
+        let (_dir, store) = loaded();
+
+        let (_listed, plaintext) = store
+            .create("listed", "acme", models(&["gpt-4o", "gpt-4o-mini"]), None)
+            .unwrap();
+        let auth = store.authenticate(&plaintext).unwrap();
+        assert!(auth.allowed_models.iter().any(|m| m == "gpt-4o"));
+        assert!(auth.allowed_models.iter().any(|m| m == "gpt-4o-mini"));
+        assert!(!auth.allowed_models.iter().any(|m| m == "gpt-5"));
+        assert!(
+            !auth.allowed_models.iter().any(|m| m == "GPT-4o"),
+            "matching is exact, not case-insensitive"
+        );
+
+        // The empty list is the default for a key that names no models, and it
+        // denies everything rather than admitting everything.
+        let (empty, plaintext) = store.create("empty", "acme", Vec::new(), None).unwrap();
+        assert!(empty.allowed_models.is_empty());
+        assert!(
+            store
+                .authenticate(&plaintext)
+                .unwrap()
+                .allowed_models
+                .is_empty()
+        );
+
+        // And it is still the strict case after a round trip through storage.
+        let reread = store.get(empty.id).unwrap().unwrap();
+        assert!(
+            reread.allowed_models.is_empty(),
+            "an empty allow-list must not come back as permissive"
+        );
+    }
+
     #[test]
     fn test_empty_fields_are_refused_before_they_reach_sql() {
         let (_dir, store) = loaded();

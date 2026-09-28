@@ -95,7 +95,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         path = %config_path.display(),
-        keys = config.keys.len(),
         upstream = %config.upstream.redacted_base_url(),
         "configuration loaded"
     );
