@@ -33,7 +33,10 @@ intact for everything except the thing it is for.
   The password is a credential: sent as `Authorization: Bearer <password>` on
   the dashboard routes, matched by exact string equality like a key value,
   scrubbed from every ledger/API text path, redacted in `Debug`, and never
-  logged by the reload watcher — the identical treatment `keys[].key` gets.
+  logged by the reload watcher — the identical treatment `keys[].key` got (the
+  last config credential, removed by
+  [ADR 0014](0014-api-keys-live-in-the-database.md): the manager password is now
+  the *only* config secret that authenticates a caller).
 * A manager credential authenticates the dashboard (`/api/me`, the summary,
   timeseries, requests and models queries) with `role: "manager"`. It is
   **not** a proxy credential: presenting it on `/v1/*` returns `403`, and no
@@ -90,7 +93,8 @@ intact for everything except the thing it is for.
   still bound by the allow-list, so a compromised dashboard cannot widen it.
 * A manager password that leaks exposes the manager's *view*, exactly as a
   leaked key exposes that key's consumer view. Rotation is a config change and
-  a hot reload, like key rotation.
+  a hot reload — unlike partner key rotation, which is an admin-API call since
+  [ADR 0014](0014-api-keys-live-in-the-database.md).
 * The ledger is unaffected: no schema change, no new table, no per-key
   attribution added. The `consumers=` intersection is computed in the query
   layer over the existing `consumer_id` column.
@@ -104,7 +108,9 @@ intact for everything except the thing it is for.
   empty `manager.consumers[i]` entries, naming fields, never values.
 * `src/config/hot_reload.rs` — `report_live_changes` names the changed field
   and renders `REDACTED` for the password.
-* `src/auth/middleware.rs` — `find_key` first, then `find_manager`; a
+* `src/auth/middleware.rs` — the key lookup first (then `find_key` on the config
+  snapshot, now `ApiKeyStore::authenticate`, see
+  [ADR 0014](0014-api-keys-live-in-the-database.md)), then `find_manager`; a
   password that matches neither is the same `InvalidKey` 401.
 * `src/auth/context.rs` — `ConsumerContext::manager`, `ManagerRole`,
   `consumers()` (None / Some([]) / Some(list)).

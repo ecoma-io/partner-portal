@@ -2,7 +2,11 @@
 
 Status: accepted — narrows ADR 0001's "no request transformation" scope: a
 per-key capability check on the proxy path is a policy *refusal*, not a routing
-or transformation decision (see ADR 0001's closing note).
+or transformation decision (see ADR 0001's closing note). Amended by
+[0014](0014-api-keys-live-in-the-database.md), which moved the list from
+`keys[].allowed_models` in the configuration to `api_keys.allowed_models` in the
+database. The decision — per-key, strict by default, enforced before the upstream
+and before metering, `/v1/models` filtered to the same list — is unchanged.
 
 ## Context
 
@@ -22,8 +26,9 @@ key cannot discover its own capabilities.
 
 The user's requirements, confirmed:
 
-1. The allow-list is **per key** (`keys[].allowed_models`), not per consumer or
-   global.
+1. The allow-list is **per key** (`api_keys.allowed_models` since
+   [ADR 0014](0014-api-keys-live-in-the-database.md); `keys[].allowed_models` in
+   the configuration when this decision was made), not per consumer or global.
 2. It is **strict by default**: a key that does not declare the field — or
    declares an empty list — may call **no** model. This is a deliberate breaking
    change: an existing deployment must add a list or its keys stop working.
@@ -34,7 +39,7 @@ The user's requirements, confirmed:
 
 ## Decision
 
-* **A new config field per key:**
+* **A field on every key:**
 
   ```yaml
   keys:
@@ -50,8 +55,16 @@ The user's requirements, confirmed:
   the strict rule: an empty list (or an absent field, which parses to empty)
   allows nothing; only an explicitly listed, exactly-matched name passes.
 
+  *Amended by [ADR 0014](0014-api-keys-live-in-the-database.md):* the list is now
+  the `api_keys.allowed_models` column, issued with the key as a JSON array.
+  Strictness is the column's `NOT NULL DEFAULT '[]'` and the issue paths, which
+  require at least one model (`keygen` has no `--all-models`, and the admin API's
+  `allowed_models` defaults to empty — a key that may call nothing). The rule
+  below — that the list rides the credential and is read from the context on the
+  request path — is exactly what the column feeds, unchanged.
+
 * **The list rides the credential, never the request.** The middleware copies
-  `key_config.allowed_models` onto the `ConsumerContext` at authentication
+  the key's `allowed_models` onto the `ConsumerContext` at authentication
   time (`src/auth/middleware.rs`); the handler reads it from the context
   (`src/auth/context.rs::allowed_models`). Nothing a client sends can contribute
   to the list — same rule as identity in ADR 0008. A manager context carries an
@@ -89,8 +102,10 @@ The user's requirements, confirmed:
   read backwards). `credentials()`, `redact_credentials` and `REDACTED` are
   untouched; the credential-scrub test still asserts exactly three credentials.
 
-* **Live.** The list is read per request from the config snapshot, so adding or
-  removing a model is a hot reload, no restart.
+* **Live.** The list is read per request from the credential's snapshot entry, so
+  adding or removing a model takes effect on the next request with no restart —
+  a hot reload while this decision was made, a `PATCH /api/admin/api-keys/{id}`
+  since [ADR 0014](0014-api-keys-live-in-the-database.md).
 
 ## Alternatives considered
 
@@ -138,32 +153,34 @@ The user's requirements, confirmed:
 * The dashboard needs no change: its model filter is usage-derived from the
   requests the key actually made, so a restricted key's dropdown already shows
   only what it can reach.
-* Hot reload reports `keys[].allowed_models` by index and value (model names
-  are not secrets), with `[]` rendered `(none)` so an emptied list cannot be
-  mistaken for "all".
+* Hot reload reported `keys[].allowed_models` by index and value (model names
+  are not secrets), with `[]` rendered `(none)` so an emptied list could not be
+  mistaken for "all". That report is gone with the config field
+  ([ADR 0014](0014-api-keys-live-in-the-database.md)); the same distinction now
+  lives in the listing, where an empty array is what it says.
 
 ## Evidence
 
-* `src/config/types.rs` — `KeyConfig.allowed_models` (`#[serde(default)]`),
-  `KeyConfig::allows_model` (strict membership).
+* `src/ledger/schema.sql` — `api_keys.allowed_models`, `NOT NULL DEFAULT '[]'`
+  ([ADR 0014](0014-api-keys-live-in-the-database.md) moved it here from
+  `keys[].allowed_models` in `src/config/types.rs`, whose `KeyConfig::allows_model`
+  encoded the strict rule; the rule now lives in `ApiKeyStore::create_with_plaintext`
+  / `validate_models` — blank entries refused, an empty list allowed and meaning
+  nothing).
 * `src/auth/context.rs` — `ConsumerIdentity.allowed_models`,
   `ConsumerContext::new(…, allowed_models)`, `allowed_models()` accessor;
   `ConsumerContext::manager` sets it empty.
-* `src/auth/middleware.rs` — the list is cloned from the config key onto the
-  context at authentication, never from the request.
+* `src/auth/middleware.rs` — the list is copied from the credential's snapshot
+  entry onto the context at authentication, never from the request.
 * `src/proxy/handler.rs` — the gate between model extraction and
   `RequestRecord::new`; `model_not_allowed_error` (404 `model_not_found` with
   `x-request-id`); `proxy_unmetered` threads the consumer and applies
   `filter_models_response` to the `/v1/models` body.
-* `src/config/loader.rs::validate` — `keys[i].allowed_models[j] cannot be
-  blank`, by position, without echoing values as if they were secrets.
-* `src/config/hot_reload.rs::report_key_changes` — the per-key branch, `[]` as
-  `(none)`.
-* `config.example.yaml` — both keys carry the field with the strict comment.
-* Tests: `src/config/types.rs::test_allows_model_is_strict_by_default`,
-  `src/config/loader.rs::test_reject_blank_allowed_models_entry`,
-  `src/config/hot_reload.rs::test_every_changed_field_is_reported` (the
-  `keys[].allowed_models` row), and
+* `src/apikeys/store.rs` — `validate_models` (blank refused by position, without
+  echoing values as if they were secrets), the JSON encode/decode of the column.
+* Tests: `src/apikeys/store.rs` (blank entries refused, the column round-trips),
+  `src/config/hot_reload.rs::test_every_changed_field_is_reported` (no longer
+  carries a keys row — the fields are all that is left), and
   `tests/integration/model_allow_list.rs` (seven: allowed-model metering,
   disallowed-model refusal with zero upstream/zero ledger, empty-list denial,
   `/v1/responses` gating, missing/non-JSON model denial, `/v1/models` filtered,

@@ -16,10 +16,11 @@ does not say, and what reading any one file will not tell you.
 ## What this repository is
 
 `partner-portal` — an OpenAI-compatible reverse proxy in front of **one**
-upstream, with local API-key authentication, a durable SQLite usage ledger, and a
-Vue dashboard embedded in the binary. Three proxied paths
+upstream, with database-backed API-key authentication, a durable SQLite usage
+ledger, and a Vue dashboard embedded in the binary. Three proxied paths
 (`/v1/chat/completions`, `/v1/responses`, `/v1/models`), five self-scoped
-dashboard endpoints, three admin endpoints, one static SPA.
+dashboard endpoints, three admin endpoints, the manager-only API-key lifecycle,
+one static SPA.
 
 It is deliberately **not** a general-purpose LLM gateway: no routing, no
 multi-provider failover, no request transformation, no pricing. Routing is a
@@ -55,11 +56,13 @@ tests that enforce it, and the superseded ADR, in one pull request.
 | `src/main.rs` | Composition root: config load, recovery, listener, layer stack, signal handling, drain |
 | `src/lib.rs` | The crate's public surface and the invariants above |
 | `src/config/` | YAML types and defaults (`types.rs`), validation (`loader.rs`), the listen-address env (`listen.rs`), the 1 s content-hash hot-reload watcher (`hot_reload.rs`) |
-| `src/auth/` | `Authenticated` extractor, Bearer parsing, server-side identity derivation |
+| `src/auth/` | `Authenticated` extractor, Bearer parsing, server-side identity derivation (from the key store's snapshot, not from a config file) |
+| `src/apikeys/` | Key hashing and generation, the hashing secret, the `api_keys` store (`store.rs`), the in-memory snapshot and its refresher (`refresher.rs`) |
+| `src/keygen.rs` | The `keygen` subcommand: one-shot provisioning of a key, outside the request path |
 | `src/proxy/` | Upstream client (`client.rs`), request handler and `StreamMeter` (`handler.rs`), SSE scanner (`sse_scan.rs`), per-endpoint usage extraction (`usage.rs`) |
 | `src/ledger/` | `schema.sql`, single-writer task (`writer.rs`), crash recovery (`recovery.rs`), retention (`retention.rs`), fixed-width timestamps (`timefmt.rs`), pool |
 | `src/dashboard/` | Consumer-scoped REST API (`api.rs`) and the invalidation-only SSE stream (`sse.rs`) |
-| `src/admin/` | `/healthz`, `/readyz`, `/version` |
+| `src/admin/` | `/healthz`, `/readyz`, `/version`, and the manager-only API-key lifecycle (`keys.rs`) |
 | `src/web/` | Embedded asset table, SPA fallback, CSP, cache headers |
 | `dashboard/` | Vue 3 + Pinia + vite source; `dashboard/dist` is embedded by `build.rs` and is Git-ignored |
 | `tests/` | Integration and end-to-end suites (below) |
@@ -263,9 +266,10 @@ all fixed; what remains is what is genuinely still true.
   `localStorage['api_key']`; there is no multi-factor, no password reset and no
   per-consumer authentication beyond the credential itself. That is deliberate —
   the credential *is* the authentication — but "login" here means "present a
-  valid key or manager password", not "authenticate a user". A standalone
-  deployment rotates its keys and the manager password through `config.yaml`
-  and hot reload, not through the dashboard.
+  valid key or manager password", not "authenticate a user". A partner key is
+  rotated through `POST /api/admin/api-keys/{id}/rotate` or `partner-portal
+  keygen` — never through the dashboard, which manages no keys — and the manager
+  password through `config.yaml` and hot reload.
 - **A reclaimed ledger is only safe on a local filesystem.** The advisory
   instance lock and `busy_timeout` serialisation assume the database file is on a
   real local disk; the two-instances-write-one-file story in `tests/e2e` is proven

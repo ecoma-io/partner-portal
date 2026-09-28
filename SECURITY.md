@@ -54,7 +54,8 @@ surface. Anything below is a vulnerability and belongs in a private report:
 |---|---|
 | **Auth bypass** | A request reaching a proxied route, a dashboard route or the SSE stream without a valid key; a bearer token parsed more permissively than the config means (scheme casing, whitespace, non-ASCII, a key that is a prefix of another); a disabled or removed key still being accepted after a reload |
 | **Consumer isolation** | Any path by which one key observes another consumer's rows — a query missing its `consumer_id` filter, a cursor or filter parameter that widens the scope, a rollup bucket aggregated across consumers |
-| **Credential leakage** | A local key or the upstream `api_key` appearing anywhere it can be read: a log line, an error body, `/version`, a dashboard response, an upstream request that forwards the client's own `Authorization` alongside the configured one, or a `401` body that echoes what was presented |
+| **Credential leakage** | A partner key or the upstream `api_key` appearing anywhere it can be read: a log line, an error body, `/version`, a dashboard response, a key listing, an upstream request that forwards the client's own `Authorization` alongside the configured one, or a `401` body that echoes what was presented |
+| **Key recovery from the database** | A partner key recoverable from its stored row — a plaintext or a reversible encoding in `api_keys`, a hash that verifies without `PARTNER_PORTAL_API_KEY_SECRET` (which would make a stolen database a set of usable credentials rather than inert digests), the secret itself stored in the database or a config file, or a create/rotate response that can be replayed from a cache |
 | **SQL injection** | Any request-derived value interpolated into a statement instead of bound as a parameter — `consumer_id` aside, the request list takes `range`, `start`, `end`, `model`, `status`, `cursor` and `limit` from the query string |
 | **Resource exhaustion** | A request that makes memory or disk grow without bound: a streaming event larger than the 256 KiB scan cap buffered anyway, a non-streaming body past the 32 MiB buffer cap retained instead of truncated, a queue that grows past its bound instead of applying backpressure, a body past `server.max_body_size` accepted, or a single authenticated consumer able to exhaust the process with connections |
 | **SSE abuse** | A subscriber that can read another consumer's invalidation stream, a payload that carries usage data, or an unbounded number of streams from one credential that degrades the process for others |
@@ -71,16 +72,24 @@ security finding:
   [`deploy/`](deploy/).
 - **There is no rate limiting, quota or billing enforcement.** The ledger records
   what happened; it does not stop anything.
-- **There is no cross-consumer or administrative API view.** The dashboard is
-  self-scoped by construction, and the SQLite file on disk is the operator's
-  cross-consumer view. Querying it directly is the intended answer, not a gap.
-- **`config.yaml` holds the upstream credential and every local key**, and the
-  file is not ignored by Git. Protecting it — permissions, an untracked path,
-  a secret mount — is the operator's responsibility.
-- **The shipped dashboard cannot authenticate its own SSE stream** (its
-  `EventSource` sends no `Authorization` header). It fails closed: the stream is
-  rejected, the "Live" badge stays disconnected. It is a defect, recorded in
-  [`AGENTS.md`](AGENTS.md#known-gaps), and not an exposure.
+- **The write surface is the key lifecycle, and it is manager-only.** The
+  dashboard is self-scoped by construction, the cross-consumer usage view is the
+  optional `manager:` password (ADR 0011, ADR 0013), and the only routes that
+  change anything are `/api/admin/api-keys*`, which a partner key cannot reach at
+  all (403) and which answer to that same manager password. A partner key being
+  unable to issue or revoke keys is the design, not a missing feature to report.
+- **`config.yaml` holds the upstream credential and the manager password**, and
+  the file is not ignored by Git. Protecting it — permissions, an untracked path,
+  a secret mount — is the operator's responsibility. It holds **no partner key**:
+  those are hashed rows in the database ([ADR
+  0014](docs/adr/0014-api-keys-live-in-the-database.md)), and the database and
+  the `PARTNER_PORTAL_API_KEY_SECRET` that keys those hashes are the two things
+  an operator protects instead. A stolen database without the secret is a table
+  of digests that authenticate nothing.
+- **The HMAC secret cannot be rotated in place.** Every stored `key_hash` was
+  derived from it and no plaintext exists to re-hash, so changing it invalidates
+  every issued key at once; rotating it means re-issuing. That is a documented
+  property of the design (ADR 0014), not a defect to report.
 - **Metrics and traces are not exported.** There is no `/metrics` endpoint to
   scrape and none is planned for this tier.
 

@@ -185,10 +185,10 @@ impl ApiKeyStore {
 
     /// Reload the snapshot from the database and swap it in.
     ///
-    /// Called at startup and by the refresher, which watches `PRAGMA
-    /// data_version` for commits made by *another* connection. Failures leave
-    /// the previous snapshot in place — the caller decides whether that is
-    /// fatal, and at startup it is.
+    /// Called at startup, by every mutation (see [`Self::mutate`]) and by the
+    /// refresher's periodic tick, which is how a *sibling* instance's commits
+    /// arrive. Failures leave the previous snapshot in place — the caller
+    /// decides whether that is fatal, and at startup it is.
     pub fn refresh(&self) -> Result<usize> {
         let rows = self.load_active()?;
         let count = rows.len();
@@ -465,8 +465,8 @@ impl ApiKeyStore {
     /// Every mutation goes through here, so a key this instance issued or
     /// revoked is usable (or unusable) on the very next request rather than
     /// after the next poll. Only this instance's snapshot is touched; a sibling
-    /// sees the commit through its own `data_version` poll, which is the
-    /// propagation delay recorded in ADR 0014.
+    /// sees the commit on its own refresher tick, which is the propagation delay
+    /// recorded in ADR 0014.
     ///
     /// A refresh that fails after a successful commit is **not** rolled back.
     /// The database is the source of truth and the write is durable, so

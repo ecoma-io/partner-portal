@@ -1,6 +1,10 @@
 # 0008 — Server-side consumer identity, isolation by construction
 
-Status: accepted
+Status: accepted — amended by [0014](0014-api-keys-live-in-the-database.md),
+which moved the credential from a config key to a row in `api_keys`. Identity is
+still derived server-side from the credential and still never from the request;
+only where the credential is read from changed. Every other decision here stands
+as written.
 
 ## Context
 
@@ -17,7 +21,9 @@ traffic, or writing rows attributed to another consumer.
 ## Decision
 
 * Identity is **always derived server-side** from the presented credential and the
-  live config snapshot: `keys[].consumer_id`, falling back to `keys[].name`. No
+  key set that credential is matched against: `api_keys.consumer_id`, which is
+  mandatory on every key ([ADR 0014](0014-api-keys-live-in-the-database.md); it
+  was `keys[].consumer_id`, falling back to `keys[].name`, before that). No
   request header, body field, query parameter or metadata contributes to it.
 * Authentication is an **extractor** (`Authenticated`), not a middleware layer. A
   handler that needs an identity must take one as an argument, so a new route is
@@ -47,7 +53,7 @@ traffic, or writing rows attributed to another consumer.
   — rejected: a route declared outside the layer is silently unauthenticated. The
   extractor makes the compiler enforce it.
 * **Deriving identity from the upstream's returned model/owner fields** —
-  rejected: identity must come from our own configuration, not from a response we
+  rejected: identity must come from our own records, not from a response we
   do not control.
 * **An admin key with a cross-consumer view** — rejected for now, and now
   implemented in one gated form by **[ADR 0011](0011-manager-password-cross-consumer-view.md)**
@@ -74,28 +80,39 @@ traffic, or writing rows attributed to another consumer.
   presented key belongs to; it never shows another consumer's traffic.
 * Two keys with the same `consumer_id` share a usage view (useful for a staging and
   a production key under one partner) and one can be revoked without disturbing the
-  other — revocation is a hot reload.
-* Revoking a key takes effect on the next request, with no restart, because the
-  lookup reads the live config snapshot.
+  other — revocation is a `POST .../revoke` on the admin surface
+  ([ADR 0014](0014-api-keys-live-in-the-database.md)).
+* Revoking a key takes effect on the next request in the instance that performed
+  it, with no restart, because the mutation refreshes the in-memory key snapshot
+  before it returns; a sibling instance sees it within its refresh interval.
 * There is no way to ask "how much did all consumers spend?" through the API —
   **unless a `manager:` block is configured**, in which case the manager password
   answers it over every consumer, narrowed only by the `consumers=` parameter
   ([ADR 0013](0013-manager-sees-all-consumers.md)), through the very same
   queries. Without a manager block, the question is still answered by querying
   the SQLite file directly.
-* **The ledger records no per-key attribution by design.** Local key values are
-  credentials and never reach persisted text (`src/config/types.rs::credentials()`);
-  a key that is leaked exposes the consumer's view while it remains configured.
-  Within-consumer key-level auditing is not available — that is a deliberate
-  trade-off for keeping credentials out of the database.
+* **The ledger records no per-key attribution by design.** Key *values* are
+  credentials and never reach persisted text, including now that the key set
+  itself is a database table: `api_keys` holds a hash and a prefix, never a
+  plaintext ([ADR 0014](0014-api-keys-live-in-the-database.md)), and a usage row
+  carries the consumer, never the key that produced it. A key that is leaked
+  exposes the consumer's view while it remains active. Within-consumer key-level
+  auditing is still not available.
 
 ## Evidence
 
 * `src/auth/middleware.rs` — module doc ("Identity is always derived server-side"),
-  `Authenticated::from_request_parts`, `extract_bearer_token` (case-insensitive
-  scheme, trimmed, non-UTF-8 rejected rather than panicking), `AuthError`
-  (`no-store`).
-* `src/config/types.rs::KeyConfig::consumer_id` — `consumer_id` or `name`.
+  `Authenticated::from_request_parts` (the key branch on
+  `state.api_keys.authenticate`, the manager branch still on the config
+  snapshot), `extract_bearer_token` (case-insensitive scheme, trimmed, non-UTF-8
+  rejected rather than panicking), `AuthError` (`no-store`).
+* `src/apikeys/store.rs` — `ApiKeyAuth.consumer_id` (`ApiKeyRow.consumer_id`),
+  the column every authenticated identity is read from since
+  [ADR 0014](0014-api-keys-live-in-the-database.md); `ApiKeyStore::authenticate`
+  is the lookup the extractor performs.
+* `src/admin/keys.rs::CreateKeyRequest` — `consumer_id` is a required field of
+  the only runtime way to issue a key, so it cannot be omitted the way the old
+  `keys[].consumer_id` could (which fell back to `name`).
 * `src/dashboard/api.rs` — module doc ("Isolation"), and `consumer_id = ?1` in
   every query (`summary`, `timeseries`, `requests`, `models`).
 * `src/dashboard/mod.rs` — the route list, and the comment that there is no

@@ -32,8 +32,9 @@ Thumbs.db
 # file is reused or ignored — so it must never be committed.
 .partner-portal-instance-*.lock
 
-# The operator's live configuration. It carries the local API keys and the
-# upstream credential, so it is never committed; `config.example.yaml` is the
+# The operator's live configuration. It carries the upstream credential and the
+# manager password — partner API keys are hashed rows in the ledger and are not
+# in any config file — so it is never committed; `config.example.yaml` is the
 # tracked template.
 /config.yaml
 config.yaml
