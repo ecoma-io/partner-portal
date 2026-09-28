@@ -1,9 +1,9 @@
 //! Partner Portal — a lightweight OpenAI-compatible reverse proxy.
 //!
-//! One upstream, three endpoints, local key authentication, and a durable usage
-//! ledger with an embedded dashboard. It is deliberately **not** a
-//! general-purpose LLM gateway: there is no routing, no multi-provider failover
-//! and no request transformation.
+//! One upstream, three endpoints, partner API-key authentication against a keyed
+//! hash in the ledger database, and a durable usage ledger with an embedded
+//! dashboard. It is deliberately **not** a general-purpose LLM gateway: there is
+//! no routing, no multi-provider failover and no request transformation.
 //!
 //! # The invariants this crate exists to uphold
 //!
@@ -28,9 +28,12 @@
 //!    ADR 0008 behaviour.
 
 pub mod admin;
+pub mod apikeys;
 pub mod auth;
 pub mod config;
+pub mod crypto;
 pub mod dashboard;
+pub mod keygen;
 pub mod ledger;
 pub mod proxy;
 pub mod telemetry;

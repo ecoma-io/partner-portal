@@ -13,15 +13,14 @@ use crate::harness::*;
 /// bus would pass a single-process test and fail here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_instance_notifies_about_writes_made_by_another_instance() {
-    const KEY: &str = "local-test-key";
-
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("ledger.db");
     let (mock, upstream) = start_mock_upstream().await;
 
     // A serves the traffic; B only serves the dashboard.
     let a = Instance::start("a", dir.path(), &db_path, &upstream);
-    let b = Instance::start("b", dir.path(), &db_path, &upstream);
+    let key = a.key().to_string();
+    let b = Instance::start_existing("b", dir.path(), &db_path, &upstream, vec![key.clone()]);
     assert!(a.wait_ready(WAIT).await, "A never became ready");
     assert!(b.wait_ready(WAIT).await, "B never became ready");
 
@@ -31,12 +30,13 @@ async fn an_instance_notifies_about_writes_made_by_another_instance() {
     let reader = {
         let client = client.clone();
         let base = b.base_url();
+        let key = key.clone();
         tokio::spawn(async move {
             client
                 .read_sse_until(
                     &base,
                     "/api/dashboard/events",
-                    KEY,
+                    &key,
                     "data_changed",
                     Duration::from_secs(15),
                 )
@@ -49,7 +49,7 @@ async fn an_instance_notifies_about_writes_made_by_another_instance() {
 
     // Traffic goes to A only. B never sees this request directly.
     assert_eq!(
-        client.chat(&a.base_url(), "sse-cross-instance").await,
+        client.chat(&a.base_url(), "sse-cross-instance", &key).await,
         Ok(200)
     );
 
@@ -82,14 +82,14 @@ async fn an_instance_notifies_about_writes_made_by_another_instance() {
 
     // Both instances are still healthy and agree on the data.
     let (status, body) = client
-        .get(&a.base_url(), "/api/dashboard/summary", Some(KEY))
+        .get(&a.base_url(), "/api/dashboard/summary", Some(&key))
         .await;
     assert_eq!(status, 200);
     let summary: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(summary["total_requests"], 1);
 
     let (status, body) = client
-        .get(&b.base_url(), "/api/dashboard/summary", Some(KEY))
+        .get(&b.base_url(), "/api/dashboard/summary", Some(&key))
         .await;
     assert_eq!(status, 200);
     let summary: Value = serde_json::from_str(&body).unwrap();

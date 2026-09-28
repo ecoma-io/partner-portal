@@ -10,7 +10,8 @@ Two instances of the same binary, one SQLite ledger, one edge, on one machine.
    portal-a          portal-b       <- the same image, two slots
    :8081             :8082             (published on 127.0.0.1 for operators)
          \            /
-      portal-data (one volume, one partner-portal.db in WAL mode)
+      portal-data (one volume, one partner-portal.db in WAL mode, holding
+                   both the usage ledger and the partner key set)
 ```
 
 Why two instances of a single binary: an update has to hold without an
@@ -20,12 +21,19 @@ two databases is not metering. SQLite in WAL mode with a 5s busy timeout is what
 makes two writer processes over one file a supported configuration rather than a
 hopeful one (`src/ledger/mod.rs`).
 
+The same file holds the partner API keys, as hashed rows (ADR 0014): one volume
+is the deployment's state, and a key issued into a container's own filesystem
+would not survive the next deploy. Two consequences worth knowing before the
+first run: the hashes are keyed by `PARTNER_PORTAL_API_KEY_SECRET`, which must be
+the same value at every start *and* the same one the keys were issued with; and a
+backup of this file is only usable alongside that secret.
+
 ## Files
 
 | Path | What it is |
 |---|---|
 | `docker-compose.yml` | the stack: two slots, the edge, a stub upstream behind `--profile smoke` |
-| `config/partner-portal.yaml` | the configuration both instances mount (one file, one ledger path) |
+| `config/partner-portal.yaml` | the configuration both instances mount (one file, one ledger path, no keys) |
 | `config/partner-portal.smoke.yaml` | the same, pointed at the stub upstream |
 | `nginx/nginx.conf` | the edge: routing, streaming (no buffering), no retries |
 | `nginx/upstream.d/upstream.conf` | **the traffic switch** — which slots are in rotation |
@@ -36,13 +44,49 @@ hopeful one (`src/ledger/mod.rs`).
 ## First run
 
 ```sh
-# Put a real upstream key and at least one partner key in config/partner-portal.yaml.
+# 1. The secret every stored key hash is keyed with. Generated once, kept
+#    forever: changing it makes every issued key unverifiable. Compose reads
+#    deploy/.env, which is gitignored, and refuses to start without the value.
+echo "PARTNER_PORTAL_API_KEY_SECRET=$(openssl rand -base64 32)" >> .env
+
+# 2. The upstream credential and the manager password, in
+#    config/partner-portal.yaml. Neither is a partner key.
+
+# 3. Start the stack, then issue the first partner key. The plaintext is printed
+#    once and stored nowhere: it cannot be read back from the database or from
+#    any endpoint, so capture it now.
 PARTNER_PORTAL_IMAGE=ghcr.io/owner/partner-portal@sha256:... docker compose up -d --wait
+docker compose exec portal-a partner-portal keygen \
+    --name acme-production --consumer-id acme --allowed-model gpt-4o
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
+A deployment may legitimately run with no keys — the process starts, logs a
+warning that every partner request will be a 401, and wants `keygen` (or
+`POST /api/admin/api-keys`) to fix it. What it will not do is start without
+`PARTNER_PORTAL_API_KEY_SECRET`: an instance that cannot hash a key
+authenticates nobody, and saying so at startup beats saying "invalid api key"
+per request.
+
+After that first key, every other operation is on the admin surface, which takes
+the manager password and not a partner key:
+
+```sh
+curl -fsS -X POST http://127.0.0.1:8080/api/admin/api-keys \
+  -H "Authorization: Bearer $MANAGER_PASSWORD" -H 'Content-Type: application/json' \
+  -d '{"name":"acme-staging","consumer_id":"acme","allowed_models":["gpt-4o-mini"]}'
+```
+
+`POST .../{id}/rotate` replaces a key's secret (the old row is revoked and the
+new one inserted in one transaction), `PATCH .../{id}` renames it or changes its
+model list, `POST .../{id}/revoke` stops it authenticating, and
+`GET /api/admin/api-keys` lists them with a prefix and never a secret. A revoked
+or rotated key cannot be brought back: only hashes are stored, so re-issuing the
+same plaintext is not an option.
+
 The dashboard is served by the edge at `/`; its API is under `/api/dashboard/*`
-and takes the same `Authorization: Bearer <partner key>` as the proxy.
+and takes the same `Authorization: Bearer <partner key>` as the proxy, or the
+manager password for the cross-consumer view.
 
 Host ports default to 8080 (edge), 8081 and 8082 (the slots) and are overridable
 with `EDGE_PORT`, `PORTAL_A_PORT`, `PORTAL_B_PORT` — the ports the smoke test and
@@ -56,6 +100,9 @@ not a second way in past the edge.
 
 ```sh
 cd deploy
+# PARTNER_PORTAL_API_KEY_SECRET must be in the environment (or in deploy/.env);
+# PARTNER_PORTAL_KEY is optional and is what phase 9 probes with.
+export PARTNER_PORTAL_KEY='<a key this deployment issued>'
 ./rolling-update.sh --instance a --image ghcr.io/owner/partner-portal@sha256:...
 ./rolling-update.sh --instance b --image ghcr.io/owner/partner-portal@sha256:...
 ```
@@ -91,7 +138,10 @@ One invocation replaces one slot; the peer keeps serving throughout. The phases
    is why the switch is applied — and given its settle — before anything is
    stopped, and never the other way round.
 9. **verify** — real requests through the edge, checked against the ledger
-   (`--verify-requests N`, default 3; each one is a billed upstream call).
+   (`--verify-requests N`, default 3; each one is a billed upstream call). The
+   credential cannot be read out of the deployment any more — only hashes are
+   stored — so it comes from `PARTNER_PORTAL_KEY`. With none set the phase is
+   skipped and says so, rather than reporting a check it did not run.
 10. **cleanup** — backups pruned to `--keep-backups`, rollback command printed.
 
 `--dry-run` prints every step and changes nothing.
@@ -118,6 +168,12 @@ Two independent sources have to agree, and the smoke test checks them both:
 ```sh
 ./smoke-test.sh                      # the full three-way check, on a stub upstream
 ```
+
+The smoke test seeds its own key (the image's `keygen`, into the shared volume)
+and then exercises the admin surface on the running stack: the manager password
+reaches it, a partner key is refused there, the listing never contains a secret,
+and a `PATCH` narrows the key's model list and is honoured on the very next
+request with no restart.
 
 * the **upstream's** own request counter — was every request forwarded exactly once?
 * the **ledger**, read through the dashboard API — one row per request, distinct
@@ -153,6 +209,13 @@ sides of it record ownership.
   unit. Never bind the data volume to a network filesystem: SQLite's locking does
   not survive NFS, and the failure mode is a corrupted ledger rather than an
   error.
+* `PARTNER_PORTAL_API_KEY_SECRET` is a deployment secret like the upstream key,
+  with one property the upstream key does not have: it cannot be rotated in
+  place. Every stored key hash was computed with it, there is no plaintext to
+  re-hash, so changing it invalidates every issued key at once — rotating it
+  means re-issuing every key. Keep it in `deploy/.env` (gitignored) or whatever
+  supplies the compose environment, and put it wherever the backup of the ledger
+  goes: a restored database without it holds keys that no longer verify.
 * `stop_grace_period` is 30s and the update stops containers with `-t 60`,
   because the drain of the metering queue must finish before the process is
   killed. The application's own shutdown grace (5s) is the wait for the edge to

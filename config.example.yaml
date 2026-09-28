@@ -30,8 +30,10 @@
 # changing one of those logs a warning saying explicitly that the new value is
 # NOT in force until restart.
 #
-# No keys are logged: the reloader reports *that* a credential changed and which
-# entry changed, never the value (src/config/hot_reload.rs::report_changes).
+# No credentials are logged: the reloader reports *that* a credential changed
+# and which field it was, never the value (src/config/hot_reload.rs::report_changes).
+# The two this file holds are `upstream.api_key` and `manager.password`;
+# partner API keys are not here at all (see the block below).
 
 # ---------------------------------------------------------------------------
 # server — HTTP listener behaviour.
@@ -90,6 +92,22 @@ server:
   # Default: 500.
   sse_poll_interval_ms: 500
 
+  # How often the in-memory API-key snapshot is reloaded from the database.
+  #
+  # Authentication reads a `HashMap` and never queries SQLite, so this is not
+  # on the request path — it bounds how long a change made by *another* instance
+  # (a create, a revoke, a rotation, or a stored `expires_at` arriving) takes to
+  # become effective here. A change made through this instance's own admin API
+  # refreshes the snapshot synchronously and does not wait for this interval.
+  #
+  # It also bounds expiry: a key past its `expires_at` stops authenticating
+  # within one interval of that instant, because the reload is unconditional
+  # rather than gated on the database changing (an expiry writes nothing
+  # anywhere). Values below 1 are clamped to 1.
+  # Read when the refresher task is spawned. Restart required to change.
+  # Default: 1000.
+  api_key_refresh_ms: 1000
+
 # ---------------------------------------------------------------------------
 # upstream — the single OpenAI-compatible API this proxy forwards to.
 #
@@ -135,73 +153,70 @@ upstream:
   connect_timeout_secs: 10
 
 # ---------------------------------------------------------------------------
-# keys — local API keys accepted by this proxy.
+# Partner API keys are NOT in this file.
 #
-# Required and non-empty: the server refuses to start with no keys, with a
-# duplicate key value, with an empty key, or with an empty name
-# (src/config/loader.rs::validate). Comparison is exact string equality against
-# the presented Bearer token — these are plaintext secrets in a file, so the
-# file's permissions are the security boundary.
+# They are rows in the `api_keys` table of the database named under `database`
+# below, and that is the only place they live (docs/adr/0014). This file is
+# deployment and runtime behaviour; a credential is neither.
 #
-# An error about a key names it by position and by `name`, never by value: a
-# credential must not reach a log line, and this file's errors are logged by the
-# reload watcher (src/config/loader.rs).
+# There is no `keys:` block here on purpose. `Config` rejects unknown fields, so
+# a configuration carrying one is a **startup parse error** naming the field —
+# an operator who upgrades and keeps the old file is told by the process rather
+# than discovering it as a 401 on the first request.
 #
-# The dashboard login accepts one of these keys and shows the usage of the
-# CONSUMER the key belongs to — the isolation boundary is the consumer, not the
-# key:
+# What a key row holds, and where each piece is enforced:
 #
-#   * Two keys with DIFFERENT `consumer_id`s (or with `consumer_id` omitted, so
-#     `name` becomes the identity) can never observe each other's data. This is
-#     the default, and it is proven by tests/e2e/dashboard_isolation.rs.
-#   * Two keys with the SAME `consumer_id` deliberately share one usage view —
-#     the rotation pattern (revoke the old key, add a replacement under the same
-#     consumer, and the partner's history continues). Granting that share is an
-#     explicit operator decision; no request can assert it.
+#   * `name`            a human-readable label, and the identity a key falls
+#                       back to when `consumer_id` is empty.
+#   * `consumer_id`     the identity written to the ledger and the isolation
+#                       boundary for every dashboard query. Always derived
+#                       server-side from the row the credential matched — never
+#                       from a request header, body field or query parameter
+#                       (src/auth/middleware.rs, docs/adr/0008).
+#   * `key_prefix`      the first 12 characters of the plaintext, for telling
+#                       two keys apart in a list. Not a secret.
+#   * `key_hash`        `hex(HMAC-SHA256(secret, plaintext))`. The plaintext is
+#                       never stored, never logged, and never returned by any
+#                       read endpoint.
+#   * `allowed_models`  **strict**: an empty list is allowed *no* model. An
+#                       inference request naming anything unlisted is refused
+#                       `404 model_not_found` before the upstream is contacted
+#                       and before a metering row is written; `/v1/models`
+#                       answers the same filtered list (docs/adr/0012).
+#   * `status`          `active` or `revoked`. A key past `expires_at` is
+#                       filtered out at load and is never authenticated.
 #
-# Live: adding or revoking a key takes effect on the next request, with no
-# restart.
-# ---------------------------------------------------------------------------
-keys:
-  - # The credential a client presents as `Authorization: Bearer <key>`.
-    key: "pp-local-key-replace-me"
-
-    # Human-readable label. Also used to identify the key in logs.
-    name: "acme-production"
-
-    # Consumer identity written to the ledger and used to scope every dashboard
-    # query. Optional; when omitted it defaults to `name`.
-    #
-    # Identity is *always* derived server-side from this config — never from a
-    # request header, body field or query parameter (src/auth/middleware.rs).
-    # Two keys that share a `consumer_id` share a usage view; one key can never
-    # observe another's.
-    consumer_id: "acme"
-
-    # Models this key may call. **Strict**: an empty list — or a key that omits
-    # the field entirely — is allowed *no* model. Every inference request whose
-    # `model` is not listed is refused with `404 model_not_found` *before* the
-    # upstream is contacted and *before* a metering row is written; `/v1/models`
-    # answers the same filtered list.
-    #
-    # A model already in use must be added here or the key stops working the
-    # moment this field ships (docs/adr/0012). Model names are not credentials:
-    # they are logged in cleartext by the reload report.
-    #
-    # Live: read per request from the snapshot, so a rotation takes effect on
-    # the next request.
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
-
-  - # A second key for the same consumer: same usage view, separate credential,
-  # so one can be revoked without disturbing the other.
-    key: "pp-local-key-staging-replace-me"
-    name: "acme-staging"
-    consumer_id: "acme"
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
+# Two rows that share a `consumer_id` deliberately share one usage view — the
+# rotation pattern. Granting that share is an explicit operator decision; no
+# request can assert it. Two rows that do not share one can never observe each
+# other's data (tests/e2e/dashboard_isolation.rs).
+#
+# # Issuing the first key
+#
+# A fresh database has zero keys, and the only way to create one is the admin
+# API — which is authenticated with the `manager` password below. To bootstrap
+# a deployment, either call the API with that password:
+#
+#   curl -sS -X POST http://127.0.0.1:8080/api/admin/api-keys \
+#     -H "Authorization: Bearer $MANAGER_PASSWORD" \
+#     -H 'content-type: application/json' \
+#     -d '{"name":"acme-production","consumer_id":"acme",
+#          "allowed_models":["gpt-4o","gpt-4o-mini"]}'
+#
+# — which prints the plaintext key exactly once — or run the one-shot helper
+# against the same database file, which needs no running instance:
+#
+#   ./partner-portal keygen --database ./partner-portal.db \
+#     --name acme-production --consumer-id acme \
+#     --allowed-model gpt-4o --allowed-model gpt-4o-mini
+#
+# The plaintext exists in that one response and nowhere else. Losing it is not
+# recoverable by design: rotate the row, which issues a new plaintext and
+# revokes the old one in a single transaction.
+#
+# The HMAC secret that keys every hash comes from the required environment
+# variable `PARTNER_PORTAL_API_KEY_SECRET` (at least 32 bytes), never from
+# this file and never from the database — see the header above.
 
 # ---------------------------------------------------------------------------
 # manager — optional operator credential with a cross-consumer dashboard view.
@@ -218,7 +233,7 @@ keys:
 #
 # The comparison is exact string equality, so a password *is* a plaintext secret
 # in a file: rotate it via hot reload, and it is scrubbed from ledger text and
-# redacted in logs just like a key value (src/config/types.rs::credentials).
+# redacted in logs just like the upstream key (src/config/types.rs::credentials).
 #
 # Live: read per request from the snapshot, so a rotation takes effect on the
 # next request.

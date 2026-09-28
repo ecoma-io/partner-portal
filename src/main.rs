@@ -56,9 +56,11 @@ use tracing::{error, info, warn};
 
 use partner_portal::{
     admin::create_admin_router,
+    apikeys::{self, ApiKeyRefresher, ApiKeyStore},
     auth::Authenticated,
-    config::{ConfigLoader, HotReloader, listen_addr},
+    config::{CONFIG_ENV, ConfigLoader, HotReloader, listen_addr},
     dashboard::{SseBroadcaster, create_dashboard_router},
+    keygen,
     ledger::{
         InstanceGuard, LedgerPool, LedgerWriter, LedgerWriterConfig, RecoveryContext,
         recover_in_flight, retention,
@@ -67,9 +69,6 @@ use partner_portal::{
     proxy::handler::{AppState, error_response},
     telemetry, web,
 };
-
-/// Environment variable that overrides the configuration path.
-const CONFIG_ENV: &str = "PARTNER_PORTAL_CONFIG";
 
 /// How long shutdown waits for in-flight requests **after the shutdown signal**,
 /// before it gives up on them and runs the metering drain anyway.
@@ -86,6 +85,15 @@ const MIN_DRAIN_BOUND: Duration = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // `partner-portal keygen …` is a one-shot provisioning command, dispatched
+    // before anything else is built. It is deliberately the only subcommand, and
+    // the match is exact: no arguments at all means "be the server", because
+    // that is what this binary is, and a typo must not mint a credential.
+    let argv: Vec<String> = std::env::args().collect();
+    if keygen::requested(&argv) {
+        return run_keygen(&argv).map_err(anyhow::Error::msg);
+    }
+
     telemetry::init_telemetry();
 
     let config_path = config_path();
@@ -94,7 +102,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!(
         path = %config_path.display(),
-        keys = config.keys.len(),
         upstream = %config.upstream.redacted_base_url(),
         "configuration loaded"
     );
@@ -168,6 +175,47 @@ async fn main() -> anyhow::Result<()> {
     );
     let ledger = Arc::new(LedgerWriter::new(pool.writer(), writer_config));
 
+    // --- Partner API keys ---------------------------------------------------
+    //
+    // The key set is database-backed and the hash is keyed by a secret from the
+    // environment. The secret is required, not defaulted: a deployment that
+    // starts with a key set it cannot hash is a deployment that authenticates
+    // nobody and says only "Invalid API key" (ADR 0014).
+    let api_key_secret = apikeys::load_secret()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e}. Generate one with `openssl rand -base64 32` and supply it \
+                 through the deployment's environment; it is never stored in the \
+                 database and never written to the config file"
+            )
+        })?;
+    let api_keys = Arc::new(ApiKeyStore::new(pool.clone(), api_key_secret));
+
+    // The refresher loads the key set at construction, so a key set that cannot
+    // be read is a start-up failure rather than an instance that answers every
+    // request with a 401. It also owns the poller that picks up a sibling's
+    // commits, which is what makes more than one instance correct.
+    let api_key_refresher = Arc::new(
+        ApiKeyRefresher::new(&db_path, api_keys.clone(), config.server.api_key_refresh_ms)
+            .map_err(|e| anyhow::anyhow!("failed to start the api key refresher: {e}"))?,
+    );
+    api_key_refresher.start();
+    // Zero is a legitimate state after a database was created but no partner
+    // has been provisioned, so it is logged rather than refused. The admin API
+    // and `partner-portal keygen` are how a key gets issued.
+    if api_key_refresher.initial_key_count() == 0 {
+        warn!(
+            "no active api keys in the database; every partner request will be \
+             rejected with 401 until a key is issued"
+        );
+    }
+    info!(
+        keys = api_key_refresher.initial_key_count(),
+        refresh_ms = config.server.api_key_refresh_ms,
+        "partner api keys loaded"
+    );
+
     // --- Configuration hot reload -------------------------------------------
 
     let reloader = HotReloader::new(config_path.clone(), config.clone());
@@ -194,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
         ledger: ledger.clone(),
         pool: pool.clone(),
         broadcaster: broadcaster.clone(),
+        api_keys: api_keys.clone(),
         shutting_down: shutting_down.clone(),
     });
 
@@ -374,6 +423,44 @@ fn config_path() -> PathBuf {
         Ok(path) => PathBuf::from(path),
         Err(_) => PathBuf::from("config.yaml"),
     }
+}
+
+/// Run the `keygen` subcommand and return its exit status.
+///
+/// Returns `Ok(())` on success and prints nothing to stdout except the key, so
+/// `KEY=$(partner-portal keygen …)` captures the credential and only the
+/// credential. The report goes to stderr (see [`keygen::run`]).
+fn run_keygen(argv: &[String]) -> Result<(), String> {
+    // `--help` anywhere is a request for the usage text, not a provisioning run
+    // — and reading help must never write a key to stdout by accident.
+    if argv.iter().skip(1).any(|a| a == "-h" || a == "--help") {
+        print!("{}", keygen::usage());
+        return Ok(());
+    }
+
+    let request = match keygen::parse(argv) {
+        Ok(request) => request,
+        Err(e) => {
+            eprint!("partner-portal keygen: {e}\n\n{}", keygen::usage());
+            std::process::exit(keygen::EXIT_USAGE);
+        }
+    };
+
+    // `--database` names the file directly and skips the configuration entirely
+    // rather than overriding it, so there is never a question of which of the
+    // two a run used.
+    let db_path = match &request.database {
+        Some(path) => path.clone(),
+        None => keygen::database_path(&config_path()).map_err(|e| e.to_string())?,
+    };
+    let secret = keygen::load_hashing_secret()?;
+
+    // Only the plaintext reaches stdout. Using `print!` and flushing explicitly
+    // rather than `println!` keeps the trailing newline with the key, so a
+    // captured value is trimmed by the shell the same way every other CLI's is.
+    let plaintext = keygen::run(&db_path, secret, &request).map_err(|e| e.to_string())?;
+    println!("{plaintext}");
+    Ok(())
 }
 
 /// Build the CORS layer, or `None` when no browser origins are allowed.

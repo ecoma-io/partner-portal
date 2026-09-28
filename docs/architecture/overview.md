@@ -13,11 +13,12 @@ describes the code as it is, not as it was intended.
 | `src/main.rs` | Composition root: ledger, broadcaster, router, retention task, shutdown sequence |
 | `src/config/` | YAML types and defaults, validation, atomic hot reload |
 | `src/auth/` | Bearer extraction, server-side consumer identity (`Authenticated` extractor) |
+| `src/apikeys/` | Key hashing and generation, the hashing secret, the `api_keys` store, the in-memory snapshot and its refresher (ADR 0014) |
 | `src/proxy/` | Upstream client, request handler, metering lifecycle, SSE usage scanner |
 | `src/ledger/` | SQLite pool, schema, bounded write queue, crash recovery, retention |
 | `src/dashboard/` | Consumer-scoped REST API (plus the one manager widening, ADR 0011/0013) and the SSE invalidation stream |
 | `src/web/` | Embedded dashboard assets and the SPA fallback |
-| `src/admin/` | `/healthz`, `/readyz`, `/version` |
+| `src/admin/` | `/healthz`, `/readyz`, `/version`, and the manager-only API-key lifecycle |
 
 ## Startup
 
@@ -29,16 +30,24 @@ describes the code as it is, not as it was intended.
                                        + roll them up, in one IMMEDIATE transaction
                                        failure = exit (unknown orphans corrupt every view)
  5. LedgerWriter::new                  spawn the single writer task over a bounded queue
- 6. HotReloader::start                 hash the file once per second, swap on change
- 7. SseBroadcaster::new + start        dedicated poll connection (query_only) reading
+ 6. load_secret                        PARTNER_PORTAL_API_KEY_SECRET (>= 32 bytes), from the
+                                       environment; missing = exit (ADR 0014)
+ 7. ApiKeyStore::new + refresher       read the key set, build the in-memory snapshot, then
+                                       reload it every api_key_refresh_ms; a read failure =
+                                       exit, zero keys = warn and continue
+ 8. HotReloader::start                 hash the file once per second, swap on change
+ 9. SseBroadcaster::new + start        dedicated poll connection (query_only) reading
                                        PRAGMA data_version
- 8. spawn_retention                    first sweep immediately, then every interval
- 9. Router build                       admin + dashboard + /v1/* routes, then the SPA fallback
-10. TcpListener::bind, axum::serve     with_graceful_shutdown(shutdown_signal)
+10. spawn_retention                    first sweep immediately, then every interval
+11. Router build                       admin + dashboard + /v1/* routes, then the SPA fallback
+12. TcpListener::bind, axum::serve     with_graceful_shutdown(shutdown_signal)
 ```
 
 Steps 3–4 happen before the listener opens, so `in_flight` means what it says
-from the first request on (`src/main.rs`).
+from the first request on, and steps 6–7 happen before the router exists, so the
+process never serves a request while it cannot answer "who is this?" — a key set
+it cannot read is a start-up failure, not an instance that 401s everything
+(`src/main.rs`).
 
 ## Request lifecycle
 
@@ -46,7 +55,7 @@ from the first request on (`src/main.rs`).
 
 ```
   request ──▶ Authenticated extractor ──▶ ConsumerContext (consumer_id, key_name)
-              key found in the live config snapshot?  no ──▶ 401 (no-store)
+              HMAC of the key in the in-memory key snapshot?  no ──▶ 401 (no-store)
   ──▶ Endpoint::from_path(path)  ──▶ None ──▶ 404 JSON
   ──▶ Endpoint::Models ──▶ proxied, not metered, no ledger row,
                           body filtered to the key's allowed_models (ADR 0012)
@@ -152,12 +161,14 @@ unrecorded one (`src/main.rs`, `src/ledger/writer.rs::shutdown`).
 
 ## Data model
 
-Two tables, one source of truth, one derived rollup.
+Two tables of usage, one source of truth for credentials, one derived rollup —
+one file.
 
 | Table | Role | Written by |
 |---|---|---|
 | `usage_records` | The raw ledger: one row per accepted request | the writer task, once in `in_flight`, once at the terminal state |
 | `usage_hourly` | Derived hourly aggregate keyed by (hour, consumer, model, endpoint, streaming) | same transaction as the terminal raw write |
+| `api_keys` | The partner key set: keyed hash, prefix, consumer, model list, status, dates (ADR 0014) | the admin surface and `keygen`, never the request path |
 | `ledger_meta` | Schema version, last retention run, last recovery run | startup, recovery, retention |
 
 Timestamps are stored as fixed-width 30-character UTC strings
@@ -198,17 +209,23 @@ transient dependency turns a slow disk into a restart loop.
 Identity flows one way only:
 
 ```
-  Authorization: Bearer <local key>
+  Authorization: Bearer <partner key>
         │
-        ├─ exact match against keys[].key in the live config      (src/auth/middleware.rs)
-        │      no match ──▶ 401
+        ├─ HMAC-SHA256(secret, key) looked up in the in-memory     (src/auth/middleware.rs)
+        │  api_keys snapshot — no SQL on the request path          (src/apikeys/store.rs)
+        │      no match, revoked or expired ──▶ 401
         │
-        ├─ consumer_id = keys[].consumer_id, else keys[].name     (server-side, config-only)
+        ├─ consumer_id = api_keys.consumer_id                      (server-side, from the row)
         │
         ├─ ledger row: consumer_id column                          (src/proxy/handler.rs)
         │
         └─ every dashboard query: WHERE consumer_id = ?1           (src/dashboard/api.rs)
 ```
+
+The snapshot is rebuilt every `server.api_key_refresh_ms` — that interval is the
+bound on how long a sibling instance's revoke, or a key's own expiry, can lag
+behind; a mutation this instance performs refreshes it before the response
+(ADR 0014).
 
 The one deliberate widening is the optional `manager:` password
 (ADR 0011, as widened by ADR 0013). It is matched after the keys, opens

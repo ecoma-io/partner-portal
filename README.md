@@ -18,7 +18,8 @@ Status: pre-release (`0.1.0`), single-VPS deployment target.
 | A durable usage ledger (SQLite, WAL, `synchronous = FULL`) | A billing or pricing system: it records tokens and counts, never cost |
 | A local API-key authenticator that replaces the credential upstream | An identity provider, OIDC client or rate limiter |
 | An incremental streaming proxy (frames forwarded as they arrive) | A body transformer: requests and responses pass through verbatim |
-| A per-consumer usage dashboard, plus an optional operator password with a cross-consumer view (`manager:` in config) | A multi-tenant admin console: no key management, billing, or write surface exists |
+| A partner-key lifecycle of its own: issue, list, rename, restrict, rotate and revoke through `/api/admin/api-keys`, hashed in SQLite, plus a first-run `keygen` subcommand | A user directory or an identity provider: no account, no password reset, no role richer than "a partner key, or the manager password" |
+| A per-consumer usage dashboard, plus an optional operator password with a cross-consumer view (`manager:` in config) | A multi-tenant admin console: no billing, no tenancy model, and no write surface outside that key lifecycle |
 | A single static binary with the dashboard embedded | A TLS terminator: the listener is plain HTTP — put it behind something that speaks TLS |
 
 Three paths are proxied: `/v1/chat/completions`, `/v1/responses`, `/v1/models`.
@@ -35,8 +36,9 @@ or batch surface.
    ├──────────────────▶│  /v1/chat/completions   /v1/responses   /v1/models                   │
    │                   │        │                                                            │
    │                   │        ├─ Authenticated extractor ──▶ ConsumerContext                 │
-   │                   │        │     key looked up in the live config snapshot;               │
-   │                   │        │     identity derived server-side, never from the request      │
+   │                   │        │     the token is hashed and looked up in the in-memory key    │
+   │                   │        │     snapshot (no SQL on this path); identity derived           │
+   │                   │        │     server-side from the row, never from the request          │
    │                   │        │                                                            │
    │                   │        ├─ Endpoint::from_path ──▶ 404 for anything else               │
    │                   │        │                                                            │
@@ -82,14 +84,22 @@ log line exist and the response is the caller's only route to either.
 | `GET /api/dashboard/requests` | Bearer | — | Keyset-paginated raw rows (max 200 per page); `consumers=` narrows a manager |
 | `GET /api/dashboard/models` | Bearer | — | Distinct models this consumer used in the window; `consumers=` narrows a manager |
 | `GET /api/dashboard/events` | Bearer | — | SSE invalidation stream (`{"type":"data_changed"}`), no usage data |
+| `POST /api/admin/api-keys` | manager | — | Issue a key. The response is the **only** place its plaintext ever appears |
+| `GET /api/admin/api-keys` | manager | — | The key set: id, name, consumer, prefix, models, status, dates. Never a secret, never a hash; `?status=active\|revoked` narrows |
+| `GET /api/admin/api-keys/{id}` | manager | — | One key |
+| `PATCH /api/admin/api-keys/{id}` | manager | — | Rename it, or replace `allowed_models` |
+| `POST /api/admin/api-keys/{id}/rotate` | manager | — | Revoke the predecessor and issue the replacement in one transaction |
+| `POST /api/admin/api-keys/{id}/revoke` | manager | — | Stop it authenticating. Idempotent: revoking a revoked key is a success |
 | `GET /healthz` | none | — | Liveness |
 | `GET /readyz` | none | — | Readiness — 503 while shutting down or while the ledger is degraded |
 | `GET /version` | none | — | Version, commit, build time, schema version |
 
 Errors are OpenAI-shaped: `{"error":{"message":…,"type":…}}`, with
-`"code":"invalid_api_key"` on a rejected credential and `"code":"not_found"` on
-an unknown `/v1/*` or `/api/*` path. Auth failures are returned with
-`Cache-Control: no-store`.
+`"code":"invalid_api_key"` on a rejected credential, `"code":"not_found"` on an
+unknown `/v1/*` or `/api/*` path, and `"code":"manager_required"` when a partner
+key calls the admin surface (no credential at all is the same `401`
+`invalid_api_key` as anywhere else). Auth failures, and every admin response, are
+returned with `Cache-Control: no-store`.
 
 ## Quick start
 
@@ -98,24 +108,36 @@ an unknown `/v1/*` or `/api/*` path. Auth failures are returned with
 #    dashboard/dist the binary still builds and serves an explanation page.
 cargo build --release
 
-# 2. Configure.
+# 2. Configure. The file is deployment settings only: the upstream credential
+#    and the manager password. Partner keys are rows in the database, not here.
 cp config.example.yaml config.yaml
-$EDITOR config.yaml          # set upstream.base_url, upstream.api_key and at least one local key
+$EDITOR config.yaml          # set upstream.base_url and upstream.api_key
 
-# 3. Run. The listen address is the PARTNER_PORTAL_LISTEN environment
+# 3. The secret every stored key hash is derived from. Required: the process
+#    refuses to start without it, and `keygen` must be given the same value.
+#    Changing it later invalidates every issued key, so generate it once.
+export PARTNER_PORTAL_API_KEY_SECRET="$(openssl rand -base64 32)"
+
+# 4. First key. It prints the plaintext once and stores only a hash, so capture
+#    it now — no endpoint can show it again. (An operator with the config file
+#    can also issue keys over the admin API; `keygen` is the first-run path.)
+./target/release/partner-portal keygen --database ./partner-portal.db \
+    --name acme-production --consumer-id acme --allowed-model gpt-4o
+
+# 5. Run. The listen address is the PARTNER_PORTAL_LISTEN environment
 #    variable (default 0.0.0.0:8080) — a port belongs to the deployment, so it
 #    is set next to the config path, never in the YAML.
 PARTNER_PORTAL_CONFIG=config.yaml ./target/release/partner-portal
 
-# 4. First request.
+# 6. First request.
 curl -s localhost:8080/healthz
-curl -s -H "Authorization: Bearer <your-local-key>" \
+curl -s -H "Authorization: Bearer <the key keygen printed>" \
      -H 'content-type: application/json' \
      -d '{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}' \
      http://localhost:8080/v1/chat/completions
 
-# 5. Streaming: -N keeps the response incremental.
-curl -sN -H "Authorization: Bearer <your-local-key>" \
+# 7. Streaming: -N keeps the response incremental.
+curl -sN -H "Authorization: Bearer <the key keygen printed>" \
      -H 'content-type: application/json' \
      -d '{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hello"}]}' \
      http://localhost:8080/v1/chat/completions
@@ -167,6 +189,47 @@ returns to the login screen.
   grant). The password cannot call `/v1/*` — it is a dashboard credential only —
   and a key's `consumers=` parameter is ignored. See ADR 0011 and ADR 0013.
 
+## Managing partner keys
+
+**A partner key is a row in the database** — the same SQLite file as the usage
+ledger, in the `api_keys` table — and the database is the only source of truth
+for it. No configuration file holds one, and no configuration file has a field
+for one. This is [ADR 0014](docs/adr/0014-api-keys-live-in-the-database.md); the
+short version of what it means in practice:
+
+* **The stored value is a keyed hash.** A key is generated as 256 bits of OS
+  entropy (`pp_…`), and what the database keeps is
+  `HMAC-SHA256(PARTNER_PORTAL_API_KEY_SECRET, key)` plus a 12-character prefix for
+  an operator to recognise it by. The plaintext is printed once — by `keygen` on
+  stdout, or in the `key_secret` field of a create/rotate response — and is
+  unrecoverable after that: there is nothing to read back, so a lost key is
+  re-issued (rotate) rather than looked up.
+* **Authentication does not touch SQLite.** Each instance holds the active keys in
+  memory, keyed by their hash, and a request is a hash lookup on the presented
+  token. The instance refreshes that snapshot every `server.api_key_refresh_ms`
+  (default 1 s), which is the bound on how long a sibling's revoke or a key's
+  expiry can lag behind — and the reason expiry is honoured within a second
+  rather than at the instant.
+* **Two ways to issue a key.** `partner-portal keygen` on the host, which is the
+  first-run path and needs no running server (`--database` names the file when
+  there is no config to share), and `POST /api/admin/api-keys` on the running
+  stack, which is the same operation with an HTTP response. Both write the same
+  rows; the endpoints table above lists the rest of the lifecycle — `GET` (list),
+  `PATCH` (rename, change the model list), `rotate`, `revoke`.
+* **Only the manager password may call the admin surface.** A partner key gets
+  `403 manager_required` there; the manager password is refused on `/v1/*`. The
+  two credentials are disjoint by construction, so a partner key can never be a
+  path to another partner's identity, and the admin surface is never a way to
+  spend upstream tokens.
+* **A key survives restarts, container recreation and rolling updates** because
+  it is in the database, and the database is the thing a deployment persists —
+  `deploy/` mounts it on a named volume and the smoke tests assert a third
+  container on that volume accepts a key issued by the first. What does *not*
+  survive is a lost `PARTNER_PORTAL_API_KEY_SECRET`: every stored hash was derived
+  from it, so a changed secret invalidates every issued key at once, and a
+  database restored without it holds keys that authenticate nobody. It is a
+  deployment secret to generate once and keep with the backups.
+
 ## Configuration
 
 YAML, loaded from `PARTNER_PORTAL_CONFIG` or `./config.yaml`. It is re-read once
@@ -185,14 +248,11 @@ including every default. Summary:
 | `server.max_body_size` | `10485760` (10 MiB) | partly: the body-limit layer is built at startup, the per-request read follows the snapshot |
 | `server.cors_allow_origins` | `[]` (no CORS headers) | restart |
 | `server.sse_poll_interval_ms` | `500` | restart |
+| `server.api_key_refresh_ms` | `1000` | restart |
 | `upstream.base_url` | — (required, `http://`/`https://`) | live |
 | `upstream.api_key` | — (required, non-empty) | live |
 | `upstream.timeout_secs` | `120` | live |
 | `upstream.connect_timeout_secs` | `10` | restart |
-| `keys[].key` | — (required, unique, non-empty) | live |
-| `keys[].name` | — (required, non-empty) | live |
-| `keys[].consumer_id` | falls back to `name` | live |
-| `keys[].allowed_models` | `[]` (**strict: no models**) | live |
 | `manager.password` | — (optional; empty refuses to load) | live (hot reload) |
 | `database.path` | `partner-portal.db` | restart |
 | `database.retention_days` | `60` | restart for the sweep; live for the dashboard's window validation |
@@ -202,24 +262,38 @@ including every default. Summary:
 | `database.retention_interval_secs` | `3600` (min 60) | restart |
 | `database.retention_batch_size` | `2000` | restart |
 
-`upstream`, `keys` and each key's `key`/`name` are required; the server refuses to
-start with no keys, a duplicate key value, or a malformed upstream URL. Never
-logged: key values are never emitted — the reloader reports *that*
-`upstream.api_key` changed, never what it changed to.
+**No partner key is in this file, and there is no field to put one in.**
+`upstream.api_key` is required and non-empty, and a malformed upstream URL aborts
+startup; never logged, the reloader reports *that* `upstream.api_key` changed,
+never what it changed to. Keys are rows in the `api_keys` table — see
+[Managing partner keys](#managing-partner-keys) and
+[ADR 0014](docs/adr/0014-api-keys-live-in-the-database.md) — so a deployment's
+key set is a property of its *database*, and the configuration is only how the
+process runs.
 
-Two values are environment variables, not config: `PARTNER_PORTAL_CONFIG` names
-the file, and `PARTNER_PORTAL_LISTEN` is the listen address (default
-`0.0.0.0:8080`; unset or empty means the default). A port is a property of the
-*deployment* — it has to match the container port mapping, the health check and
-whatever fronts the process, none of which read this YAML — so it is set where
-those are set. An invalid value aborts startup, naming the variable and the
-rejected value.
+Three values are environment variables, not config: `PARTNER_PORTAL_CONFIG` names
+the file, `PARTNER_PORTAL_LISTEN` is the listen address (default `0.0.0.0:8080`;
+unset or empty means the default), and `PARTNER_PORTAL_API_KEY_SECRET` is the
+secret every stored key hash is derived from — required, at least 32 bytes, never
+in SQLite and never in a config file. A port is a property of the *deployment* —
+it has to match the container port mapping, the health check and whatever fronts
+the process, none of which read this YAML — so it is set where those are set. An
+invalid value aborts startup, naming the variable and the rejected value.
 
 **Upgrading a configuration that sets `server.listen`, `keys[].metadata` or
 `manager.consumers`:** all three are now unknown fields and fail to parse —
 delete them. A file like that read at boot aborts startup; reached by hot
 reload it is refused with the previous configuration still in force and a log
 line naming the field, so watch the log. See ADR 0013.
+
+**Upgrading from a build that kept keys in the YAML** — a `keys:` block is now an
+unknown field too, so the file must lose it before the new binary starts, and the
+keys themselves have to be registered in the database before an instance that
+needs them takes traffic. `keygen --plaintext` registers a plaintext you already
+have, so a partner is not re-issued one by a change of storage; the upgrade is one
+command per key, and a database that has never seen this build arrives with an
+empty `api_keys` table and logs a warning rather than failing. See ADR 0014's
+consequences.
 
 ## Accounting and durability
 
@@ -273,7 +347,7 @@ data frame (`src/proxy/handler.rs`, `src/proxy/sse_scan.rs`).
 
 **The dashboard cannot see across consumers — except by the one configured
 operator password.** Consumer identity is derived server-side from the
-presented credential and the live config, and every dashboard query is filtered
+presented credential and the key row it matches, and every dashboard query is filtered
 by that value. No request field contributes to identity, so there is nothing for
 a client to tamper with (`src/auth/middleware.rs`, `src/dashboard/api.rs`). The
 single deliberate widening is the optional `manager:` password block, which
@@ -361,8 +435,10 @@ deletes its rows, the file never shrinks, and startup says so once. A one-off
 ### Logs
 
 `tracing` to stdout, filtered by `RUST_LOG` (`partner_portal=info` and
-`tower_http=info` by default). Config reloads report which fields moved; key
-values and upstream credentials are never logged. `SetSensitiveHeadersLayer`
+`tower_http=info` by default). Config reloads report which fields moved; upstream
+credentials are never logged, and neither is a partner key — the startup line
+reports how many keys are loaded (and their prefixes), a mutation logs an id and
+a consumer, and no path anywhere formats a plaintext key. `SetSensitiveHeadersLayer`
 marks `Authorization` unrenderable before anything inside the stack can log it.
 
 ## Deployment
@@ -451,9 +527,18 @@ Log in with `dev-key` (consumer `acme`), `dev-key-beta` (consumer `beta`), or
 `dev-manager` (every consumer, ADR 0013). Two keys share the `acme` consumer
 deliberately, so the dashboard shows what a key rotation looks like.
 
+Those three are **rows in the dev ledger**, not lines in a config file: the dev
+config has no `keys:` block, and `scripts/dev-seed-keys.sh` registers them with
+`keygen --plaintext` — into a database `dev-up.sh` has just created, or into an
+existing one (the call is idempotent, so a key already there is left alone rather
+than duplicated). It is also the smallest worked example of the bootstrap path a
+deployment uses. The script prints the plaintexts it seeded for the banner; the
+list lives in the one place that can know them.
+
 The dev ledger is `target/dev/partner-portal-dev.db` and is **kept** between
 runs — `scripts/dev-up.sh --reset` or `scripts/dev-down.sh --purge` to start
-clean.
+clean. A `--reset` therefore also drops the keys, and `dev-up.sh` reseeds them
+as part of the reset rather than leaving a loop that answers `401` everywhere.
 
 #### Looking at the dashboard with something in it
 

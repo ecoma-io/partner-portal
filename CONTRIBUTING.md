@@ -228,7 +228,15 @@ file and there is no migration directory — and `SCHEMA_VERSION` in
    does not get your change. A new nullable column or a new table is invisible to
    old code (safe in both directions during a rolling update); a changed `CHECK`,
    a `NOT NULL` addition, or a renamed column is not, and needs a documented path
-   — including what an operator running two instances does.
+   — including what an operator running two instances does. `api_keys`
+   ([ADR 0014](docs/adr/0014-api-keys-live-in-the-database.md),
+   `SCHEMA_VERSION` 4 → 5) is the worked example of the safe case: a table no
+   previous binary reads at all, so it is created empty on the next start and
+   nothing about the old instance's behaviour changes. What it did need is the
+   part a table-only change can still get wrong: the *operational* consequence
+   (a deployment arrives with no keys and every partner 401s until one is
+   provisioned) belongs in the pull request and in `deploy/`, and
+   `scripts/schema-check.sh` is what proves the fresh-database path still works.
 4. Update **both** write paths: `src/ledger/writer.rs` (the live path) and
    `src/ledger/recovery.rs` (the crash path). A column one of them does not know
    about is a difference between a clean shutdown and a crash, which is the

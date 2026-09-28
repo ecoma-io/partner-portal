@@ -1159,6 +1159,7 @@ dependencies = [
  "libc",
  "memchr",
  "parking_lot",
+ "partner-portal",
  "pin-project-lite",
  "pretty_assertions",
  "proptest",

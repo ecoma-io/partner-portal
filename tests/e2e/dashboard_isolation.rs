@@ -12,42 +12,31 @@ use crate::harness::*;
 /// invisible to a unit test of the store.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() {
-    const KEY_A: &str = "key-alpha";
-    const KEY_B: &str = "key-beta";
-
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("ledger.db");
     let (mock, upstream) = start_mock_upstream().await;
 
-    let port = free_port();
-    let config_path = dir.path().join("config.yaml");
-    write_config_multi(
-        &config_path,
+    // Two keys, two consumers. This used to need a hand-rolled spawn because
+    // `Instance::start` could only express one key — the key list lived in the
+    // config file, and expressing two of them meant writing a different config
+    // writer and driving `Command::new` by hand. Keys are database rows now, so
+    // the ordinary harness seeds as many as the test needs.
+    let instance = Instance::start_with(
+        "a",
+        dir.path(),
         &db_path,
         &upstream,
-        &[(KEY_A, "alpha-key", "alpha"), (KEY_B, "beta-key", "beta")],
+        &[
+            SeedKey::new("alpha-key", "alpha"),
+            SeedKey::new("beta-key", "beta"),
+        ],
     );
-
-    let child = Command::new(binary_path())
-        .env("PARTNER_PORTAL_CONFIG", &config_path)
-        .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{port}"))
-        .env("RUST_LOG", "warn")
-        .current_dir(dir.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn partner-portal");
-
-    let instance = Instance {
-        child,
-        port,
-        config_path,
-    };
     assert!(
         instance.wait_ready(WAIT).await,
         "instance never became ready"
     );
+    let key_a = instance.key_at(0).to_string();
+    let key_b = instance.key_at(1).to_string();
     let base = instance.base_url();
 
     let client = ProxyClient::new();
@@ -56,7 +45,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     for i in 0..3 {
         assert_eq!(
             client
-                .chat_with_key(&base, &format!("alpha-{i}"), KEY_A)
+                .chat_with_key(&base, &format!("alpha-{i}"), &key_a)
                 .await,
             Ok(200)
         );
@@ -64,7 +53,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     for i in 0..2 {
         assert_eq!(
             client
-                .chat_with_key(&base, &format!("beta-{i}"), KEY_B)
+                .chat_with_key(&base, &format!("beta-{i}"), &key_b)
                 .await,
             Ok(200)
         );
@@ -84,7 +73,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     assert_eq!(mock.models_seen().len(), 5);
 
     // --- Identity comes from the key, never from the request -----------------
-    let (status, body) = client.get(&base, "/api/me", Some(KEY_A)).await;
+    let (status, body) = client.get(&base, "/api/me", Some(&key_a)).await;
     assert_eq!(status, 200, "GET /api/me failed: {body}");
     let me: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(me["consumer_id"], "alpha");
@@ -92,7 +81,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
 
     // A header claiming to be someone else is not an identity.
     let (status, body) = client
-        .get_with_headers(&base, "/api/me", Some(KEY_A), &[("x-consumer-id", "beta")])
+        .get_with_headers(&base, "/api/me", Some(&key_a), &[("x-consumer-id", "beta")])
         .await;
     assert_eq!(status, 200);
     let me: Value = serde_json::from_str(&body).unwrap();
@@ -103,7 +92,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
 
     // --- Summary is scoped to the authenticated consumer --------------------
     let (status, body) = client
-        .get(&base, "/api/dashboard/summary", Some(KEY_A))
+        .get(&base, "/api/dashboard/summary", Some(&key_a))
         .await;
     assert_eq!(status, 200, "GET summary failed: {body}");
     let summary: Value = serde_json::from_str(&body).unwrap();
@@ -120,7 +109,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     assert_eq!(summary["total_cached_tokens"], 6);
 
     let (_, body) = client
-        .get(&base, "/api/dashboard/summary", Some(KEY_B))
+        .get(&base, "/api/dashboard/summary", Some(&key_b))
         .await;
     let beta_summary: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
@@ -136,7 +125,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
         "/api/dashboard/requests?consumer_id=beta",
         "/api/dashboard/requests?consumer_id=alpha",
     ] {
-        let (status, body) = client.get(&base, probe, Some(KEY_A)).await;
+        let (status, body) = client.get(&base, probe, Some(&key_a)).await;
         assert_eq!(status, 200, "GET {probe} failed: {body}");
         let page: Value = serde_json::from_str(&body).unwrap();
         let models: Vec<String> = page["data"]
@@ -163,7 +152,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
         .get(
             &base,
             "/api/dashboard/timeseries?consumer_id=beta",
-            Some(KEY_A),
+            Some(&key_a),
         )
         .await;
     assert_eq!(status, 200, "GET timeseries failed: {body}");
@@ -194,7 +183,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
         let request = hyper::Request::builder()
             .method("GET")
             .uri(format!("{base}/api/dashboard/events"))
-            .header("authorization", format!("Bearer {KEY_A}"))
+            .header("authorization", format!("Bearer {key_a}"))
             .body(
                 Full::new(Bytes::new())
                     .map_err(|never| match never {})
@@ -240,7 +229,7 @@ async fn dashboard_is_isolated_per_key_and_ignores_a_client_supplied_identity() 
     );
 
     // A 404 under /api/* must be JSON, not the SPA's HTML.
-    let (status, body) = client.get(&base, "/api/nope", Some(KEY_A)).await;
+    let (status, body) = client.get(&base, "/api/nope", Some(&key_a)).await;
     assert_eq!(status, 404);
     assert!(
         body.contains("application/json") || body.trim_start().starts_with('{'),

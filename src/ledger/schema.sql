@@ -93,6 +93,51 @@ CREATE TABLE IF NOT EXISTS usage_hourly (
 CREATE INDEX IF NOT EXISTS idx_usage_hourly_hour ON usage_hourly(hour);
 CREATE INDEX IF NOT EXISTS idx_usage_hourly_consumer_hour ON usage_hourly(consumer_id, hour);
 
+-- Partner API keys. This table is the source of truth for who may call the
+-- proxy; `config.yaml` carries no keys (ADR 0014).
+--
+-- The plaintext is NEVER stored. `key_hash` is hex(HMAC-SHA256(secret, key))
+-- where `secret` is `PARTNER_PORTAL_API_KEY_SECRET` from the runtime
+-- environment — keyed, not a bare digest, so a stolen database cannot be
+-- brute-forced offline without it. `key_prefix` is the first few characters of
+-- the plaintext and exists so an operator can identify a key in a list; it is
+-- not a secret and is not used to authenticate anything.
+--
+-- `allowed_models` is a JSON array so the whole allow-list is one column and
+-- one value; the `rusqlite` serde_json feature binds a Vec<String> directly.
+-- An empty array denies every model, which is the strict default.
+--
+-- `status` is two-state on purpose. Expiry is not a third state: a key past
+-- `expires_at` is simply not loaded into the authentication snapshot, so the
+-- question "is this key still good" is answered by one predicate at load time
+-- instead of by a clock check on the request path.
+CREATE TABLE IF NOT EXISTS api_keys (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    name           TEXT NOT NULL,
+    -- The identity every ledger row is scoped by. Taken from the credential,
+    -- never from the request (ADR 0008).
+    consumer_id    TEXT NOT NULL,
+    key_prefix     TEXT NOT NULL,
+    key_hash       TEXT NOT NULL,
+    allowed_models TEXT NOT NULL DEFAULT '[]',
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL,
+    expires_at     TEXT,
+    revoked_at     TEXT,
+
+    UNIQUE (key_hash),
+    CHECK (status IN ('active', 'revoked')),
+    -- A revoked key must say when it was revoked, and a live one must not carry
+    -- a revocation that never happened.
+    CHECK ((status = 'active' AND revoked_at IS NULL)
+        OR (status = 'revoked' AND revoked_at IS NOT NULL)),
+    -- No model name may be blank; the allow-list is compared literally.
+    CHECK (json_valid(allowed_models) AND json_type(allowed_models) = 'array')
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(status);
+
 -- Metadata table for tracking schema version and maintenance.
 --
 -- `schema_version` is deliberately NOT seeded here. `init_schema` reads whatever

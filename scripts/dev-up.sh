@@ -3,6 +3,7 @@
 # dev-up.sh — start the three processes a dev loop needs, and stop being the
 # thing you have to remember.
 #
+#   0. dev-seed-keys.sh           the three partner keys, into the dev ledger
 #   1. dev/mock-upstream-dev.py   the stub upstream, on 9100
 #   2. the proxy                   a native binary, on 8080
 #   3. the dashboard               vite dev server, on 5173
@@ -24,6 +25,9 @@
 # The ledger is kept at target/dev/partner-portal-dev.db and is *not* reset:
 # the load script is meant to build up a history worth paging through. Pass
 # --reset to start clean.
+#
+# The partner keys are rows in that ledger, not lines in the config file, so a
+# `--reset` run re-seeds them (dev-seed-keys.sh) before the proxy starts.
 #
 # POSIX sh, not bash: /bin/sh is dash on Debian, and a script that only runs
 # under bash is a script that only runs on the machine where it was written.
@@ -121,7 +125,19 @@ fi
 
 mkdir -p "$LOG_DIR"
 if [ "$RESET" = "1" ]; then
-  rm -f "$RUN_DIR"/partner-portal-dev.db*
+  rm -f "$DEV_DB"* "$DEV_DB-shm" "$DEV_DB-wal"
+fi
+
+# --- the keys ---------------------------------------------------------------
+
+# Before the proxy, not after. Keys are database rows now (ADR 0014) and
+# `keygen` applies the schema itself, so seeding first means the proxy's start-up
+# snapshot already holds them — no login races the seed, and a `--reset` run
+# comes back with working credentials rather than a warning about an empty key
+# set. Safe to run every time: it leaves keys that are already there.
+if ! "$REPO_ROOT/scripts/dev-seed-keys.sh"; then
+  echo "dev-up: seeding the dev keys failed; not starting the stack." >&2
+  exit 1
 fi
 
 : > "$PIDS_FILE"
@@ -137,6 +153,21 @@ if ! start_stub; then
 fi
 
 if ! start_proxy; then
+  "$REPO_ROOT/scripts/dev-down.sh" >/dev/null 2>&1
+  exit 1
+fi
+
+# The keys were written to $DEV_DB by a separate process; the proxy is the
+# authority on whether it read that same file with that same secret. A mismatch
+# (a changed `database.path` in the dev config, a different secret on one side)
+# would otherwise show up much later as a login that fails for no visible
+# reason, so it is checked here and named.
+if ! curl -fsS --max-time 5 -H "Authorization: Bearer $DEV_KEY" \
+     "http://127.0.0.1:$PROXY_PORT/api/me" >/dev/null 2>&1; then
+  echo "dev-up: the proxy is running but refuses '$DEV_KEY'." >&2
+  echo "  The keys are in $DEV_DB and the proxy reads '$DEV_CONFIG'." >&2
+  echo "  Check that database.path there names the same file, then:" >&2
+  echo "    scripts/dev-up.sh --reset" >&2
   "$REPO_ROOT/scripts/dev-down.sh" >/dev/null 2>&1
   exit 1
 fi
@@ -166,6 +197,9 @@ echo "    log in with"
 echo "      dev-key         consumer 'acme'        (or dev-key-2 — same view, by design)"
 echo "      dev-key-beta    consumer 'beta'"
 echo "      dev-manager     every consumer        (ADR 0013)"
+echo
+echo "    (those three are ledger rows, written by scripts/dev-seed-keys.sh;"
+echo "     the dashboard's own key list is at /api/admin/api-keys)"
 echo
 echo "    load        scripts/dev-load.sh"
 echo "    restart     scripts/dev-restart.sh     (after a Rust edit; the dashboard keeps HMR)"

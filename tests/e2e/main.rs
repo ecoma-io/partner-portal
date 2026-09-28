@@ -17,6 +17,7 @@
 //! | `hot_reload` | a config change lands within ~1s; a broken one is refused |
 //! | `dashboard_isolation` | a key sees only its own usage; the client cannot choose its identity |
 //! | `cross_instance_sse` | an instance notifies about a write another process made |
+//! | `api_key_refresh` | a key revoked or issued on one instance reaches the other within the refresh interval |
 //! | `shutdown` | a graceful shutdown completes and commits everything it accepted |
 //!
 //! The files share the harness in `harness.rs`. `#![allow(dead_code)]` is on it
@@ -24,6 +25,7 @@
 
 mod harness;
 
+mod api_key_refresh;
 mod cross_instance_sse;
 mod dashboard_isolation;
 mod hot_reload;

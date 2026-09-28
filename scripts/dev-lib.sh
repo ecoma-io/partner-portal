@@ -45,6 +45,39 @@ PIDS_FILE="$RUN_DIR/pids"
 DEV_CONFIG="dev/partner-portal.dev.yaml"
 STUB="dev/mock-upstream-dev.py"
 
+# The dev ledger file, named here once so `dev-up.sh --reset` (which deletes
+# it), `dev-seed-keys.sh` (which writes keys into it) and the proxy (which opens
+# it) cannot disagree. It is the same path `database.path` names in
+# `$DEV_CONFIG`; `dev-up.sh` verifies that by authenticating a key after the
+# proxy is up, because a mismatch here would otherwise surface as a login that
+# silently fails.
+DEV_DB="$RUN_DIR/partner-portal-dev.db"
+
+# The secret every API-key hash in the dev database is keyed by.
+#
+# The production deployment supplies this from its own environment (it is
+# never stored in the database and never written to a config file — ADR 0014),
+# and the dev loop is no exception: it just uses a literal, because this
+# database is a throwaway whose keys are the word `dev-key`. The one property
+# that matters here is that the *proxy* and the *seed script* agree on it, so
+# both read it from this one variable. A different secret on either side
+# produces keys that authenticate nowhere, which is exactly the failure the
+# one-variable rule prevents.
+# Override with DEV_API_KEY_SECRET to run a loop with a different secret — and
+# expect every existing dev key to stop authenticating when you do, because the
+# stored hashes were keyed by the old one.
+DEV_API_KEY_SECRET="${DEV_API_KEY_SECRET:-dev-api-key-secret-not-a-real-one!!}"
+PARTNER_PORTAL_API_KEY_SECRET="$DEV_API_KEY_SECRET"
+export PARTNER_PORTAL_API_KEY_SECRET
+
+# The three dev keys, and the models each may call. Both are read here rather
+# than in one script so `dev-seed-keys.sh` (which writes them) and `dev-up.sh`
+# (which prints them) cannot drift apart.
+DEV_KEY="dev-key"
+DEV_KEY_2="dev-key-2"
+DEV_BETA_KEY="dev-key-beta"
+DEV_MODELS="gpt-4o gpt-4o-mini claude-sonnet-4-20250514 gpt-4.1"
+
 STUB_PORT="${DEV_STUB_PORT:-9100}"
 PROXY_PORT="${DEV_PROXY_PORT:-8080}"
 DASHBOARD_PORT="${DEV_DASHBOARD_PORT:-5173}"

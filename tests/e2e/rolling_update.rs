@@ -17,6 +17,7 @@ async fn rolling_update_loses_nothing_and_duplicates_nothing() {
 
     // --- A running, serving traffic ----------------------------------------
     let mut a = Instance::start("a", dir.path(), &db_path, &upstream);
+    let key = a.key().to_string();
     assert!(
         a.wait_healthy(WAIT).await,
         "instance A never became healthy"
@@ -25,7 +26,7 @@ async fn rolling_update_loses_nothing_and_duplicates_nothing() {
 
     let rotation = Rotation::new();
     rotation.add(a.base_url());
-    let traffic = rotation.run(4, ProxyClient::new());
+    let traffic = rotation.run(4, ProxyClient::new(), key.clone());
 
     // Let A settle into serving.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -36,7 +37,7 @@ async fn rolling_update_loses_nothing_and_duplicates_nothing() {
     );
 
     // --- Start B, wait for it to be healthy and ready ----------------------
-    let mut b = Instance::start("b", dir.path(), &db_path, &upstream);
+    let mut b = Instance::start_existing("b", dir.path(), &db_path, &upstream, vec![key.clone()]);
     assert!(
         b.wait_healthy(WAIT).await,
         "instance B never became healthy"
@@ -154,7 +155,8 @@ async fn sigterm_with_a_request_in_flight_keeps_the_ledger_consistent() {
 
     let client = ProxyClient::new();
     let base = instance.base_url();
-    let request = tokio::spawn(async move { client.chat(&base, "model-in-flight").await });
+    let key = instance.key().to_string();
+    let request = tokio::spawn(async move { client.chat(&base, "model-in-flight", &key).await });
 
     // Give the request time to be accepted and forwarded.
     tokio::time::sleep(Duration::from_millis(600)).await;
@@ -200,15 +202,18 @@ async fn killed_instance_requests_are_recovered_not_left_in_flight() {
     let db_path = dir.path().join("ledger.db");
     let (mock, upstream) = start_mock_upstream().await;
 
-    {
+    let key = {
         let mut instance = Instance::start("a", dir.path(), &db_path, &upstream);
         assert!(instance.wait_ready(WAIT).await);
+        let key = instance.key().to_string();
 
         mock.set_hang(true);
 
         let client = ProxyClient::new();
         let base = instance.base_url();
-        let request = tokio::spawn(async move { client.chat(&base, "model-killed").await });
+        let request_key = key.clone();
+        let request =
+            tokio::spawn(async move { client.chat(&base, "model-killed", &request_key).await });
 
         tokio::time::sleep(Duration::from_millis(600)).await;
 
@@ -216,7 +221,8 @@ async fn killed_instance_requests_are_recovered_not_left_in_flight() {
         instance.child.kill().unwrap();
         let _ = instance.child.wait();
         let _ = tokio::time::timeout(Duration::from_secs(10), request).await;
-    }
+        instance.key().to_string()
+    };
 
     // The record is committed and stuck in_flight: nothing has resolved it.
     {
@@ -236,7 +242,7 @@ async fn killed_instance_requests_are_recovered_not_left_in_flight() {
 
     // Restart: recovery runs before the listener opens.
     mock.set_hang(false);
-    let mut restarted = Instance::start("b", dir.path(), &db_path, &upstream);
+    let mut restarted = Instance::start_existing("b", dir.path(), &db_path, &upstream, vec![key]);
     assert!(restarted.wait_ready(WAIT).await);
 
     let ledger = read_ledger(&db_path);
@@ -281,15 +287,17 @@ async fn repeated_overlap_windows_never_duplicate_or_lose_a_record() {
         let (mock, upstream) = start_mock_upstream().await;
 
         let mut a = Instance::start("a", dir.path(), &db_path, &upstream);
+        let key = a.key().to_string();
         assert!(a.wait_ready(WAIT).await, "run {run}: A never became ready");
 
         let rotation = Rotation::new();
         rotation.add(a.base_url());
-        let traffic = rotation.run(6, ProxyClient::new());
+        let traffic = rotation.run(6, ProxyClient::new(), key.clone());
 
         // Start B while A is already busy, so the overlap begins under load.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let mut b = Instance::start("b", dir.path(), &db_path, &upstream);
+        let mut b =
+            Instance::start_existing("b", dir.path(), &db_path, &upstream, vec![key.clone()]);
         assert!(b.wait_ready(WAIT).await, "run {run}: B never became ready");
 
         rotation.add(b.base_url());

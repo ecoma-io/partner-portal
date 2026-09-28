@@ -24,6 +24,16 @@
 # does not list is refused 404 `model_not_found` before the upstream is
 # contacted, and leaves every counter above untouched.
 #
+# Finally, because the key set is a database (docs/adr/0014) and not a line in the
+# config, it exercises the operations that replaced the config rewrite this script
+# used to perform on itself: `partner-portal keygen` seeds the key into the shared
+# volume before the stack starts; the manager password reaches the admin surface
+# while the partner key is refused there; a `PATCH` narrows the key's model list
+# and the very next request against that instance is refused by the gate, with no
+# restart and no waiting; widening it serves again; and the key still
+# authenticates after an instance restart, because it lives on the volume rather
+# than in the file both instances mount.
+#
 # Usage:
 #   PARTNER_PORTAL_IMAGE=partner-portal:local ./smoke-test.sh
 #
@@ -44,22 +54,51 @@ PORTAL_B_PORT="${PORTAL_B_PORT:-8082}"
 export EDGE_PORT PORTAL_A_PORT PORTAL_B_PORT
 
 # Which file inside ./config the instances load. This must be the smoke config:
-# the production one holds a placeholder partner key and points at the real
-# api.openai.com, so a stack that loaded it would reject every authenticated
-# request here *and* would have been one restart away from making live calls.
+# the production one points at the real api.openai.com, so a stack that loaded it
+# would reject every request here *and* would have been one restart away from
+# making live calls.
 PARTNER_PORTAL_CONFIG_FILE="${PARTNER_PORTAL_CONFIG_FILE:-partner-portal.smoke.yaml}"
 export PARTNER_PORTAL_CONFIG_FILE
+
+# The volume the instances share, and the database on it (docs/adr/0014: the
+# ledger holds the partner keys as well as the usage). Named exactly as
+# docker-compose.yml names it and overridable the same way rolling-update.sh
+# overrides it, so the key this script seeds is the key the stack loads.
+DATA_VOLUME="${PARTNER_PORTAL_DATA_VOLUME:-partner-portal-deploy_portal-data}"
+DB_PATH="/var/lib/partner-portal/partner-portal.db"
+
+# The secret the key hashes are keyed with. It must not change between runs —
+# this script seeds into a volume that outlives it, and a hash written under one
+# secret is not verifiable under another — so it is a fixed fixture here, exactly
+# like `smoke-upstream-key`, and overridable for a CI job that supplies its own.
+# compose refuses to start without it (`:?` in docker-compose.yml), which is why
+# it is exported rather than merely set.
+API_KEY_SECRET="${PARTNER_PORTAL_API_KEY_SECRET:-smoke-api-key-secret-not-a-real-one!!}"
+export PARTNER_PORTAL_API_KEY_SECRET="$API_KEY_SECRET"
 
 EDGE="http://127.0.0.1:${EDGE_PORT}"
 PORTAL_A="http://127.0.0.1:${PORTAL_A_PORT}"
 PORTAL_B="http://127.0.0.1:${PORTAL_B_PORT}"
-KEY="smoke-key"
+# Longer than KEY_PREFIX_LEN on purpose: a real key is `pp_` plus 43 characters,
+# and a key *shorter* than the prefix length is stored whole in `key_prefix`, which
+# would make "the listing does not contain the secret" impossible to assert — the
+# prefix would be the secret.
+KEY="smoke-key-please-replace"
+# The consumer the seeded key belongs to, and the manager password the smoke
+# config sets. Neither is a credential the deployment ships with: both are
+# fixtures for this script, like `smoke-upstream-key`.
+KEY_CONSUMER="partner-smoke"
+MANAGER="smoke-manager"
 # Unique per run, so a leftover ledger from an earlier run cannot be mistaken for
 # traffic produced by this one.
 MODEL="smoke-$(date +%s)"
 # The traffic-switch burst gets its own name off the same stamp: its three rows
 # must stay separable from the main burst's in every ledger query below.
 SWITCH_MODEL="$MODEL-switch"
+# The model the admin-API section below is about: in the key's list when the stack
+# starts, dropped by a PATCH and added back by another, and never in the same
+# query as the two above — its rows are counted on their own.
+GATE_MODEL="$MODEL-gate"
 # Refused by the gate: in no allow-list, so the smoke proves the refusal without
 # ever being able to reach the upstream under it.
 REFUSED_MODEL="$MODEL-not-allowed"
@@ -75,16 +114,14 @@ STATUS_FILE="$(mktemp)"
 
 # The file that decides which instances the edge routes to, and a copy of it to
 # restore on exit.
+#
+# It is now the *only* repository file this script edits: the config the
+# instances load is not amended any more, because the key's model list is a row
+# in the database and is changed through the admin API (docs/adr/0014). Nothing
+# writes `config/`, so nothing has to be restored there.
 UPSTREAM_CONF="nginx/upstream.d/upstream.conf"
 UPSTREAM_CONF_BACKUP="$(mktemp)"
 cp "$UPSTREAM_CONF" "$UPSTREAM_CONF_BACKUP"
-
-# The file the instances load, and a copy of it to restore on exit — the preflight
-# below amends it with this run's model names, and a failed run must not leave
-# those behind, the same way it must not leave one instance out of rotation.
-SMOKE_CONF="config/${PARTNER_PORTAL_CONFIG_FILE}"
-SMOKE_CONF_BACKUP="$(mktemp)"
-cp "$SMOKE_CONF" "$SMOKE_CONF_BACKUP"
 
 failures=0
 say() { printf '\n=== %s\n' "$*"; }
@@ -135,6 +172,31 @@ print(json.load(urllib.request.urlopen("http://127.0.0.1:9000/__count"))["infere
 ' | tr -d '\r'
 }
 
+# The state of the smoke key's row, as stored: `active`, `revoked`, or `absent`
+# when there is no row (or no database yet). Read through a throwaway container on
+# the shared volume, read-only, so the assertion comes from the ledger the
+# instances write rather than from an API that filters.
+#
+# `< 12 characters is the whole prefix`: the smoke key is shorter than
+# KEY_PREFIX_LEN, so the stored prefix *is* the key — which is what makes it
+# findable here, and is also why a real deployment's keys are generated long.
+key_state() {
+    docker run --rm \
+        -v "$DATA_VOLUME:/data" \
+        python:3.13-alpine python -c '
+import sqlite3, sys
+try:
+    conn = sqlite3.connect("file:/data/partner-portal.db?mode=ro", uri=True, timeout=10)
+    row = conn.execute(
+        "SELECT status FROM api_keys WHERE key_prefix = ? LIMIT 1", (sys.argv[1],)
+    ).fetchone()
+except sqlite3.Error:
+    print("absent")
+    sys.exit(0)
+print("absent" if row is None else row[0])
+' "${KEY:0:12}"
+}
+
 # The ledger *records* an instance reports it has committed since it started.
 # Cumulative for the life of the process, so it only means anything as a delta
 # taken around the traffic this test generates — and a *restart* resets it, which
@@ -156,14 +218,12 @@ ledger_records() {
 }
 
 cleanup() {
-    # The traffic-switch check rewrites the upstream that is in rotation, and the
-    # preflight amends the smoke config with this run's model names; both
-    # repository copies are restored even if the script fails part-way, so a
-    # failed run can leave neither the deployment pointing at one instance nor
-    # a stale allow-list behind.
+    # The traffic-switch check rewrites the upstream that is in rotation, so the
+    # repository copy is restored even if the script fails part-way: a failed run
+    # must not leave the deployment pointing at one instance. Nothing else in the
+    # repository is written by this run.
     cp "$UPSTREAM_CONF_BACKUP" "$UPSTREAM_CONF"
-    cp "$SMOKE_CONF_BACKUP" "$SMOKE_CONF"
-    rm -f "$BODY_FILE" "$STATUS_FILE" "$UPSTREAM_CONF_BACKUP" "$SMOKE_CONF_BACKUP"
+    rm -f "$BODY_FILE" "$STATUS_FILE" "$UPSTREAM_CONF_BACKUP"
 }
 trap cleanup EXIT
 
@@ -272,33 +332,62 @@ if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
 fi
 ok "image $IMAGE present"
 
-# The instances must be started on this run's amended config, not hot-reload it
-# mid-run: the model gate (docs/adr/0012) reads the allow-list that the preflight
-# is about to write, and a burst sent before the reload lands would 404. Taking
-# the stack down first makes the start deterministic whether or not a previous
-# run left one behind — without `-v`: the ledger volume survives, which is
-# exactly why MODEL is unique per run.
+# The instances must start with the key set this run expects, not pick it up
+# mid-run: the model gate (docs/adr/0012) reads the allow-list, and a burst sent
+# before the snapshot refresh lands would 404. Taking the stack down first makes
+# the start deterministic whether or not a previous run left one behind — without
+# `-v`: the volume survives, which is exactly why MODEL is unique per run.
+#
+# Down before the key is seeded, too: the seed belongs to a stopped deployment,
+# and an instance that is running would load a half-built key set for no reason.
 "${COMPOSE[@]}" down --remove-orphans >/dev/null
 
-# This run's two burst names appended to the smoke key's `allowed_models`. The
-# committed fixture still lists exactly what the deployment serves (`mock-model`),
-# so `/v1/models` keeps answering the upstream's filtered list; the appended
-# entries exist only so the burst's unique names pass the gate. The rewrite is
-# in-place through the existing file, not a rename over it: the instances run as
-# uid 10001 and read the bind-mounted file directly, so the mode the fixture
-# carries (0644) must survive the edit — a `mktemp`d file renamed over it would
-# land as 0600 and the config load would die on EACCES.
-conf_tmp="$(mktemp)"
-awk -v model="$MODEL" -v switch_model="$SWITCH_MODEL" '
-    { print }
-    /^ *allowed_models:/ {
-        print "      - \"" model "\""
-        print "      - \"" switch_model "\""
-    }
-' "$SMOKE_CONF" >"$conf_tmp"
-cat "$conf_tmp" >"$SMOKE_CONF"
-rm -f "$conf_tmp"
-ok "smoke key lists this run's models: $MODEL, $SWITCH_MODEL"
+# The key this run authenticates with, seeded into the shared volume with the
+# image's own `keygen` — the first-run step deploy/README.md documents, and the
+# reason the smoke config carries no `keys:` block (docs/adr/0014). It is the
+# same binary the deployment runs, which is also what makes this a test of the
+# image's provisioning path.
+#
+# It runs before any container has mounted the volume, and that is deliberate: on
+# first creation Docker seeds an empty named volume with the image's own directory
+# ownership (uid 10001, mode 0750), and only a container that has
+# /var/lib/partner-portal in its image can do that. A reader started first would
+# create the volume root-owned and the deployment would then fail to open its own
+# database.
+#
+# The key is issued with exactly the models the deployment serves plus this run's,
+# in one call: the bundled mock answers one model, and the run's own unique names
+# are not knowable to a hot reload, so they are part of the key rather than a file
+# edit. The `PATCH` section below then changes that list through the API — the
+# operation this script exists to exercise.
+if seed_report="$(docker run --rm \
+    -v "$DATA_VOLUME:/var/lib/partner-portal" \
+    -e "PARTNER_PORTAL_API_KEY_SECRET=$API_KEY_SECRET" \
+    "$IMAGE" keygen \
+    --database "$DB_PATH" \
+    --name partner-smoke \
+    --consumer-id "$KEY_CONSUMER" \
+    --plaintext "$KEY" \
+    --allowed-model mock-model \
+    --allowed-model "$MODEL" \
+    --allowed-model "$SWITCH_MODEL" \
+    --allowed-model "$GATE_MODEL" 2>&1)"; then
+    ok "seeded the smoke key into $DATA_VOLUME with $IMAGE's keygen"
+else
+    # The volume outlives this script, so a second run finds the key already
+    # there — and a UNIQUE failure on the stored hash is how that surfaces. The
+    # state is read rather than assumed, because a *revoked* key collides the
+    # same way and means something else entirely, and neither `keygen` nor the
+    # operator can undo it: the hash is the same hash.
+    seeded_state="$(key_state)"
+    if [ "$seeded_state" = "active" ]; then
+        ok "the smoke key is already in $DATA_VOLUME (left alone)"
+    else
+        printf '%s\n' "$seed_report" >&2
+        bad "could not seed the smoke key: it is '$seeded_state' in $DATA_VOLUME"
+        exit 1
+    fi
+fi
 
 # `--wait` blocks on the compose healthcheck, which probes /readyz rather than
 # /healthz: an instance that is up but not ready to receive traffic is not up for
@@ -507,6 +596,114 @@ expect_eq "the refusal names the gate" "model_not_found" "$(body | json_get erro
 expect_eq "the refused model never reached the upstream" "$REQUESTS" "$(mock_count)"
 
 # ---------------------------------------------------------------------------
+say "The admin surface, and the key it manages (docs/adr/0014)"
+# ---------------------------------------------------------------------------
+# The key set is a table now, not a line in the config both instances mount, so
+# the operations that replace editing that file are exercised against the live
+# deployment: the manager password reaches the surface and a partner key does not,
+# no response ever carries a plaintext, and a PATCH is honoured by the instance
+# that served it on the very next request.
+
+fetch "$PORTAL_A/api/admin/api-keys"
+expect_eq "unauthenticated /api/admin/api-keys is rejected" "401" "$(status)"
+
+fetch "$PORTAL_A/api/admin/api-keys" -H "Authorization: Bearer $KEY"
+expect_eq "a partner key is refused the admin surface" "403" "$(status)"
+expect_eq "the refusal names the credential it wants" "manager_required" \
+    "$(body | json_get error.code)"
+
+# The listing an operator reads: the prefix identifies the key, and the secret is
+# not in the response at all. Asserted on the body just fetched rather than on a
+# second request, so the two checks below are about one response.
+fetch "$PORTAL_A/api/admin/api-keys" -H "Authorization: Bearer $MANAGER"
+expect_eq "the manager password reaches the admin surface" "200" "$(status)"
+if body | grep -qF -- "$KEY"; then
+    bad "the key listing contains the plaintext key"
+else
+    ok "the key listing contains the prefix ${KEY:0:12} and not the secret"
+fi
+if body | grep -q 'key_hash'; then
+    bad "the key listing leaks the stored hash"
+else
+    ok "the key listing does not leak the stored hash"
+fi
+
+if ! key_id="$(body | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)
+for row in rows:
+    if row["key_prefix"] == sys.argv[1]:
+        print(row["id"])
+        break
+else:
+    sys.exit(f"no api key with prefix {sys.argv[1]} in the listing")
+' "${KEY:0:12}")"; then
+    bad "the manager listing has no key with prefix ${KEY:0:12}"
+    exit 1
+fi
+
+# Through portal-a directly, not through the edge: a mutation is visible to the
+# instance that served it on the next request (the store reloads its snapshot
+# inside the same call), and to a sibling within one refresh interval. Asserting
+# the sibling here would be asserting a timing bound rather than an operation —
+# tests/e2e/api_key_refresh.rs is where that bound is measured.
+fetch "$PORTAL_A/api/admin/api-keys/$key_id" \
+    -X PATCH \
+    -H "Authorization: Bearer $MANAGER" \
+    -H 'Content-Type: application/json' \
+    -d '{"allowed_models":["mock-model"]}'
+expect_eq "PATCH narrows the key's model list" "200" "$(status)"
+expect_eq "the PATCH response carries the list it set" "['mock-model']" \
+    "$(body | json_get allowed_models)"
+
+# The gate, in its quiet direction again — but this time the model is one the key
+# *did* list, a moment ago. A refusal here is the proof that the PATCH took effect
+# on this instance with no restart and no waiting.
+gate_upstream_before="$(mock_count)"
+fetch "$PORTAL_A/v1/chat/completions" \
+    -X POST \
+    -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$GATE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"gate\"}]}"
+expect_eq "a model the key no longer lists is refused" "404" "$(status)"
+expect_eq "the refusal names the gate" "model_not_found" "$(body | json_get error.code)"
+expect_eq "the dropped model never reached the upstream" \
+    "$gate_upstream_before" "$(mock_count)"
+
+fetch "$EDGE/api/dashboard/requests?range=24h&limit=200&model=$GATE_MODEL" \
+    -H "Authorization: Bearer $KEY"
+expect_eq "the refused model minted no ledger row" "0" \
+    "$(body | python3 -c 'import json, sys; print(len(json.load(sys.stdin)["data"]))')"
+
+fetch "$PORTAL_A/api/admin/api-keys/$key_id" \
+    -X PATCH \
+    -H "Authorization: Bearer $MANAGER" \
+    -H 'Content-Type: application/json' \
+    -d "{\"allowed_models\":[\"mock-model\",\"$MODEL\",\"$SWITCH_MODEL\",\"$GATE_MODEL\"]}"
+expect_eq "PATCH widens it again" "200" "$(status)"
+
+fetch "$PORTAL_A/v1/chat/completions" \
+    -X POST \
+    -H "Authorization: Bearer $KEY" \
+    -H 'Content-Type: application/json' \
+    -d "{\"model\":\"$GATE_MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"gate again\"}]}"
+expect_eq "the widened model is served again" "200" "$(status)"
+
+# The writer batches on a 1s timeout, so wait for it rather than racing it — and
+# then count: exactly one row, from the one accepted request above. The refused
+# one is the interesting half, and it is already accounted for: it minted nothing.
+sleep 2
+fetch "$EDGE/api/dashboard/requests?range=24h&limit=200&model=$GATE_MODEL" \
+    -H "Authorization: Bearer $KEY"
+expect_eq "the accepted probe is the model's only ledger row" "1" \
+    "$(body | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)["data"]
+done = [r for r in rows if r["request_status"] == "completed"]
+print(len(rows) if len(done) == len(rows) else f"{len(rows)} rows, {len(done)} completed")
+')"
+
+# ---------------------------------------------------------------------------
 say "SIGTERM drains the metering pipeline instead of discarding it"
 # ---------------------------------------------------------------------------
 "${COMPOSE[@]}" stop portal-a >/dev/null
@@ -582,6 +779,14 @@ for _ in $(seq 1 60); do
 done
 fetch "$PORTAL_A/readyz"
 expect_eq "portal-a is ready again after restart" "200" "$(status)"
+
+# The restarted instance authenticates with the same key, because the key is a row
+# on the shared volume rather than something the old process held in memory or in
+# the file both instances mount (docs/adr/0014). Asked of the restarted instance
+# directly: through the edge the request could land on the peer, which never
+# stopped and would answer either way.
+fetch "$PORTAL_A/api/me" -H "Authorization: Bearer $KEY"
+expect_eq "the restarted instance accepts the same key" "200" "$(status)"
 
 # The restarted instance must be reading the same ledger, not a fresh one: the
 # rows written before it restarted are still there, under the same model.

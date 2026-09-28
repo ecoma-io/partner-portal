@@ -120,10 +120,14 @@ comes from the environment, never the YAML.
   variable and the value) and its four unit tests; `src/main.rs` reads
   `listen_addr()` at the bind site and aborts startup on its error.
 * `src/config/types.rs` — `ManagerConfig { password }`, `KeyConfig` without
-  `metadata`, the rewritten `Config::hash` doc (no map-typed field left).
+  `metadata` (and since [ADR 0014](0014-api-keys-live-in-the-database.md)
+  `KeyConfig` itself is gone), the rewritten `Config::hash` doc (no map-typed
+  field left).
 * `src/auth/context.rs` / `src/auth/middleware.rs` —
   `ConsumerContext::manager()` takes no allow-list; the extractor builds the
-  context from `find_key` / `find_manager` alone.
+  context from the key store's `authenticate` / `find_manager` alone
+  (`find_key` on the config snapshot when this was written — the key side moved
+  to the database in [ADR 0014](0014-api-keys-live-in-the-database.md)).
 * `src/dashboard/api.rs` — `resolve_scope` (manager + no parameter →
   `Scope::All`; named consumers → verbatim `Scope::List`; a key is always
   `Scope::One`), `distinct_consumers` (the `usage_hourly` DISTINCT behind

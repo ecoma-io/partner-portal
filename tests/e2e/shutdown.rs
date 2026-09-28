@@ -30,21 +30,23 @@ async fn shutdown_completes_while_a_dashboard_stream_is_open() {
 
     let client = ProxyClient::new();
     let base = instance.base_url();
+    let key = instance.key().to_string();
 
     // One real request, so there is something in the ledger to protect.
-    assert_eq!(client.chat(&base, "before-shutdown").await, Ok(200));
+    assert_eq!(client.chat(&base, "before-shutdown", &key).await, Ok(200));
 
     // An operator with the dashboard open: the event stream is held by a task
     // that reads it exactly as a browser would — slowly, and until it closes.
     let stream_task = {
         let client = client.clone();
         let base = base.clone();
+        let key = key.clone();
         tokio::spawn(async move {
             use futures::StreamExt;
             let request = hyper::Request::builder()
                 .method("GET")
                 .uri(format!("{base}/api/dashboard/events"))
-                .header("authorization", format!("Bearer {LOCAL_KEY}"))
+                .header("authorization", format!("Bearer {key}"))
                 .body(
                     Full::new(Bytes::new())
                         .map_err(|never| match never {})
@@ -65,7 +67,7 @@ async fn shutdown_completes_while_a_dashboard_stream_is_open() {
     // Give the subscription time to register, then confirm the stream is live by
     // generating a change.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(client.chat(&base, "during-stream").await, Ok(200));
+    assert_eq!(client.chat(&base, "during-stream", &key).await, Ok(200));
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !stream_task.is_finished(),
@@ -130,6 +132,7 @@ async fn shutdown_commits_every_accepted_request() {
 
     let client = ProxyClient::new();
     let base = instance.base_url();
+    let key = instance.key().to_string();
 
     // A burst that is still arriving when the signal lands.
     let mut sent = 0usize;
@@ -137,10 +140,11 @@ async fn shutdown_commits_every_accepted_request() {
     for _ in 0..200 {
         let client = client.clone();
         let base = base.clone();
+        let key = key.clone();
         tasks.push(tokio::spawn(async move {
             // A fixed ring: the strict per-key allow-list (ADR 0012) cannot
             // enumerate `burst-{i}`; this burst only counts acceptances.
-            client.chat(&base, E2E_MODELS[0]).await
+            client.chat(&base, E2E_MODELS[0], &key).await
         }));
     }
 
@@ -223,7 +227,9 @@ async fn an_idle_server_does_not_exit_on_its_own() {
     // listener dead but the process running would be just as broken.
     let client = ProxyClient::new();
     assert_eq!(
-        client.chat(&instance.base_url(), "gpt-4o").await,
+        client
+            .chat(&instance.base_url(), "gpt-4o", instance.key())
+            .await,
         Ok(200),
         "the instance must still be proxying after the drain bound has passed"
     );

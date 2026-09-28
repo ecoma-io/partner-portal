@@ -11,6 +11,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod api_key_admin;
 mod auth;
 mod dashboard;
 mod hot_reload;

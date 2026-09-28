@@ -19,14 +19,19 @@ upstream:
   timeout_secs: 30
   connect_timeout_secs: 5
 
-keys:
-  - key: "smoke-key"
-    name: "partner-smoke"
-    # The gate is strict (docs/adr/0012): a key that omits the field serves
-    # `404 model_not_found` for every model and `/v1/models` answers an empty
-    # list. The bundled mock serves exactly one model; that is the list.
-    allowed_models:
-      - "mock-model"
+# There is no `keys:` block here, and there cannot be one (docs/adr/0014): a
+# partner key is a row in the ledger database, and `Config` rejects an unknown
+# field, so a leftover block is a start-up failure rather than a second
+# credential source. deploy/smoke-test.sh seeds `smoke-key-please-replace` with
+# `partner-portal keygen` before the stack starts, and rewrites its model list
+# through `PATCH /api/admin/api-keys/:id` — the same two operations an operator
+# performs on a real deployment, which is why the smoke test performs them.
+
+manager:
+  # A fixture, like `smoke-upstream-key` above: the credential the smoke test
+  # presents to the admin surface. It is what lets a run widen the key's model
+  # list through the API instead of editing this file (docs/adr/0014).
+  password: "smoke-manager"
 
 database:
   path: "/var/lib/partner-portal/partner-portal.db"

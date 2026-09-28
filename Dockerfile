@@ -29,6 +29,13 @@
 #   * data at   /var/lib/partner-portal  (declared VOLUME; holds partner-portal.db
 #     plus its -wal/-shm siblings — these three files are one unit, never split
 #     across volumes or hosts)
+#   * PARTNER_PORTAL_API_KEY_SECRET (>= 32 bytes) in the environment, always:
+#     partner API keys are hashed rows in that database (docs/adr/0014) and this
+#     is the secret their hashes are keyed with. It is deliberately not an `ENV`
+#     below — a secret baked into an image is a secret in every image pull — and
+#     the process refuses to start without it. The same value must be used for
+#     `partner-portal keygen` and for the running instances, because a stored
+#     hash is only verifiable under the secret it was written with.
 #   * runs as uid/gid 10001 (non-root, no login shell)
 #   * the binary is PID 1 in exec form, so `docker stop`'s SIGTERM is delivered
 #     straight to it; the drain path in src/main.rs then finalizes the metering

@@ -6,10 +6,10 @@ use sha2::{Digest, Sha256};
 
 /// What a secret renders as wherever it might be logged or `Debug`-printed.
 ///
-/// `keys[].key` and `upstream.api_key` are plaintext credentials in a file; the
-/// file's permissions are their security boundary. Nothing in this process may
-/// copy one into a log line, an error value or a panic message, so types that
-/// hold one redact on render and the loader redacts on error.
+/// `upstream.api_key` and `manager.password` are plaintext credentials in a
+/// file; the file's permissions are their security boundary. Nothing in this
+/// process may copy one into a log line, an error value or a panic message, so
+/// types that hold one redact on render and the loader redacts on error.
 pub(crate) const REDACTED: &str = "<redacted>";
 
 /// Main configuration structure
@@ -26,9 +26,6 @@ pub struct Config {
 
     /// Upstream OpenAI-compatible endpoint
     pub upstream: UpstreamConfig,
-
-    /// Local API keys for authentication
-    pub keys: Vec<KeyConfig>,
 
     /// Database configuration
     #[serde(default)]
@@ -62,27 +59,18 @@ impl Config {
         hex::encode(hasher.finalize())
     }
 
-    /// Find a key by its value
-    pub fn find_key(&self, key_value: &str) -> Option<&KeyConfig> {
-        self.keys.iter().find(|k| k.key == key_value)
-    }
-
     /// Every credential this configuration holds.
     ///
-    /// The upstream key, every local key, *and* the manager password, because
-    /// the rule that matters is "no credential in this file reaches text we
-    /// persist or serve" — stating it over the whole set makes it true by
-    /// construction, instead of resting on an argument about which paths could
-    /// see which secret. In practice only the upstream key can appear in
-    /// upstream text (the local keys are never sent upstream), so including the
-    /// rest costs a comparison each.
+    /// The upstream key and the manager password, and that is the whole list:
+    /// partner API keys are not configuration. They live in the database, and
+    /// their plaintext exists only in the response that issued them, so there is
+    /// nothing here for this function to scrub.
     ///
     /// Values too short to be credentials are left out deliberately: scrubbing
     /// every occurrence of a two-character string would garble ordinary words in
     /// a recorded reason and hide the real message.
     pub fn credentials(&self) -> Vec<&str> {
         std::iter::once(self.upstream.api_key.as_str())
-            .chain(self.keys.iter().map(|k| k.key.as_str()))
             .chain(self.manager.as_ref().map(|m| m.password.as_str()))
             .filter(|secret| secret.len() >= MIN_SCRUBBED_SECRET_LEN)
             .collect()
@@ -197,57 +185,6 @@ fn redact_userinfo(url: &str) -> Option<String> {
     Some(out)
 }
 
-/// Local API key configuration
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct KeyConfig {
-    /// The API key value (used for authentication)
-    pub key: String,
-
-    /// Human-readable name for the key
-    pub name: String,
-
-    /// Optional consumer ID (derived from key if not specified)
-    #[serde(default)]
-    pub consumer_id: Option<String>,
-
-    /// Models this key may call. **Strict**: an empty list (or a key that omits
-    /// the field entirely) is allowed *no* model — every inference request is
-    /// refused with `404 model_not_found` before it reaches the upstream. A
-    /// model already in use must be added here or the key stops working the
-    /// moment this ships. Read live per request (ADR 0012).
-    #[serde(default)]
-    pub allowed_models: Vec<String>,
-}
-
-/// Manual, so `key` renders as a redaction. A key value is a credential, and a
-/// derived `Debug` here would emit it from any `{:?}` of a config snapshot —
-/// including the ones in diagnostics written by other modules.
-impl std::fmt::Debug for KeyConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KeyConfig")
-            .field("key", &REDACTED)
-            .field("name", &self.name)
-            .field("consumer_id", &self.consumer_id)
-            .finish()
-    }
-}
-
-impl KeyConfig {
-    /// Get or derive the consumer ID
-    pub fn consumer_id(&self) -> &str {
-        self.consumer_id.as_deref().unwrap_or(&self.name)
-    }
-
-    /// Whether this key may call `model`.
-    ///
-    /// Strict by default: an empty list (or a key that never declared the
-    /// field) allows nothing. Only an explicitly listed name passes.
-    pub fn allows_model(&self, model: &str) -> bool {
-        !self.allowed_models.is_empty() && self.allowed_models.iter().any(|m| m == model)
-    }
-}
-
 /// Credential granting a **cross-consumer** dashboard view.
 ///
 /// This is the one deliberate exception to the "dashboard is consumer-scoped"
@@ -255,7 +192,7 @@ impl KeyConfig {
 /// `Authorization: Bearer <password>`) may view the usage of **every**
 /// consumer (ADR 0013). It is a *credential*, exactly like a key value, so
 /// it is scrubbed from ledger text, redacted in `Debug`, and never logged by
-/// the reload watcher — the same treatment `keys[].key` gets.
+/// the reload watcher — the same treatment `upstream.api_key` gets.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ManagerConfig {
@@ -332,6 +269,16 @@ pub struct ServerConfig {
     /// How often the dashboard's SSE poller checks SQLite for changes.
     #[serde(default = "default_sse_poll_interval_ms")]
     pub sse_poll_interval_ms: u64,
+
+    /// How often the API-key snapshot is reloaded after another instance
+    /// changes a key.
+    ///
+    /// The key set is held in memory so that authentication never queries
+    /// SQLite. That is only correct for one instance unless the others' writes
+    /// are noticed, and this is the bound on how long a revoke issued through
+    /// instance A can stay effective on instance B.
+    #[serde(default = "default_api_key_refresh_ms")]
+    pub api_key_refresh_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -342,6 +289,7 @@ impl Default for ServerConfig {
             max_body_size: default_max_body_size(),
             cors_allow_origins: Vec::new(),
             sse_poll_interval_ms: default_sse_poll_interval_ms(),
+            api_key_refresh_ms: default_api_key_refresh_ms(),
         }
     }
 }
@@ -357,6 +305,9 @@ fn default_max_body_size() -> usize {
 } // 10MB
 fn default_sse_poll_interval_ms() -> u64 {
     500
+}
+fn default_api_key_refresh_ms() -> u64 {
+    crate::apikeys::refresher::DEFAULT_REFRESH_INTERVAL_MS
 }
 
 /// Database configuration
@@ -447,12 +398,6 @@ mod tests {
                 timeout_secs: 120,
                 connect_timeout_secs: 10,
             },
-            keys: vec![KeyConfig {
-                key: "local-key".to_string(),
-                name: "test".to_string(),
-                consumer_id: None,
-                allowed_models: Vec::new(),
-            }],
             database: DatabaseConfig::default(),
             manager: None,
         };
@@ -469,9 +414,6 @@ upstream:
   base_url: https://api.openai.com
   api_key: sk-test
   timeout_secs: 120
-keys:
-  - key: local-key
-    name: test
 database:
   batch_size: 100
 "#;
@@ -479,12 +421,15 @@ database:
         let original = crate::config::ConfigLoader::parse_yaml(base).unwrap();
 
         for (name, changed) in [
+            (
+                "upstream base_url",
+                base.replace("api.openai.com", "api.gateway.internal"),
+            ),
             ("upstream api_key", base.replace("sk-test", "sk-other")),
             (
                 "upstream timeout",
                 base.replace("timeout_secs: 120", "timeout_secs: 121"),
             ),
-            ("key value", base.replace("local-key", "local-key-2")),
             (
                 "database",
                 base.replace("batch_size: 100", "batch_size: 101"),
@@ -511,25 +456,24 @@ database:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-upstream-secret
-keys:
-  - key: pp-local-secret
-    name: test
 manager:
   password: mgr-secret-password
 "#,
         )
         .unwrap();
         let credentials = config.credentials();
-        assert_eq!(credentials.len(), 3);
+        // The two credentials configuration still holds. Partner keys moved to
+        // the database and are not here to be scrubbed: their plaintext exists
+        // only in the response that issued it.
+        assert_eq!(credentials.len(), 2);
 
         let echo = "Incorrect API key provided: sk-upstream-secret. \
-                    The key pp-local-secret is also rejected, \
-                    and neither is mgr-secret-password.";
+                    Nothing in this config says mgr-secret-password, but an \
+                    upstream that echoed it would have to be scrubbed too.";
         let scrubbed = redact_credentials(echo, &credentials);
         assert!(!scrubbed.contains("sk-upstream-secret"), "{scrubbed}");
-        assert!(!scrubbed.contains("pp-local-secret"), "{scrubbed}");
         assert!(!scrubbed.contains("mgr-secret-password"), "{scrubbed}");
-        assert_eq!(scrubbed.matches(REDACTED).count(), 3, "{scrubbed}");
+        assert_eq!(scrubbed.matches(REDACTED).count(), 2, "{scrubbed}");
         // The rest of the message survives: the reason must still be readable.
         assert!(
             scrubbed.contains("Incorrect API key provided"),
@@ -561,9 +505,6 @@ manager:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-upstream-secret
-keys:
-  - key: pp-local-secret
-    name: test
 manager:
   password: mgr-secret-password
 "#,
@@ -576,18 +517,14 @@ manager:
             "upstream.api_key must not render: {rendered}"
         );
         assert!(
-            !rendered.contains("pp-local-secret"),
-            "keys[].key must not render: {rendered}"
-        );
-        assert!(
             !rendered.contains("mgr-secret-password"),
             "manager.password must not render: {rendered}"
         );
-        assert_eq!(rendered.matches(REDACTED).count(), 3, "{rendered}");
-        // Still identifiable: the name is what an operator locates a key by,
-        // and the redacted `password` label is what says a manager block is
-        // there without saying what it holds.
-        assert!(rendered.contains("test"), "{rendered}");
+        assert_eq!(rendered.matches(REDACTED).count(), 2, "{rendered}");
+        // Still identifiable: the redacted labels are what say a credential is
+        // there without saying what it holds, and the base URL is what says
+        // where the process is pointed.
+        assert!(rendered.contains("api.openai.com"), "{rendered}");
         assert!(rendered.contains("password"), "{rendered}");
     }
 
@@ -601,9 +538,6 @@ manager:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
-keys:
-  - key: pp-local-secret
-    name: test
 manager:
   password: mgr-password-exact
 "#,
@@ -636,9 +570,6 @@ manager:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
-keys:
-  - key: pp-local-secret
-    name: test
 "#,
         )
         .unwrap();
@@ -652,12 +583,6 @@ keys:
                 timeout_secs: 120,
                 connect_timeout_secs: 10,
             },
-            keys: vec![KeyConfig {
-                key: "local-key".to_string(),
-                name: "test".to_string(),
-                consumer_id: None,
-                allowed_models: Vec::new(),
-            }],
             database: DatabaseConfig::default(),
             manager: Some(ManagerConfig {
                 password: String::new(),
@@ -667,35 +592,6 @@ keys:
             with_empty_password.find_manager("").is_none(),
             "an empty password must never authenticate"
         );
-    }
-
-    /// The strict-by-default contract: only an explicitly listed name passes.
-    #[test]
-    fn test_allows_model_is_strict_by_default() {
-        let key = |list: &[&str]| KeyConfig {
-            key: "k".to_string(),
-            name: "n".to_string(),
-            consumer_id: None,
-            allowed_models: list.iter().map(|s| s.to_string()).collect(),
-        };
-
-        // A declared list admits exactly its members.
-        let listed = key(&["gpt-4o", "gpt-4o-mini"]);
-        assert!(listed.allows_model("gpt-4o"));
-        assert!(listed.allows_model("gpt-4o-mini"));
-
-        // Anything outside the list is refused.
-        assert!(!listed.allows_model("gpt-5"));
-        assert!(
-            !listed.allows_model("GPT-4o"),
-            "matching is exact, not case-insensitive"
-        );
-
-        // An empty list — the default for a key that omits the field — is the
-        // strict case: *no* model is allowed at all, never "everything".
-        let empty = key(&[]);
-        assert!(!empty.allows_model("gpt-4o"));
-        assert!(!empty.allows_model("anything"));
     }
 
     #[test]

@@ -145,7 +145,7 @@ fn short(hash: &str) -> &str {
 /// Log which parts of the configuration changed.
 ///
 /// A single "configuration reloaded" line is not enough to operate this: the
-/// difference between "I edited a key's display name" and "I repointed the
+/// difference between "I raised the poll interval" and "I repointed the
 /// upstream" is the difference between a no-op and every subsequent request
 /// changing destination. Secret values are never logged, only whether they moved.
 ///
@@ -183,11 +183,10 @@ fn report_live_changes(old: &Config, new: &Config) {
         );
     }
 
-    report_key_changes(old, new);
-
-    // The manager password is read per request from the snapshot, like a key
-    // value, so a rotation is live from the next request. That it moved is the
-    // operational fact; the value is a credential and is not logged.
+    // The manager password is read per request from the snapshot, exactly like
+    // a partner key value is, so a rotation is live from the next request.
+    // That it moved is the operational fact; the value is a credential and is
+    // not logged.
     let old_password = old.manager.as_ref().map(|m| m.password.as_str());
     let new_password = new.manager.as_ref().map(|m| m.password.as_str());
     if old_password != new_password {
@@ -235,6 +234,13 @@ fn report_restart_required_changes(old: &Config, new: &Config) {
             "server.sse_poll_interval_ms",
             old.server.sse_poll_interval_ms,
             new.server.sse_poll_interval_ms,
+        );
+    }
+    if old.server.api_key_refresh_ms != new.server.api_key_refresh_ms {
+        needs_restart(
+            "server.api_key_refresh_ms",
+            old.server.api_key_refresh_ms,
+            new.server.api_key_refresh_ms,
         );
     }
     if old.upstream.connect_timeout_secs != new.upstream.connect_timeout_secs {
@@ -296,73 +302,10 @@ fn report_restart_required_changes(old: &Config, new: &Config) {
     }
 }
 
-/// Report the key set by position, never by value.
-///
-/// A local key value is a credential: which entry changed is operational
-/// information, what it changed to is not. The set follows the snapshot per
-/// request, so every line here is a live change.
-fn report_key_changes(old: &Config, new: &Config) {
-    if old.keys.len() != new.keys.len() {
-        info!(
-            field = "keys",
-            old = old.keys.len(),
-            new = new.keys.len(),
-            "applied on reload: the key set changed size"
-        );
-    }
-
-    for (index, (a, b)) in old.keys.iter().zip(new.keys.iter()).enumerate() {
-        if a.key != b.key {
-            info!(
-                field = "keys[].key",
-                index, "applied on reload: credential replaced (value not logged)"
-            );
-        }
-        if a.name != b.name {
-            applied_indexed("keys[].name", index, &a.name, &b.name);
-        }
-        if a.consumer_id() != b.consumer_id() {
-            applied_indexed(
-                "keys[].consumer_id",
-                index,
-                a.consumer_id(),
-                b.consumer_id(),
-            );
-        }
-        if a.allowed_models != b.allowed_models {
-            // Model names are not credentials — they are the same identifiers
-            // the ledger stores in cleartext — so the list itself is logged.
-            // Strict-by-default note: an empty list means *no* models, so it
-            // renders as "(none)" rather than looking like an opening-up.
-            let render = |models: &[String]| match models {
-                [] => "(none)".to_string(),
-                list => list.join(","),
-            };
-            applied_indexed(
-                "keys[].allowed_models",
-                index,
-                render(&a.allowed_models),
-                render(&b.allowed_models),
-            );
-        }
-    }
-}
-
 /// A field the running process reads from the live snapshot.
 fn applied(field: &str, old: impl Display, new: impl Display) {
     info!(
         field,
-        old = %old,
-        new = %new,
-        "applied on reload: configuration field changed"
-    );
-}
-
-/// As [`applied`], for a field belonging to one entry of a list.
-fn applied_indexed(field: &str, index: usize, old: impl Display, new: impl Display) {
-    info!(
-        field,
-        index,
         old = %old,
         new = %new,
         "applied on reload: configuration field changed"
@@ -396,9 +339,6 @@ mod tests {
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
-keys:
-  - key: test-key
-    name: Test
 "#
         .to_string()
     }
@@ -426,9 +366,6 @@ keys:
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test-updated
-keys:
-  - key: test-key
-    name: Test
 "#;
         std::fs::write(&config_path, new_yaml).unwrap();
 
@@ -520,17 +457,12 @@ server:
   max_body_size: 10485760
   cors_allow_origins: []
   sse_poll_interval_ms: 500
+  api_key_refresh_ms: 1000
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
   timeout_secs: 120
   connect_timeout_secs: 10
-keys:
-  - key: test-key
-    name: Test
-    allowed_models:
-      - gpt-4o
-      - gpt-4o-mini
 database:
   path: "./partner-portal.db"
   retention_days: 60
@@ -566,6 +498,11 @@ database:
                 "sse_poll_interval_ms: 1000",
             ),
             (
+                "server.api_key_refresh_ms",
+                "api_key_refresh_ms: 1000",
+                "api_key_refresh_ms: 2000",
+            ),
+            (
                 "upstream.base_url",
                 "base_url: https://api.openai.com",
                 "base_url: https://other.example",
@@ -585,8 +522,6 @@ database:
                 "connect_timeout_secs: 10",
                 "connect_timeout_secs: 3",
             ),
-            ("keys[].key", "key: test-key", "key: test-key-2"),
-            ("keys[].name", "name: Test", "name: Renamed"),
             (
                 "database.path",
                 "path: \"./partner-portal.db\"",
@@ -651,41 +586,6 @@ database:
             "the report rendered the manager password:\n{rendered}"
         );
 
-        // `keys[].allowed_models` is a per-key list (ADR 0012) with a
-        // hand-written report branch. Model names are not credentials, so the
-        // values are logged; an emptied list renders as "(none)", the strict
-        // default, not as "*" (which would falsely read as "all models").
-        let models_changed = config_from(&BASE.replace(
-            "    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
-            "    allowed_models:\n      - gpt-4o\n      - gpt-5\n",
-        ));
-        assert_ne!(
-            old.hash(),
-            models_changed.hash(),
-            "the allowed_models edit does not change the config, so it tests nothing"
-        );
-        let rendered = capture_report(&old, &models_changed);
-        assert!(
-            rendered.contains("field=\"keys[].allowed_models\""),
-            "a change to keys[].allowed_models must be reported by name:\n{rendered}"
-        );
-        assert!(
-            rendered.contains("gpt-4o-mini") && rendered.contains("gpt-5"),
-            "the report should log the model names (they are not credentials):\n{rendered}"
-        );
-
-        // Strict-by-default rendering: an emptied list must read as "(none)",
-        // never as a wildcard that reads as "every model allowed".
-        let emptied = config_from(&BASE.replace(
-            "    allowed_models:\n      - gpt-4o\n      - gpt-4o-mini\n",
-            "    allowed_models: []\n",
-        ));
-        let rendered = capture_report(&old, &emptied);
-        assert!(
-            rendered.contains("(none)"),
-            "an emptied allowed_models must render as (none), not *:\n{rendered}"
-        );
-
         // A separate password rotation is the shape the extraction above
         // rewrites, so report it directly rather than via string surgery on a
         // BASE that has no manager block.
@@ -727,7 +627,7 @@ database:
     /// line, would tell the operator to expect a value the process is ignoring.
     #[test]
     fn test_restart_required_fields_warn_that_they_are_not_in_force() {
-        const BASE: &str = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nkeys:\n  - key: test-key\n    name: Test\ndatabase:\n  batch_size: 100\n";
+        const BASE: &str = "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\ndatabase:\n  batch_size: 100\n";
         let old = config_from(BASE);
         let new = config_from(&BASE.replace("batch_size: 100", "batch_size: 50"));
 
@@ -747,24 +647,24 @@ database:
     /// credential, whether it moved or not.
     #[test]
     fn test_report_never_logs_a_credential() {
-        const SECRET_LOCAL: &str = "pp-local-do-not-log";
         const SECRET_UPSTREAM: &str = "sk-upstream-do-not-log";
         const SECRET_MANAGER: &str = "pp-manager-do-not-log";
 
+        // The two credentials a config still holds. A partner API key used to
+        // be the third; it is a row in `api_keys` now, so this file can never
+        // see one and there is nothing to scrub here.
         let old = config_from(&format!(
-            "upstream:\n  base_url: https://api.openai.com\n  api_key: {SECRET_UPSTREAM}\nkeys:\n  - key: {SECRET_LOCAL}\n    name: Test\nmanager:\n  password: {SECRET_MANAGER}\n"
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: {SECRET_UPSTREAM}\nmanager:\n  password: {SECRET_MANAGER}\n"
         ));
         let new = config_from(
-            "upstream:\n  base_url: https://other.example\n  api_key: sk-rotated-do-not-log\nkeys:\n  - key: pp-rotated-do-not-log\n    name: Test\nmanager:\n  password: pp-manager-rotated-do-not-log\n",
+            "upstream:\n  base_url: https://other.example\n  api_key: sk-rotated-do-not-log\nmanager:\n  password: pp-manager-rotated-do-not-log\n",
         );
 
         let rendered = capture_report(&old, &new);
         for secret in [
-            SECRET_LOCAL,
             SECRET_UPSTREAM,
             SECRET_MANAGER,
             "sk-rotated-do-not-log",
-            "pp-rotated-do-not-log",
             "pp-manager-rotated-do-not-log",
         ] {
             assert!(
@@ -778,7 +678,6 @@ database:
             rendered.contains("field=\"upstream.api_key\""),
             "{rendered}"
         );
-        assert!(rendered.contains("field=\"keys[].key\""), "{rendered}");
         assert!(
             rendered.contains("field=\"manager.password\""),
             "{rendered}"
