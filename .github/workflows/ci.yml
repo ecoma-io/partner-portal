@@ -247,6 +247,16 @@ jobs:
           cache-from: type=gha,scope=partner-portal-image
           cache-to: type=gha,mode=max,scope=partner-portal-image
 
+      # The schema, on a database that does not exist yet. There is no migration
+      # runner — `src/ledger/schema.sql` is embedded in the binary and applied on
+      # every startup — so the first-ever start is a code path no other job
+      # exercises: every other test begins from a database something already
+      # created. This starts the built image against an empty volume and asserts
+      # that what it creates matches `SCHEMA_VERSION` in the source and holds
+      # `api_keys`, the table the key set lives in.
+      - name: Fresh database matches the declared schema
+        run: ./scripts/schema-check.sh partner-portal:ci
+
       # The same script an operator can run against a tag before promoting it:
       # the image's runtime contract, liveness, readiness, auth, an end-to-end
       # proxied request, the model gate's refusal, the embedded dashboard, and
