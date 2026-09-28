@@ -4,14 +4,11 @@
 use std::time::Duration;
 
 use crate::common::{
-    Behaviour, CLIENT_KEY, KeySpec, MockUpstream, Spec, TestClient, TestServer, WAIT_TIMEOUT,
-    chat_request, open_db, wait_for_terminal, wait_for_terminal_count,
+    Behaviour, KeySpec, MockUpstream, Spec, TestClient, TestServer, WAIT_TIMEOUT, chat_request,
+    open_db, wait_for_terminal, wait_for_terminal_count,
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
-
-/// A second credential, deliberately mapped to a different consumer.
-const OTHER_KEY: &str = "sk-local-other-key";
 
 /// Make one metered request and return the response.
 async fn chat(
@@ -38,8 +35,8 @@ async fn chat(
 /// A server with two keys mapped to two distinct consumers.
 async fn two_consumer_server(upstream: &MockUpstream) -> TestServer {
     let spec = Spec::new(upstream).with_keys(vec![
-        KeySpec::new(CLIENT_KEY, "primary").with_consumer("consumer-a"),
-        KeySpec::new(OTHER_KEY, "secondary").with_consumer("consumer-b"),
+        KeySpec::new("primary").with_consumer("consumer-a"),
+        KeySpec::new("secondary").with_consumer("consumer-b"),
     ]);
     TestServer::start(spec).await
 }
@@ -57,10 +54,10 @@ async fn each_key_sees_only_its_own_usage() {
 
     // consumer-a: two requests against gpt-4o.
     for _ in 0..2 {
-        chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
+        chat(&client, &server, server.key(), "gpt-4o", true).await;
     }
     // consumer-b: one request against a different model.
-    let first_b = chat(&client, &server, OTHER_KEY, "gpt-4o-mini", true).await;
+    let first_b = chat(&client, &server, server.key_at(1), "gpt-4o-mini", true).await;
     wait_for_terminal(
         &server.db_path,
         &first_b.request_id().expect("x-request-id"),
@@ -70,7 +67,7 @@ async fn each_key_sees_only_its_own_usage() {
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     let a = client
-        .get_json(&server.url("/api/dashboard/summary"), Some(CLIENT_KEY))
+        .get_json(&server.url("/api/dashboard/summary"), Some(server.key()))
         .await;
     assert_eq!(a.status, StatusCode::OK);
     assert_eq!(a.json()["total_requests"], 2);
@@ -80,7 +77,10 @@ async fn each_key_sees_only_its_own_usage() {
     assert_eq!(a.json()["total_cached_tokens"], 40);
 
     let b = client
-        .get_json(&server.url("/api/dashboard/summary"), Some(OTHER_KEY))
+        .get_json(
+            &server.url("/api/dashboard/summary"),
+            Some(server.key_at(1)),
+        )
         .await;
     assert_eq!(b.status, StatusCode::OK);
     assert_eq!(
@@ -94,7 +94,7 @@ async fn each_key_sees_only_its_own_usage() {
     let a_requests = client
         .get_json(
             &server.url("/api/dashboard/requests?limit=200"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     let a_items = a_requests.json()["data"]
@@ -107,7 +107,7 @@ async fn each_key_sees_only_its_own_usage() {
     let b_requests = client
         .get_json(
             &server.url("/api/dashboard/requests?limit=200"),
-            Some(OTHER_KEY),
+            Some(server.key_at(1)),
         )
         .await;
     let b_items = b_requests.json()["data"]
@@ -119,11 +119,11 @@ async fn each_key_sees_only_its_own_usage() {
 
     // The model list is derived from the caller's own traffic only.
     let a_models = client
-        .get_json(&server.url("/api/dashboard/models"), Some(CLIENT_KEY))
+        .get_json(&server.url("/api/dashboard/models"), Some(server.key()))
         .await;
     assert_eq!(a_models.json()["models"], serde_json::json!(["gpt-4o"]));
     let b_models = client
-        .get_json(&server.url("/api/dashboard/models"), Some(OTHER_KEY))
+        .get_json(&server.url("/api/dashboard/models"), Some(server.key_at(1)))
         .await;
     assert_eq!(
         b_models.json()["models"],
@@ -132,7 +132,7 @@ async fn each_key_sees_only_its_own_usage() {
 
     // The timeseries carries the same totals, per hour.
     let a_series = client
-        .get_json(&server.url("/api/dashboard/timeseries"), Some(CLIENT_KEY))
+        .get_json(&server.url("/api/dashboard/timeseries"), Some(server.key()))
         .await;
     let points = a_series.json()["data"]
         .as_array()
@@ -164,7 +164,10 @@ async fn each_key_sees_only_its_own_usage() {
     // consumer-b's single request is scoped away from consumer-a's timeseries:
     // the rollup (and its latency inputs) must not leak across keys.
     let b_series = client
-        .get_json(&server.url("/api/dashboard/timeseries"), Some(OTHER_KEY))
+        .get_json(
+            &server.url("/api/dashboard/timeseries"),
+            Some(server.key_at(1)),
+        )
         .await;
     let b_points = b_series.json()["data"]
         .as_array()
@@ -191,7 +194,7 @@ async fn requests_paginate_without_gaps_or_duplicates() {
     const TOTAL: usize = 7;
     for i in 0..TOTAL {
         let model = if i % 2 == 0 { "gpt-4o" } else { "gpt-4o-mini" };
-        let response = chat(&client, &server, CLIENT_KEY, model, true).await;
+        let response = chat(&client, &server, server.key(), model, true).await;
         wait_for_terminal(
             &server.db_path,
             &response.request_id().expect("x-request-id"),
@@ -214,7 +217,7 @@ async fn requests_paginate_without_gaps_or_duplicates() {
             ),
             None => format!("{}?limit=3", server.url("/api/dashboard/requests")),
         };
-        let page = client.get_json(&url, Some(CLIENT_KEY)).await;
+        let page = client.get_json(&url, Some(server.key())).await;
         assert_eq!(page.status, StatusCode::OK, "page {url}");
         let items = page.json()["data"].as_array().cloned().unwrap_or_default();
         assert!(items.len() <= 3);
@@ -268,7 +271,7 @@ async fn requests_paginate_without_gaps_or_duplicates() {
                 server.url("/api/dashboard/requests"),
                 urlencode(&forged)
             ),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(
@@ -290,7 +293,7 @@ async fn query_parameters_are_clamped_or_rejected() {
     let client = TestClient::new();
 
     for _ in 0..3 {
-        chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
+        chat(&client, &server, server.key(), "gpt-4o", true).await;
     }
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
@@ -298,14 +301,14 @@ async fn query_parameters_are_clamped_or_rejected() {
 
     // limit=0 is clamped up to one row rather than returning nothing.
     let zero = client
-        .get_json(&format!("{requests}?limit=0"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?limit=0"), Some(server.key()))
         .await;
     assert_eq!(zero.status, StatusCode::OK);
     assert_eq!(zero.json()["data"].as_array().map(|a| a.len()), Some(1));
 
     // An absurd limit is clamped down to the documented maximum, not honoured.
     let huge = client
-        .get_json(&format!("{requests}?limit=999999"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?limit=999999"), Some(server.key()))
         .await;
     assert_eq!(huge.status, StatusCode::OK);
     assert!(
@@ -319,7 +322,7 @@ async fn query_parameters_are_clamped_or_rejected() {
 
     // A cursor that cannot be parsed is a client error, not an empty page.
     let bad_cursor = client
-        .get_json(&format!("{requests}?cursor=garbage"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?cursor=garbage"), Some(server.key()))
         .await;
     assert_eq!(bad_cursor.status, StatusCode::BAD_REQUEST);
     assert!(
@@ -333,7 +336,7 @@ async fn query_parameters_are_clamped_or_rejected() {
 
     // range=custom without bounds is a client error.
     let no_bounds = client
-        .get_json(&format!("{requests}?range=custom"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?range=custom"), Some(server.key()))
         .await;
     assert_eq!(no_bounds.status, StatusCode::BAD_REQUEST);
 
@@ -342,7 +345,7 @@ async fn query_parameters_are_clamped_or_rejected() {
     let outside = client
         .get_json(
             &format!("{requests}?range=custom&start=2020-01-01T00:00:00Z&end=2020-01-02T00:00:00Z"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(outside.status, StatusCode::BAD_REQUEST);
@@ -355,14 +358,14 @@ async fn query_parameters_are_clamped_or_rejected() {
 
     // A limit that is not a number is rejected by the extractor.
     let not_a_number = client
-        .get_json(&format!("{requests}?limit=abc"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?limit=abc"), Some(server.key()))
         .await;
     assert_eq!(not_a_number.status, StatusCode::BAD_REQUEST);
 
     // An unrecognised range falls back to a day of data rather than everything
     // or nothing: the recent requests are still there.
     let nonsense = client
-        .get_json(&format!("{requests}?range=whenever"), Some(CLIENT_KEY))
+        .get_json(&format!("{requests}?range=whenever"), Some(server.key()))
         .await;
     assert_eq!(nonsense.status, StatusCode::OK);
     assert_eq!(
@@ -383,15 +386,15 @@ async fn the_model_and_status_filters_narrow_the_result() {
     let server = TestServer::start(Spec::new(&upstream)).await;
     let client = TestClient::new();
 
-    chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
-    chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
-    chat(&client, &server, CLIENT_KEY, "mock-model", true).await;
+    chat(&client, &server, server.key(), "gpt-4o", true).await;
+    chat(&client, &server, server.key(), "gpt-4o", true).await;
+    chat(&client, &server, server.key(), "mock-model", true).await;
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     let by_model = client
         .get_json(
             &server.url("/api/dashboard/requests?model=gpt-4o&limit=200"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     let items = by_model.json()["data"]
@@ -404,7 +407,7 @@ async fn the_model_and_status_filters_narrow_the_result() {
     let summary = client
         .get_json(
             &server.url("/api/dashboard/summary?model=gpt-4o"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(summary.json()["total_requests"], 2);
@@ -413,7 +416,7 @@ async fn the_model_and_status_filters_narrow_the_result() {
     let all = client
         .get_json(
             &server.url("/api/dashboard/requests?model=ALL&limit=200"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(all.json()["data"].as_array().map(|a| a.len()), Some(3));
@@ -423,14 +426,14 @@ async fn the_model_and_status_filters_narrow_the_result() {
     let failed = client
         .get_json(
             &server.url("/api/dashboard/requests?status=failed&limit=200"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(failed.json()["data"].as_array().map(|a| a.len()), Some(0));
     let bogus = client
         .get_json(
             &server.url("/api/dashboard/requests?status=not-a-status&limit=200"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(bogus.json()["data"].as_array().map(|a| a.len()), Some(3));
@@ -447,11 +450,10 @@ async fn api_me_is_scoped_to_the_credential_presented() {
     let server = two_consumer_server(&upstream).await;
     let client = TestClient::new();
 
-    for (key, consumer, name) in [
-        (CLIENT_KEY, "consumer-a", "primary"),
-        (OTHER_KEY, "consumer-b", "secondary"),
-    ] {
-        let me = client.get_json(&server.url("/api/me"), Some(key)).await;
+    for (index, consumer, name) in [(0, "consumer-a", "primary"), (1, "consumer-b", "secondary")] {
+        let me = client
+            .get_json(&server.url("/api/me"), Some(server.key_at(index)))
+            .await;
         assert_eq!(me.status, StatusCode::OK);
         assert_eq!(me.json()["consumer_id"], consumer);
         assert_eq!(me.json()["key_name"], name);
@@ -485,14 +487,14 @@ async fn the_requests_endpoint_reports_the_recorded_fields() {
     let server = TestServer::start(Spec::new(&upstream)).await;
     let client = TestClient::new();
 
-    let response = chat(&client, &server, CLIENT_KEY, "gpt-4o", true).await;
+    let response = chat(&client, &server, server.key(), "gpt-4o", true).await;
     let request_id = response.request_id().expect("x-request-id");
     let row = wait_for_terminal(&server.db_path, &request_id, WAIT_TIMEOUT).await;
 
     let page = client
         .get_json(
             &server.url("/api/dashboard/requests?limit=10"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     let item = &page.json()["data"][0];
@@ -523,7 +525,10 @@ async fn a_consumer_with_no_traffic_gets_an_empty_but_valid_view() {
     let client = TestClient::new();
 
     let summary = client
-        .get_json(&server.url("/api/dashboard/summary"), Some(OTHER_KEY))
+        .get_json(
+            &server.url("/api/dashboard/summary"),
+            Some(server.key_at(1)),
+        )
         .await;
     assert_eq!(summary.status, StatusCode::OK);
     assert_eq!(summary.json()["total_requests"], 0);
@@ -532,13 +537,16 @@ async fn a_consumer_with_no_traffic_gets_an_empty_but_valid_view() {
     assert_eq!(summary.json()["success_rate"], 0.0);
 
     let series = client
-        .get_json(&server.url("/api/dashboard/timeseries"), Some(OTHER_KEY))
+        .get_json(
+            &server.url("/api/dashboard/timeseries"),
+            Some(server.key_at(1)),
+        )
         .await;
     assert_eq!(series.status, StatusCode::OK);
     assert_eq!(series.json()["data"].as_array().map(|a| a.len()), Some(0));
 
     let models = client
-        .get_json(&server.url("/api/dashboard/models"), Some(OTHER_KEY))
+        .get_json(&server.url("/api/dashboard/models"), Some(server.key_at(1)))
         .await;
     assert_eq!(models.json()["models"].as_array().map(|a| a.len()), Some(0));
 
@@ -547,7 +555,7 @@ async fn a_consumer_with_no_traffic_gets_an_empty_but_valid_view() {
     let requests = client
         .get_json(
             &server.url("/api/dashboard/requests?limit=200"),
-            Some(OTHER_KEY),
+            Some(server.key_at(1)),
         )
         .await;
     assert_eq!(requests.json()["data"].as_array().map(|a| a.len()), Some(0));
@@ -578,7 +586,7 @@ async fn timeseries_ttft_is_weighted_over_reporting_requests_only() {
         .call(
             Method::POST,
             &server.url("/v1/chat/completions"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
             crate::common::chat_stream_request("gpt-4o"),
             &[],
         )
@@ -596,7 +604,7 @@ async fn timeseries_ttft_is_weighted_over_reporting_requests_only() {
         .call(
             Method::POST,
             &server.url("/v1/chat/completions"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
             crate::common::chat_request("gpt-4o"),
             &[],
         )
@@ -606,7 +614,7 @@ async fn timeseries_ttft_is_weighted_over_reporting_requests_only() {
     wait_for_terminal_count(&server.db_path, 2, WAIT_TIMEOUT).await;
 
     let series = client
-        .get_json(&server.url("/api/dashboard/timeseries"), Some(CLIENT_KEY))
+        .get_json(&server.url("/api/dashboard/timeseries"), Some(server.key()))
         .await;
     let points = series.json()["data"]
         .as_array()

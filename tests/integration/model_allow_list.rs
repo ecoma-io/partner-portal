@@ -3,8 +3,7 @@
 //! ledger row, and `/v1/models` discovery is filtered to the same list.
 
 use crate::common::{
-    Behaviour, CLIENT_KEY, KeySpec, MockUpstream, Spec, TestClient, TestServer, row_count,
-    wait_for_terminal,
+    Behaviour, KeySpec, MockUpstream, Spec, TestClient, TestServer, row_count, wait_for_terminal,
 };
 use bytes::Bytes;
 use http::{Method, StatusCode};
@@ -24,7 +23,7 @@ fn chat_request(model: &str) -> Bytes {
 
 /// A restricted key on the default consumer name, so `server.key()` works.
 fn restricted_key(models: &[&str]) -> KeySpec {
-    KeySpec::new(CLIENT_KEY, "restricted").with_allowed_models(models)
+    KeySpec::new("restricted").with_allowed_models(models)
 }
 
 async fn start_restricted(models: &[&str]) -> (MockUpstream, TestServer, TestClient) {

@@ -35,7 +35,10 @@ pub use hyper_util::client::legacy::connect::HttpConnector;
 pub use hyper_util::rt::TokioExecutor;
 pub use serde_json::json;
 
-pub const LOCAL_KEY: &str = "local-test-key";
+/// The HMAC secret every e2e instance is given, and the one [`seed_keys`]
+/// hashes with. A test value that protects nothing and exists only so both
+/// sides agree; it never leaves this harness.
+pub const TEST_SECRET: &[u8] = b"an-e2e-only-hmac-secret-of-32-bytes";
 
 /// Every model any e2e test sends, so every e2e key can carry one shared
 /// allow-list. The request names a model from an unbounded counter
@@ -48,8 +51,10 @@ pub const E2E_MODELS: &[&str] = &[
     "reload-0",
     "reload-probe",
     "reload-old-key",
+    "reload-same-key",
     "reload-badyaml",
     "reload-invalid",
+    "reload-keys-block",
     "reload-final",
     "before-shutdown",
     "during-stream",
@@ -193,6 +198,8 @@ pub struct Instance {
     pub port: u16,
     /// Retained so a test can publish a new configuration and watch it land.
     pub config_path: PathBuf,
+    /// Every plaintext the seed issued, in seed order.
+    keys: Vec<String>,
 }
 
 impl Instance {
@@ -200,8 +207,61 @@ impl Instance {
     ///
     /// The port reaches the child only through `PARTNER_PORTAL_LISTEN`: the
     /// listen address is an environment property now, so the harness exercises
-    /// exactly the wiring a deployment uses.
+    /// exactly the wiring a deployment uses. The API key is a row seeded before
+    /// the spawn, and the child is handed the same [`TEST_SECRET`] the store
+    /// hashed it with — so startup finds a key to load and every instance in
+    /// the suite can present the same plaintext.
     pub fn start(name: &str, dir: &Path, db_path: &Path, upstream: &str) -> Self {
+        Self::start_with(
+            name,
+            dir,
+            db_path,
+            upstream,
+            &[SeedKey::new("tester", "tester")],
+        )
+    }
+
+    /// As [`Instance::start`], with an explicit key set.
+    ///
+    /// The plaintexts are returned so the test can present them; nothing about
+    /// them is knowable in advance, which is the point.
+    pub fn start_with(
+        name: &str,
+        dir: &Path,
+        db_path: &Path,
+        upstream: &str,
+        keys: &[SeedKey],
+    ) -> Self {
+        // Before the child exists: startup loads the active key set and refuses
+        // to serve without one, so a seed after the spawn would race that load.
+        let plaintexts = seed_keys(db_path, keys)
+            .into_iter()
+            .map(|key| key.plaintext)
+            .collect();
+        Self::spawn(name, dir, db_path, upstream, plaintexts)
+    }
+
+    /// Start another instance against an already-seeded database.
+    ///
+    /// The initial instance mints the database rows. A second instance in a
+    /// rolling update must use those same rows and their already-issued
+    /// plaintexts; seeding again would create unrelated credentials rather than
+    /// proving that the database is shared.
+    pub fn start_existing(
+        name: &str,
+        dir: &Path,
+        db_path: &Path,
+        upstream: &str,
+        keys: Vec<String>,
+    ) -> Self {
+        assert!(
+            !keys.is_empty(),
+            "an existing instance needs at least one seeded key"
+        );
+        Self::spawn(name, dir, db_path, upstream, keys)
+    }
+
+    fn spawn(name: &str, dir: &Path, db_path: &Path, upstream: &str, keys: Vec<String>) -> Self {
         let port = free_port();
         let config_path = dir.join(format!("config-{name}.yaml"));
         write_config(&config_path, db_path, upstream);
@@ -209,6 +269,10 @@ impl Instance {
         let child = Command::new(binary_path())
             .env("PARTNER_PORTAL_CONFIG", &config_path)
             .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{port}"))
+            .env(
+                "PARTNER_PORTAL_API_KEY_SECRET",
+                std::str::from_utf8(TEST_SECRET).expect("the test secret is ASCII"),
+            )
             .env("RUST_LOG", "warn")
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -221,7 +285,30 @@ impl Instance {
             child,
             port,
             config_path,
+            keys,
         }
+    }
+
+    /// The plaintext of the first seeded key.
+    pub fn key(&self) -> &str {
+        self.key_at(0)
+    }
+
+    /// The plaintext of the `index`-th seeded key.
+    ///
+    /// A test that seeds several keys needs all of them, and gets them from the
+    /// one seed call rather than from a second one — which is why
+    /// [`SeedKey::new`] is the only way to name a key in this suite.
+    pub fn key_at(&self, index: usize) -> &str {
+        self.keys
+            .get(index)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the fixture seeded {} key(s), asked for {index}",
+                    self.keys.len()
+                )
+            })
+            .as_str()
     }
 
     pub fn base_url(&self) -> String {
@@ -308,33 +395,17 @@ pub fn free_port() -> u16 {
     port
 }
 
+/// Write a configuration. It carries no API key: those are rows in the
+/// database, seeded by [`seed_keys`] before an instance starts.
 pub fn write_config(path: &Path, db_path: &Path, upstream: &str) {
-    write_config_full(
-        path,
-        db_path,
-        upstream,
-        UPSTREAM_KEY,
-        LOCAL_KEY,
-        "tester",
-        E2E_MODELS,
-    );
+    write_config_full(path, db_path, upstream, UPSTREAM_KEY);
 }
 
 /// Write a configuration file, varying the fields a reload test needs to move.
 ///
 /// No listen address here: that is `PARTNER_PORTAL_LISTEN`, set where the
 /// instance is spawned.
-#[allow(clippy::too_many_arguments)]
-pub fn write_config_full(
-    path: &Path,
-    db_path: &Path,
-    upstream: &str,
-    upstream_key: &str,
-    local_key: &str,
-    local_name: &str,
-    allowed_models: &[&str],
-) {
-    let models = render_allowed_models(allowed_models);
+pub fn write_config_full(path: &Path, db_path: &Path, upstream: &str, upstream_key: &str) {
     let yaml = format!(
         r#"server:
   shutdown_grace_secs: 1
@@ -345,61 +416,7 @@ upstream:
   api_key: "{upstream_key}"
   timeout_secs: 15
   connect_timeout_secs: 2
-keys:
-  - key: "{local_key}"
-    name: "{local_name}"
-{models}database:
-  path: "{db}"
-  queue_size: 5000
-  batch_size: 50
-  batch_timeout_ms: 20
-  retention_interval_secs: 3600
-"#,
-        db = db_path.display(),
-        models = models,
-    );
-
-    write_raw(path, &yaml);
-}
-
-/// Render the `allowed_models:` block for a key, or nothing when the slice is
-/// empty (the strict default — a test that wants to probe it must say so).
-fn render_allowed_models(models: &[&str]) -> String {
-    if models.is_empty() {
-        return String::new();
-    }
-    let mut out = "    allowed_models:\n".to_string();
-    for m in models {
-        out.push_str(&format!("      - \"{m}\"\n"));
-    }
-    out
-}
-
-/// Write a configuration with several local keys, each with its own consumer.
-pub fn write_config_multi(
-    path: &Path,
-    db_path: &Path,
-    upstream: &str,
-    keys: &[(&str, &str, &str)],
-) {
-    let mut list = String::new();
-    for (key, name, consumer) in keys {
-        list.push_str(&format!(
-            "  - key: \"{key}\"\n    name: \"{name}\"\n    consumer_id: \"{consumer}\"\n{models}",
-            models = render_allowed_models(E2E_MODELS),
-        ));
-    }
-
-    let yaml = format!(
-        r#"server:
-  shutdown_grace_secs: 1
-  sse_poll_interval_ms: 100
-upstream:
-  base_url: "{upstream}"
-  api_key: "{UPSTREAM_KEY}"
-  timeout_secs: 15
-keys:
-{list}database:
+database:
   path: "{db}"
   queue_size: 5000
   batch_size: 50
@@ -410,6 +427,77 @@ keys:
     );
 
     write_raw(path, &yaml);
+}
+
+/// One API key to seed into `api_keys` before an instance starts.
+#[derive(Clone, Debug)]
+pub struct SeedKey {
+    pub name: String,
+    pub consumer_id: String,
+    pub allowed_models: Vec<String>,
+}
+
+impl SeedKey {
+    /// A key for `consumer_id` that may call every model the e2e suite sends.
+    pub fn new(name: &str, consumer_id: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            consumer_id: consumer_id.to_string(),
+            allowed_models: E2E_MODELS.iter().map(|m| m.to_string()).collect(),
+        }
+    }
+}
+
+/// The plaintext a seeded key was issued with.
+#[derive(Clone, Debug)]
+pub struct SeededKey {
+    pub id: i64,
+    pub plaintext: String,
+}
+
+/// Insert `keys` into the `api_keys` table of `db_path` and return what was
+/// issued.
+///
+/// The rows go in through the product's own `ApiKeyStore`, so the schema is
+/// applied by the same call the product makes and the plaintext is *generated*
+/// rather than written down — no e2e fixture carries a credential in source.
+///
+/// Idempotent on the key hash, because a rolling-update test starts a second
+/// instance against the database the first one left behind, and that call
+/// re-seeds the same rows. There is no key hash to re-issue from (a real
+/// plaintext is never stored), so a restart test must reuse the plaintext the
+/// first seed returned rather than seeding again; a genuine duplicate is a
+/// fixture bug and fails loudly here.
+pub fn seed_keys(db_path: &Path, keys: &[SeedKey]) -> Vec<SeededKey> {
+    use partner_portal::apikeys::ApiKeyStore;
+    use partner_portal::ledger::LedgerPool;
+    use std::sync::Arc;
+
+    let pool = Arc::new(LedgerPool::new(db_path.to_path_buf()).expect("open ledger for seeding"));
+    let store = ApiKeyStore::new(pool, TEST_SECRET.to_vec());
+
+    keys.iter()
+        .map(|key| {
+            let (row, plaintext) = store
+                .create(
+                    &key.name,
+                    &key.consumer_id,
+                    key.allowed_models.clone(),
+                    None,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "seeding {} into {} failed: {e}",
+                        key.name,
+                        db_path.display()
+                    )
+                });
+            SeededKey {
+                id: row.id,
+                plaintext,
+            }
+        })
+        .collect()
 }
 
 /// Write arbitrary bytes to a path atomically.
@@ -484,9 +572,13 @@ impl ProxyClient {
         }
     }
 
-    /// POST a chat completion carrying a unique model name.
-    pub async fn chat(&self, base: &str, model: &str) -> Result<u16, String> {
-        self.chat_with_key(base, model, LOCAL_KEY).await
+    /// POST a chat completion carrying a unique model name, with an explicit
+    /// credential.
+    ///
+    /// There is no default key: the suite cannot know one in advance, because
+    /// the store mints it. A test that wants the default passes `instance.key()`.
+    pub async fn chat(&self, base: &str, model: &str, key: &str) -> Result<u16, String> {
+        self.chat_with_key(base, model, key).await
     }
 
     /// GET a path with an optional bearer key; returns `(status, body)`.
@@ -690,11 +782,17 @@ impl Rotation {
     }
 
     /// Run `workers` request loops until `stop` is set.
-    pub fn run(&self, workers: usize, client: ProxyClient) -> Vec<tokio::task::JoinHandle<()>> {
+    pub fn run(
+        &self,
+        workers: usize,
+        client: ProxyClient,
+        key: String,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         (0..workers)
             .map(|_| {
                 let rotation = self.clone();
                 let client = client.clone();
+                let key = key.clone();
                 tokio::spawn(async move {
                     while !rotation.stop.load(Ordering::Acquire) {
                         // Clone the target list out of the lock rather than
@@ -712,7 +810,7 @@ impl Rotation {
                         // unbounded counter. The tests only count acceptances.
                         let model = E2E_MODELS[0];
 
-                        if let Ok(200) = client.chat(target, model).await {
+                        if let Ok(200) = client.chat(target, model, &key).await {
                             rotation.accepted.fetch_add(1, Ordering::Relaxed);
                         }
 

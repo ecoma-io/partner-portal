@@ -122,8 +122,18 @@ async fn a_queue_of_zero_is_refused_at_startup() {
         0,
         "nothing may be served by an instance that refused to start"
     );
-    assert!(
-        !server.db_path.exists(),
-        "a refused start must not create a ledger it never uses"
+    // The database file exists — the harness seeded the key rows into it before
+    // the spawn — but a refused start must leave it exactly as it found it. No
+    // usage record, and no rollup, can exist for a process that never served a
+    // request; if it does, something ran before the validation aborted.
+    assert_eq!(
+        row_count(&server.open_db()),
+        0,
+        "a refused start must not leave a ledger row behind"
+    );
+    assert_eq!(
+        raw_rollup_totals(&server.open_db()),
+        (0, 0),
+        "a refused start must not leave a rollup row behind"
     );
 }

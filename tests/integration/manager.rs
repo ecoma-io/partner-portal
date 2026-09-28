@@ -16,23 +16,21 @@
 //!   server-derived, ADR 0008).
 
 use crate::common::{
-    Behaviour, CLIENT_KEY, KeySpec, ManagerSpec, MockUpstream, Spec, TestClient, TestServer,
-    WAIT_TIMEOUT, chat_request, wait_for_terminal_count,
+    Behaviour, KeySpec, ManagerSpec, MockUpstream, Spec, TestClient, TestServer, WAIT_TIMEOUT,
+    chat_request, wait_for_terminal_count,
 };
 use http::{Method, StatusCode};
 use serde_json::Value;
 
 /// The manager password configured in the fixture.
 const MANAGER_PASSWORD: &str = "sk-manager-password-do-not-guess";
-/// A second consumer key, sharing the server with [`CLIENT_KEY`].
-const OTHER_KEY: &str = "sk-other-key";
 
 /// A server with two consumers and a manager password over both of them.
 async fn manager_server(upstream: &MockUpstream) -> TestServer {
     let spec = Spec::new(upstream)
         .with_keys(vec![
-            KeySpec::new(CLIENT_KEY, "primary").with_consumer("consumer-a"),
-            KeySpec::new(OTHER_KEY, "secondary").with_consumer("consumer-b"),
+            KeySpec::new("primary").with_consumer("consumer-a"),
+            KeySpec::new("secondary").with_consumer("consumer-b"),
         ])
         .with_manager(ManagerSpec::new(MANAGER_PASSWORD));
     TestServer::start(spec).await
@@ -81,9 +79,9 @@ async fn manager_me_lists_the_consumers_present_in_the_ledger() {
     let server = manager_server(&upstream).await;
     let client = TestClient::new();
 
-    chat(&client, &server, CLIENT_KEY, "gpt-4o").await;
-    chat(&client, &server, CLIENT_KEY, "gpt-4o").await;
-    chat(&client, &server, OTHER_KEY, "gpt-4o-mini").await;
+    chat(&client, &server, server.key(), "gpt-4o").await;
+    chat(&client, &server, server.key(), "gpt-4o").await;
+    chat(&client, &server, server.key_at(1), "gpt-4o-mini").await;
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     let me = client
@@ -101,7 +99,7 @@ async fn manager_me_lists_the_consumers_present_in_the_ledger() {
 
     // A regular key's `/api/me` is unchanged in shape, just with `role=consumer`.
     let consumer_me = client
-        .get_json(&server.url("/api/me"), Some(CLIENT_KEY))
+        .get_json(&server.url("/api/me"), Some(server.key()))
         .await;
     assert_eq!(consumer_me.status, StatusCode::OK);
     let body = consumer_me.json();
@@ -150,9 +148,9 @@ async fn manager_sees_every_consumer_and_narrows_by_request() {
     let client = TestClient::new();
 
     // consumer-a makes 2 requests, consumer-b makes 1.
-    chat(&client, &server, CLIENT_KEY, "gpt-4o").await;
-    chat(&client, &server, CLIENT_KEY, "gpt-4o").await;
-    chat(&client, &server, OTHER_KEY, "gpt-4o-mini").await;
+    chat(&client, &server, server.key(), "gpt-4o").await;
+    chat(&client, &server, server.key(), "gpt-4o").await;
+    chat(&client, &server, server.key_at(1), "gpt-4o-mini").await;
     wait_for_terminal_count(&server.db_path, 3, WAIT_TIMEOUT).await;
 
     // Full view: every consumer.
@@ -250,7 +248,7 @@ async fn manager_sees_every_consumer_and_narrows_by_request() {
     let widened = client
         .get_json(
             &server.url("/api/dashboard/summary?consumers=consumer-b"),
-            Some(CLIENT_KEY),
+            Some(server.key()),
         )
         .await;
     assert_eq!(

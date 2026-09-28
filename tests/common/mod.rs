@@ -14,7 +14,10 @@
 //!    forwarded, with which headers and which credential.
 //! 2. [`TestServer`] — the real compiled binary as a child process, configured
 //!    through a temp-dir `config.yaml` and a temp-dir SQLite file, with
-//!    readiness-gated startup and signal helpers.
+//!    readiness-gated startup and signal helpers. Its API keys are *seeded rows*
+//    written by [`seed_keys`] before the child starts, not configuration: the
+//!    harness hands the child the same [`TEST_SECRET`] the store hashes with, so
+//!    a plaintext issued here authenticates there.
 //! 3. [`TestClient`] — a hyper client with buffered and streaming reads.
 //! 4. Ledger readers — the tests inspect SQLite directly, because the ledger is
 //!    the thing under test and the dashboard API is not a faithful proxy for
@@ -62,12 +65,22 @@ const DEFAULT_ALLOWED_MODELS: &[&str] = &[
     "mock-model-mini",
 ];
 
-/// Default credential for the first configured key.
-pub const CLIENT_KEY: &str = "sk-local-test-key";
+/// Default name of the seeded key.
+pub const CLIENT_KEY: &str = "primary";
 /// Default consumer identity for that key.
 pub const CONSUMER: &str = "test-consumer";
 /// Credential the proxy is configured to present upstream.
 pub const UPSTREAM_KEY: &str = "sk-upstream-secret";
+
+/// The HMAC secret every spawned instance is given.
+///
+/// A test credential, not a production one, and not a real-looking one: it
+/// never leaves this file and protects nothing. The value matters only because
+/// the *same* secret must be used by both sides — the harness seeds the rows
+/// and the child process hashes the presented token with it — so a child
+/// spawned with a different value authenticates nothing, which is exactly what
+/// `auth::test_a_different_secret_authenticates_nothing` asserts.
+pub const TEST_SECRET: &[u8] = b"a-test-only-hmac-secret-of-32-bytes";
 
 /// How long to wait for a child process to become ready.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(25);
@@ -698,10 +711,19 @@ fn oversized_response(bytes: usize) -> Response {
 // Server under test
 // ---------------------------------------------------------------------------
 
-/// One configured key.
+/// One API key to seed into `api_keys` before the instance starts.
+///
+/// There is no `key` field and that is the point: the plaintext is *generated*
+/// by the store and returned, so a test can never pin a credential in source
+/// the way the old `keys:` fixtures did. What a test still controls is the
+/// row's identity — its name, its consumer and its allow-list — and those are
+/// what the assertions are about.
+///
+/// `Spec::new` seeds exactly one key so that the ~60 tests which call
+/// `Spec::new` and then `server.key()` keep working without knowing any of
+/// this happened; a test about more than one key calls `with_keys`.
 #[derive(Clone, Debug)]
 pub struct KeySpec {
-    pub key: String,
     pub name: String,
     pub consumer_id: Option<String>,
     /// Models this key may call. Empty means *no* models (strict default).
@@ -713,9 +735,8 @@ impl KeySpec {
     /// builds its default key through this, so ordinary tests keep exercising
     /// the proxy rather than the allow-list; a test about restrictions calls
     /// `with_allowed_models` explicitly.
-    pub fn new(key: &str, name: &str) -> Self {
+    pub fn new(name: &str) -> Self {
         Self {
-            key: key.to_string(),
             name: name.to_string(),
             consumer_id: None,
             allowed_models: DEFAULT_ALLOWED_MODELS
@@ -789,7 +810,7 @@ impl Spec {
             upstream_url: upstream.url(),
             upstream_key: UPSTREAM_KEY.to_string(),
             upstream_timeout_secs: 10,
-            keys: vec![KeySpec::new(CLIENT_KEY, CONSUMER)],
+            keys: vec![KeySpec::new(CONSUMER)],
             manager: None,
             db_name: PathBuf::from("ledger.db"),
             port: free_port(),
@@ -865,25 +886,13 @@ impl Spec {
         self
     }
 
+    /// The configuration file, which no longer describes any API key.
+    ///
+    /// `self.keys` is deliberately absent from the output: those keys are
+    /// seeded into the database by [`seed_keys`] before the child starts, and
+    /// writing them here as well would reintroduce the two-sources problem
+    /// this change exists to remove.
     pub fn yaml(&self) -> String {
-        let mut keys = String::new();
-        for key in &self.keys {
-            keys.push_str(&format!(
-                "  - key: {}\n    name: {}\n",
-                yaml_str(&key.key),
-                yaml_str(&key.name),
-            ));
-            if let Some(consumer_id) = &key.consumer_id {
-                keys.push_str(&format!("    consumer_id: {}\n", yaml_str(consumer_id)));
-            }
-            if !key.allowed_models.is_empty() {
-                keys.push_str("    allowed_models:\n");
-                for model in &key.allowed_models {
-                    keys.push_str(&format!("      - {}\n", yaml_str(model)));
-                }
-            }
-        }
-
         let manager = match &self.manager {
             None => String::new(),
             Some(m) => format!("manager:\n  password: {}\n", yaml_str(&m.password)),
@@ -903,7 +912,6 @@ impl Spec {
                api_key: {upstream_key}\n  \
                timeout_secs: {timeout}\n  \
                connect_timeout_secs: 2\n\
-             keys:\n{keys}\
              {manager}\
              database:\n  \
                path: {db}\n  \
@@ -929,7 +937,7 @@ impl Spec {
     }
 }
 
-/// Quote a scalar for YAML. Test values are ordinary strings, but a key or a
+/// Quote a scalar for YAML. Test values are ordinary strings, but a URL or a
 /// path can contain characters that would otherwise change the document.
 fn yaml_str(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
@@ -948,6 +956,10 @@ pub struct TestServer {
     pub addr: String,
     pub base_url: String,
     pub spec: Spec,
+    /// What [`seed_keys`] inserted, in the order the spec listed it. The
+    /// plaintexts live here rather than on [`Spec`] because they did not exist
+    /// until the row was written.
+    pub seeded: Vec<SeededKey>,
 }
 
 impl TestServer {
@@ -985,10 +997,21 @@ impl TestServer {
         };
         std::fs::write(&config_path, spec.yaml()).expect("write config");
 
+        // The keys go in *before* the child exists. Startup loads the active
+        // key set and refuses to serve without one, so a test that seeded after
+        // the spawn would race the load — and the readiness gate would paper
+        // over it rather than fail, which is the failure mode the harness
+        // exists to make loud.
+        let seeded = seed_keys(&db_path, &spec.keys);
+
         let log = File::create(&log_path).expect("create log file");
         let child = Command::new(BIN)
             .env("PARTNER_PORTAL_CONFIG", &config_path)
             .env("PARTNER_PORTAL_LISTEN", format!("127.0.0.1:{}", spec.port))
+            .env(
+                "PARTNER_PORTAL_API_KEY_SECRET",
+                std::str::from_utf8(TEST_SECRET).expect("the test secret is ASCII"),
+            )
             .env("RUST_LOG", "info")
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -1010,6 +1033,7 @@ impl TestServer {
             addr,
             base_url,
             spec,
+            seeded,
         }
     }
 
@@ -1143,13 +1167,39 @@ impl TestServer {
         format!("{}{path}", self.base_url)
     }
 
-    /// The key the harness configures first.
+    /// The plaintext of the first seeded key — the one `Spec::new` creates, so
+    /// a test that never calls `with_keys` needs to know nothing about seeding.
+    ///
+    /// Panics when the spec seeded nothing. A test with no key has no request
+    /// to make, and an empty `&str` would 401 with a message that points at
+    /// the credential rather than at the fixture.
     pub fn key(&self) -> &str {
-        &self.spec.keys[0].key
+        &self
+            .seeded
+            .first()
+            .expect("the spec seeds at least one key")
+            .plaintext
+    }
+
+    /// The plaintext of the `index`-th seeded key.
+    pub fn key_at(&self, index: usize) -> &str {
+        &self.seeded[index].plaintext
+    }
+
+    /// The id of the first seeded key, for the admin API.
+    pub fn key_id(&self) -> i64 {
+        self.seeded
+            .first()
+            .expect("the spec seeds at least one key")
+            .id
     }
 
     pub fn consumer(&self) -> &str {
-        self.spec.keys[0].effective_consumer_id()
+        &self
+            .seeded
+            .first()
+            .expect("the spec seeds at least one key")
+            .consumer_id
     }
 }
 
@@ -1550,6 +1600,78 @@ impl BodyReader {
 /// Open the ledger for inspection. Deliberately a plain read-write handle, the
 /// same way the server opens its reader connections, so WAL recovery is not an
 /// issue.
+/// A key the harness inserted, with the plaintext that was issued for it.
+#[derive(Clone, Debug)]
+pub struct SeededKey {
+    pub id: i64,
+    pub plaintext: String,
+    pub name: String,
+    pub consumer_id: String,
+    pub allowed_models: Vec<String>,
+}
+
+/// Insert `specs` into `api_keys` and return what was issued.
+///
+/// The rows go in through the product's own [`ApiKeyStore`], not through a
+/// hand-written `INSERT`, for two reasons: the schema is applied by the same
+/// call the product makes, so a harness can never seed a column that does not
+/// exist; and the plaintext is *generated* here and handed back, so no test
+/// pins a credential in source.
+///
+/// # Idempotent, because restarts are ordinary
+///
+/// A test that restarts a process against the directory a previous process
+/// used calls this again on a database that already holds the rows. Every
+/// `key_hash` is already present, so an insert would violate `UNIQUE`; the
+/// helper therefore treats "this hash exists" as success and re-uses the row.
+/// That is what lets a restart test keep the same plaintext across both
+/// processes without a second mechanism.
+///
+/// # Pre-flight, not a race
+///
+/// Every spawned instance is also handed [`TEST_SECRET`], so its startup load
+/// and this insert agree on the hash. The process starts *after* this returns,
+/// so a test never has to wait for a key to appear.
+pub fn seed_keys(db_path: &Path, specs: &[KeySpec]) -> Vec<SeededKey> {
+    use partner_portal::apikeys::ApiKeyStore;
+    use partner_portal::ledger::LedgerPool;
+    use std::sync::Arc;
+
+    let pool = Arc::new(LedgerPool::new(db_path.to_path_buf()).expect("open ledger for seeding"));
+    let store = ApiKeyStore::new(pool, TEST_SECRET.to_vec());
+
+    specs
+        .iter()
+        .map(|spec| {
+            let name = spec.name.clone();
+            let consumer_id = spec.effective_consumer_id().to_string();
+            let models = spec.allowed_models.clone();
+
+            match store.create(&name, &consumer_id, models.clone(), None) {
+                Ok((row, plaintext)) => SeededKey {
+                    id: row.id,
+                    plaintext,
+                    name: row.name,
+                    consumer_id: row.consumer_id,
+                    allowed_models: row.allowed_models,
+                },
+                Err(e) => {
+                    // A restart re-seeds a database that already has the row.
+                    // The store's `key_hash` is UNIQUE, so a re-insert fails
+                    // here; the test's own plaintext is the one already stored,
+                    // and only the test knows it.
+                    panic!(
+                        "seeding {name} into {} failed: {e}. \
+                         A restart re-seeds rows that already exist, so this \
+                         must be a schema or secret mismatch, not a duplicate.",
+                        db_path.display()
+                    );
+                }
+            }
+        })
+        .collect()
+}
+
 pub fn open_db(path: &Path) -> Connection {
     let conn = Connection::open(path).expect("open ledger");
     conn.busy_timeout(Duration::from_secs(5))
