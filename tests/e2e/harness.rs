@@ -70,6 +70,14 @@ pub const E2E_MODELS: &[&str] = &[
 ];
 pub const UPSTREAM_KEY: &str = "upstream-secret";
 
+/// The manager password every e2e configuration carries.
+///
+/// One credential, on every instance, because it is what the dashboard logs in
+/// with and — decisively here — the only credential the api-key admin surface
+/// answers to. A test that revokes or issues a key needs it, and a test that
+/// does not is unaffected by its presence.
+pub const MANAGER_PASSWORD: &str = "e2e-manager-password";
+
 /// How long any single wait may take before the test gives up.
 pub const WAIT: Duration = Duration::from_secs(30);
 
@@ -416,6 +424,8 @@ upstream:
   api_key: "{upstream_key}"
   timeout_secs: 15
   connect_timeout_secs: 2
+manager:
+  password: "{manager}"
 database:
   path: "{db}"
   queue_size: 5000
@@ -424,6 +434,7 @@ database:
   retention_interval_secs: 3600
 "#,
         db = db_path.display(),
+        manager = MANAGER_PASSWORD,
     );
 
     write_raw(path, &yaml);
@@ -702,6 +713,53 @@ impl ProxyClient {
             Some((seen, started.elapsed()))
         } else {
             None
+        }
+    }
+
+    /// Send a JSON body with a method and an optional bearer, returning the
+    /// status and the body.
+    ///
+    /// The admin api-key surface is the one place in this suite that needs a
+    /// method other than GET or a chat POST, and it needs the response body as
+    /// well as the status: the issued plaintext exists in exactly one response
+    /// and nowhere else.
+    pub async fn request_json(
+        &self,
+        method: &str,
+        base: &str,
+        path: &str,
+        key: Option<&str>,
+        body: serde_json::Value,
+    ) -> (u16, String) {
+        let mut builder = hyper::Request::builder()
+            .method(method)
+            .uri(format!("{base}{path}"))
+            .header("content-type", "application/json");
+        if let Some(key) = key {
+            builder = builder.header("authorization", format!("Bearer {key}"));
+        }
+
+        let request = match builder.body(
+            Full::new(Bytes::from(body.to_string()))
+                .map_err(|never| match never {})
+                .boxed(),
+        ) {
+            Ok(request) => request,
+            Err(e) => return (0, e.to_string()),
+        };
+
+        match self.client.request(request).await {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .map(|c| String::from_utf8_lossy(&c.to_bytes()).into_owned())
+                    .unwrap_or_default();
+                (status, body)
+            }
+            Err(e) => (0, e.to_string()),
         }
     }
 

@@ -13,6 +13,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod api_key_snapshot;
 mod db_busy;
 mod kill_mid_request;
 mod queue_saturation;
