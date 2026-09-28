@@ -21,6 +21,7 @@
 #   6  readiness   GET /readyz until ready: the gate for receiving traffic
 #   7  switch      the slot goes back into the edge's rotation
 #   9  verify      requests through the edge, checked against the ledger
+#                   (skipped, and said to be skipped, without PARTNER_PORTAL_KEY)
 #  10  cleanup     backups pruned, the rollback command printed
 #
 # Why phases 4 and 8 trade places here: the two slots are fixed, each with its
@@ -85,7 +86,16 @@ Rolling update of one instance slot (a or b) on a single VPS.
 
 Environment: EDGE_PORT, PORTAL_A_PORT, PORTAL_B_PORT,
 PARTNER_PORTAL_CONFIG_FILE, PARTNER_PORTAL_DATA_VOLUME — the same overrides
-deploy/docker-compose.yml documents.
+deploy/docker-compose.yml documents — plus:
+
+  PARTNER_PORTAL_API_KEY_SECRET    required: the deployment will not start
+                                   without it, and a compose command that
+                                   does not have it fails rather than
+                                   quietly deploying an instance that
+                                   cannot verify a single key
+  PARTNER_PORTAL_KEY               a key this deployment issued, for the
+                                   phase 9 probe through the edge; without
+                                   it that probe is skipped and says so
 EOF
 }
 
@@ -134,6 +144,17 @@ export PARTNER_PORTAL_CONFIG_FILE
 
 DATA_VOLUME="${PARTNER_PORTAL_DATA_VOLUME:-partner-portal-deploy_portal-data}"
 COMPOSE=(docker compose -f docker-compose.yml)
+
+# The credential phase 9 probes with, and the one thing here that cannot be read
+# out of the deployment's own files any more: partner keys are hashed rows in the
+# ledger (docs/adr/0014), and the plaintext is not recoverable from the database
+# — not by this script, not by an operator, not by the product. So the operator
+# supplies a key this deployment issued, and a run without one skips the probe
+# rather than inventing a credential. `keygen` cannot stand in for it either: it
+# creates a key, it cannot read one back.
+# Deliberately not exported: nothing this script starts needs it, and a secret
+# that is exported is a secret in every child's environment.
+PARTNER_PORTAL_KEY="${PARTNER_PORTAL_KEY:-}"
 UPSTREAM_CONF="nginx/upstream.d/upstream.conf"
 BACKUP_DIR="$PWD/backups"
 EDGE="http://127.0.0.1:${EDGE_PORT}"
@@ -221,20 +242,6 @@ print(row[0] if row else 0)
 '
 }
 
-# The first configured partner key. Phases 7 and 9 speak to the deployment the
-# way a client does, which means presenting a key — the same file the instances
-# read, so no credential is duplicated into this script or into its environment.
-partner_key() {
-    python3 -c 'import re, sys
-for line in open("config/" + sys.argv[1]):
-    m = re.match(r"\s*-\s*key:\s*[\"\x27]?([^\"\x27#]+)", line)
-    if m:
-        print(m.group(1).strip())
-        break
-else:
-    sys.exit("no key found in config/" + sys.argv[1])' "$PARTNER_PORTAL_CONFIG_FILE"
-}
-
 # Take a slot out of, or put it back into, rotation, then reload the edge. The
 # edit goes through the existing inode (write a temporary, then truncate-and-write
 # the real file) rather than with `sed -i` or `mv`, both of which replace it: the
@@ -318,6 +325,11 @@ say "1. Backup the ledger"
 # not open. The backup connection is opened read-write because a read-only
 # connection cannot always map the WAL's shared memory; it is a reader as far as
 # the writers are concerned.
+#
+# The file holds the partner keys as well as the usage (docs/adr/0014), so this
+# backup is the deployment's only recoverable copy of them — but only under the
+# PARTNER_PORTAL_API_KEY_SECRET the hashes were written with. A restore without
+# that secret restores rows that no key can ever verify against.
 BACKUP_NAME="partner-portal-$(date -u +%Y%m%dT%H%M%SZ).db"
 run mkdir -p "$BACKUP_DIR"
 if [ -z "$DRY_RUN" ]; then
@@ -408,9 +420,15 @@ if [ -z "$DRY_RUN" ]; then
     # 1777 of /tmp — an instance running as uid 10001 gets a directory it cannot
     # create a database in, and fails at startup for a reason that has nothing to
     # do with the image being tested.
+    # `-e VAR` with no `=` propagates the value from this shell's environment,
+    # which must be set — the new build refuses to start without it (ADR 0014),
+    # and phase 2's `compose config -q` has already refused to run the compose
+    # file without it. The scratch database is empty of keys, which is a
+    # legitimate state: this container is here to answer /version, not to serve.
     docker run -d --rm --name "$PREFLIGHT_CONTAINER" \
         -v "$PWD/config:/etc/partner-portal:ro" \
         -e "PARTNER_PORTAL_CONFIG=/etc/partner-portal/$PARTNER_PORTAL_CONFIG_FILE" \
+        -e PARTNER_PORTAL_API_KEY_SECRET \
         --tmpfs /var/lib/partner-portal:rw,mode=0770,uid=10001,gid=10001 \
         -p "127.0.0.1:${preflight_port}:8080" \
         "$IMAGE" >/dev/null || die "the new image did not start"
@@ -536,10 +554,21 @@ say "9. Verify"
 # ---------------------------------------------------------------------------
 # Through the edge, not against the container: what is being verified is the
 # deployment the client sees. Each of these is a real, billed upstream call, which
-# is why the count is an option rather than a constant.
-if [ "$VERIFY_REQUESTS" -gt 0 ] && [ -z "$DRY_RUN" ]; then
+# is why the count is an option rather than a constant — and why it also needs a
+# key, supplied by the operator as PARTNER_PORTAL_KEY. Without one the probe is
+# skipped and said to be skipped: a fresh deployment that has issued no key yet
+# still rolls correctly, and reporting success for a check that never ran would
+# be worse than reporting that it did not.
+if [ "$VERIFY_REQUESTS" -gt 0 ] && [ -z "$DRY_RUN" ] && [ -z "$PARTNER_PORTAL_KEY" ]; then
+    warn "PARTNER_PORTAL_KEY is not set: skipping the traffic verification"
+    warn "  set it to a key this deployment issued (POST /api/admin/api-keys, or"
+    warn "  \`docker compose exec portal-a partner-portal keygen …\`), or"
+    warn "  pass --verify-requests 0 to say so on purpose"
+fi
+
+if [ "$VERIFY_REQUESTS" -gt 0 ] && [ -z "$DRY_RUN" ] && [ -n "$PARTNER_PORTAL_KEY" ]; then
     probe_model="rolling-update-$(date +%s)"
-    key="$(partner_key)"
+    key="$PARTNER_PORTAL_KEY"
     verified=0
     for i in $(seq 1 "$VERIFY_REQUESTS"); do
         code="$(curl -sS --max-time 60 -o /dev/null -w '%{http_code}' \
@@ -566,8 +595,8 @@ print(f"{len(rows)} {done}")')"
     else
         die "the ledger has $ledger_rows row(s) for the probe model, $completed_rows completed; expected $VERIFY_REQUESTS"
     fi
-else
-    info "no probe requests sent (--verify-requests $VERIFY_REQUESTS)"
+elif [ "$VERIFY_REQUESTS" -eq 0 ]; then
+    info "no probe requests sent (--verify-requests 0)"
 fi
 
 # ---------------------------------------------------------------------------

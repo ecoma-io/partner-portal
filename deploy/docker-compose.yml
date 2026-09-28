@@ -59,6 +59,18 @@ x-portal: &portal
     # smoke test sets this to partner-portal.smoke.yaml; nothing else should.
     PARTNER_PORTAL_CONFIG: /etc/partner-portal/${PARTNER_PORTAL_CONFIG_FILE:-partner-portal.yaml}
 
+    # The secret every stored partner key hash is keyed with (docs/adr/0014).
+    # Passed through from the host environment — never written into this file,
+    # which is committed, and never into the image, which is a shipped artefact.
+    # It has to be the same value in both instances and across restarts: the
+    # hashes in the shared ledger are only verifiable under the secret they were
+    # written with, so rotating it re-issues every key rather than re-keying it.
+    #
+    # `:?` turns "the operator forgot it" into `docker compose up` failing here,
+    # naming the variable, instead of a container that starts and rejects every
+    # partner request; the process itself also refuses to start without it.
+    PARTNER_PORTAL_API_KEY_SECRET: ${PARTNER_PORTAL_API_KEY_SECRET:?set PARTNER_PORTAL_API_KEY_SECRET to at least 32 bytes in the environment; see deploy/README.md}
+
   volumes:
     # Read-only: the configuration is re-read every second, and a container that
     # can write its own config has a config that no longer describes the

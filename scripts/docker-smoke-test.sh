@@ -16,7 +16,8 @@
 #   * /readyz answers 200 with ready=true (the metering writer is committing)
 #   * /version reports a schema version (what a rolling update compares)
 #   * authentication is enforced: 401 without a key, 401 with a wrong one, 200 with
-#     the configured one
+#     the one this script seeded into the volume with the image's own `keygen`
+#     (docs/adr/0014 — the key is a row in the ledger, not a line in the config)
 #   * /v1/models is proxied to the upstream and answers
 #   * /v1/chat/completions is proxied *and metered*: the ledger row exists, with the
 #     token usage the upstream reported
@@ -25,7 +26,10 @@
 #   * the dashboard is embedded: GET / returns the built index, not the
 #     "built without a dashboard" placeholder, and a hashed asset is served
 #   * SIGTERM drains the metering pipeline ("metering pipeline drained and
-#     committed") before the process exits, and the ledger survives on the volume
+#     committed") before the process exits, and the database survives on the volume
+#   * a *third* container started on that volume — a recreation, which is what a
+#     redeploy is — accepts the same key, so the key set is durable rather than
+#     something the first container held
 #
 # Usage:
 #   scripts/docker-smoke-test.sh [image]        # default: partner-portal:test
@@ -41,14 +45,35 @@ IMAGE="${1:-partner-portal:test}"
 # script leaves its two-instance stack running when it finishes, so a CI job that
 # runs both must not have them fight over a port. Overridable either way.
 HOST_PORT="${HOST_PORT:-18090}"
+# The recreated container's port, outside both of the above: the first container
+# still holds its mapping after `docker stop`.
+RECREATE_PORT="${RECREATE_PORT:-18091}"
 MOCK_PORT="${MOCK_PORT:-19000}"
-KEY="smoke-key"
+# Longer than the key prefix length on purpose: a real key is `pp_` plus 43
+# characters, and a key shorter than the prefix is stored whole in `key_prefix`,
+# which would make "the listing never returns the secret" unassertable.
+KEY="smoke-key-please-replace"
 UPSTREAM_MODEL="mock-model"
+# The consumer the seeded key belongs to. It is what the dashboard scopes by, so
+# the image test provisions a key the way a deployment would rather than with a
+# placeholder.
+KEY_CONSUMER="smoke"
+
+# The secret the key hashes are keyed with (docs/adr/0014). Required: the process
+# refuses to start without it, and a hash written under one secret is not
+# verifiable under another — which is also why this script never changes it
+# between the seed and the containers it starts.
+API_KEY_SECRET="${PARTNER_PORTAL_API_KEY_SECRET:-smoke-api-key-secret-not-a-real-one!!}"
+
 CONTAINER="partner-portal-smoke-$$"
+RECREATED="partner-portal-smoke-recreated-$$"
 MOCK_CONTAINER="partner-portal-mock-$$"
 VOLUME="partner-portal-smoke-data-$$"
 NETWORK="partner-portal-smoke-net-$$"
 WORK="$(mktemp -d)"
+
+# The database inside the volume, as the image's own WORKDIR/volume path names it.
+DB_PATH="/var/lib/partner-portal/partner-portal.db"
 
 failures=0
 ok() { printf '  ok   %s\n' "$*"; }
@@ -94,6 +119,7 @@ print(doc)
 
 cleanup() {
     docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+    docker rm -f "$RECREATED" >/dev/null 2>&1 || true
     docker rm -f "$MOCK_CONTAINER" >/dev/null 2>&1 || true
     docker volume rm "$VOLUME" >/dev/null 2>&1 || true
     docker network rm "$NETWORK" >/dev/null 2>&1 || true
@@ -175,6 +201,38 @@ fi
 sed "s|http://mock-upstream:9000|http://$MOCK_CONTAINER:9000|" \
     deploy/config/partner-portal.smoke.yaml >"$WORK/config.yaml"
 
+# The key this run authenticates with, issued into the volume by the image's own
+# `keygen` — the first-run provisioning step deploy/README.md documents, and now
+# the only way an image has a key at all: the key set is a table in the ledger,
+# not a line in the config the container mounts (docs/adr/0014).
+#
+# It runs before any container has mounted the volume, and that is deliberate. An
+# empty named volume takes the ownership of the directory in the image it is first
+# mounted from (uid 10001, mode 0750 — the Dockerfile creates it), and only a
+# container that has /var/lib/partner-portal in its image can pass that on. A
+# reader in another image started first would leave the volume root-owned and the
+# deployment would then fail to open its own database.
+#
+# The volume is removed first: it is named after this shell's pid, and a run that
+# died before its trap fired must not leave a volume whose key collides with this
+# run's — the same plaintext hashes to the same row, and the second seed would be
+# a UNIQUE failure rather than a fresh start.
+docker volume rm "$VOLUME" >/dev/null 2>&1 || true
+if ! seed_report="$(docker run --rm \
+    -v "$VOLUME:/var/lib/partner-portal" \
+    -e "PARTNER_PORTAL_API_KEY_SECRET=$API_KEY_SECRET" \
+    "$IMAGE" keygen \
+    --database "$DB_PATH" \
+    --name partner-smoke \
+    --consumer-id "$KEY_CONSUMER" \
+    --plaintext "$KEY" \
+    --allowed-model "$UPSTREAM_MODEL" 2>&1)"; then
+    bad "could not seed the smoke key into a fresh volume"
+    printf '%s\n' "$seed_report" >&2
+    exit 1
+fi
+ok "seeded the partner key into $VOLUME with the image's own keygen"
+
 # Started with the hardening the compose files apply, so this test covers the
 # deployment's actual shape: read-only root filesystem, every capability dropped,
 # no new privileges, non-root user, a writable /tmp only.
@@ -185,6 +243,7 @@ docker run -d --name "$CONTAINER" \
     -p "127.0.0.1:$HOST_PORT:8080" \
     -v "$WORK/config.yaml:/etc/partner-portal/config.yaml:ro" \
     -v "$VOLUME:/var/lib/partner-portal" \
+    -e "PARTNER_PORTAL_API_KEY_SECRET=$API_KEY_SECRET" \
     "$IMAGE" >/dev/null
 
 for _ in $(seq 1 60); do
@@ -226,7 +285,7 @@ fetch "$BASE/api/me" -H "Authorization: Bearer wrong-key"
 expect_eq "wrong key is rejected" "401" "$(status)"
 
 fetch "$BASE/api/me" -H "Authorization: Bearer $KEY"
-expect_eq "configured key is accepted" "200" "$(status)"
+expect_eq "the seeded key is accepted" "200" "$(status)"
 
 # ---------------------------------------------------------------------------
 say "Proxying and metering"
@@ -350,13 +409,51 @@ else
     docker logs "$CONTAINER" 2>&1 | tail -20
 fi
 
-# The ledger must be on the volume, not inside the container: a database written
-# into the image layer disappears at the next deploy, taking the usage with it.
+# The database must be on the volume, not inside the container: a database written
+# into the image layer disappears at the next deploy, taking the usage — and now
+# the partner keys — with it.
 if docker run --rm -v "$VOLUME:/data" --entrypoint /bin/sh "$IMAGE" \
     -c 'test -s /data/partner-portal.db'; then
-    ok "the ledger persists on the declared volume"
+    ok "the database persists on the declared volume"
 else
-    bad "no ledger on the volume after shutdown"
+    bad "no database on the volume after shutdown"
+fi
+
+# And the keys in it are usable by a process that was not there when they were
+# written. Checking the file exists does not say that: a third container is what
+# proves the seeded key is durable rather than something the first container held
+# in memory — which is exactly the difference between a redeploy that keeps
+# working and one that hands every partner a 401.
+say "A container recreated on the same volume accepts the same key"
+docker run -d --name "$RECREATED" \
+    --network "$NETWORK" \
+    --read-only --tmpfs /tmp \
+    --cap-drop ALL --security-opt no-new-privileges \
+    -p "127.0.0.1:$RECREATE_PORT:8080" \
+    -v "$WORK/config.yaml:/etc/partner-portal/config.yaml:ro" \
+    -v "$VOLUME:/var/lib/partner-portal" \
+    -e "PARTNER_PORTAL_API_KEY_SECRET=$API_KEY_SECRET" \
+    "$IMAGE" >/dev/null
+
+for _ in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:$RECREATE_PORT/healthz" >/dev/null 2>&1; then break; fi
+    if ! docker inspect --format '{{.State.Running}}' "$RECREATED" | grep -q true; then
+        bad "the recreated container exited during startup"
+        docker logs "$RECREATED" 2>&1 | tail -20
+        exit 1
+    fi
+    sleep 1
+done
+
+fetch "http://127.0.0.1:$RECREATE_PORT/api/me" -H "Authorization: Bearer $KEY"
+expect_eq "the recreated container accepts the same key" "200" "$(status)"
+if [ "$(status)" = "200" ]; then
+    expect_eq "and still identifies the same consumer" "$KEY_CONSUMER" \
+        "$(body | json_get consumer_id)"
+else
+    # A 401 here means the key did not survive the recreation; the body is the
+    # only thing that says so, and it is about to be overwritten.
+    docker logs "$RECREATED" 2>&1 | tail -20
 fi
 
 # ---------------------------------------------------------------------------

@@ -36,19 +36,34 @@ upstream:
   timeout_secs: 120
   connect_timeout_secs: 10
 
-# Consumers of this proxy. Each key is an identity: the consumer_id it derives is
-# what every ledger row and every dashboard query is scoped by, and it is always
-# taken from this file, never from the request.
-keys:
-  - key: "REPLACE-WITH-A-PARTNER-KEY"
-    name: "partner-smoke"
-    # Models this key may call. Strict (docs/adr/0012): a key that omits the
-    # field serves `404 model_not_found` for every model, and `/v1/models`
-    # answers this same filtered list. Replace with what the real upstream
-    # serves and this partner may call.
-    allowed_models:
-      - "gpt-4o"
-      - "gpt-4o-mini"
+# There is no `keys:` block here, and there cannot be one: partner API keys are
+# rows in the ledger database (docs/adr/0014), and `Config` rejects an unknown
+# field, so a leftover block is a start-up failure rather than a credential
+# source nobody is reading. Provision the first key with
+#
+#   docker compose exec portal-a partner-portal keygen \
+#     --name partner-production --consumer-id acme --allowed-model gpt-4o
+#
+# which prints the plaintext once and stores only its keyed hash, and issue,
+# rename, restrict, rotate and revoke the rest through `POST /api/admin/api-keys`
+# with the manager password. Both write to `database.path` below, which is why
+# that file must be on a volume: a key issued into a container's own filesystem
+# disappears with the container.
+#
+# The secret those hashes are keyed with is neither in this file nor in the
+# database: `PARTNER_PORTAL_API_KEY_SECRET`, at least 32 bytes, supplied through
+# the environment (`docker-compose.yml` passes the host's through and refuses to
+# start without it). The process will not start without it either — and because
+# a stored hash can only be verified under the secret it was written with, the
+# value must not change between restarts. See docs/adr/0014.
+
+manager:
+  # The credential that reaches `/api/admin/api-keys` — and the dashboard's
+  # cross-consumer view. Replace it. The manager password is read from this file
+  # only, so a deployment that must keep it out of the repository replaces it in
+  # its own copy of this directory rather than looking for a variable: there is
+  # no environment override for it.
+  password: "REPLACE-WITH-A-MANAGER-PASSWORD"
 
 database:
   # Absolute, and on the shared volume: the pair writes to one ledger.
