@@ -11,12 +11,18 @@ use std::sync::Arc;
 
 use crate::proxy::handler::AppState;
 
+pub mod keys;
+
 /// Admin router. Mount at the root.
 pub fn create_admin_router() -> Router<Arc<AppState>> {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/version", get(version))
+        // The manager-only api-key surface. Merged here rather than in `main`
+        // so every route this product serves from `/api/admin` is one `Router`,
+        // and a new one cannot be forgotten at the composition root.
+        .merge(keys::create_key_router())
 }
 
 #[derive(Serialize)]

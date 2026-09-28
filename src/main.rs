@@ -191,12 +191,8 @@ async fn main() -> anyhow::Result<()> {
     // request with a 401. It also owns the poller that picks up a sibling's
     // commits, which is what makes more than one instance correct.
     let api_key_refresher = Arc::new(
-        ApiKeyRefresher::new(
-            &db_path,
-            api_keys.clone(),
-            config.server.api_key_refresh_ms,
-        )
-        .map_err(|e| anyhow::anyhow!("failed to start the api key refresher: {e}"))?,
+        ApiKeyRefresher::new(&db_path, api_keys.clone(), config.server.api_key_refresh_ms)
+            .map_err(|e| anyhow::anyhow!("failed to start the api key refresher: {e}"))?,
     );
     api_key_refresher.start();
     // Zero is a legitimate state after a database was created but no partner
