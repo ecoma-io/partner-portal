@@ -332,6 +332,16 @@ pub struct ServerConfig {
     /// How often the dashboard's SSE poller checks SQLite for changes.
     #[serde(default = "default_sse_poll_interval_ms")]
     pub sse_poll_interval_ms: u64,
+
+    /// How often the API-key snapshot is reloaded after another instance
+    /// changes a key.
+    ///
+    /// The key set is held in memory so that authentication never queries
+    /// SQLite. That is only correct for one instance unless the others' writes
+    /// are noticed, and this is the bound on how long a revoke issued through
+    /// instance A can stay effective on instance B.
+    #[serde(default = "default_api_key_refresh_ms")]
+    pub api_key_refresh_ms: u64,
 }
 
 impl Default for ServerConfig {
@@ -342,6 +352,7 @@ impl Default for ServerConfig {
             max_body_size: default_max_body_size(),
             cors_allow_origins: Vec::new(),
             sse_poll_interval_ms: default_sse_poll_interval_ms(),
+            api_key_refresh_ms: default_api_key_refresh_ms(),
         }
     }
 }
@@ -357,6 +368,9 @@ fn default_max_body_size() -> usize {
 } // 10MB
 fn default_sse_poll_interval_ms() -> u64 {
     500
+}
+fn default_api_key_refresh_ms() -> u64 {
+    crate::apikeys::refresher::DEFAULT_REFRESH_INTERVAL_MS
 }
 
 /// Database configuration

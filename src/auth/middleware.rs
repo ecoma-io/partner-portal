@@ -1,15 +1,24 @@
 //! Authentication.
 //!
-//! Identity is **always derived server-side** from the presented credential and
-//! the current config snapshot. Nothing a client sends — `consumer_id`,
-//! `x-consumer-id`, or any other field — contributes to identity, so no request
-//! can read or write another consumer's data by asserting it.
+//! Identity is **always derived server-side** from the presented credential.
+//! Nothing a client sends — `consumer_id`, `x-consumer-id`, or any other field
+//! — contributes to identity, so no request can read or write another consumer's
+//! data by asserting it.
 //!
-//! Two credentials are accepted: a local key value (scoped to its consumer) and,
+//! Two credentials are accepted: a partner API key (scoped to its consumer) and,
 //! when configured, the manager password (scoped to every consumer; ADR 0013).
-//! Both travel as `Authorization: Bearer <value>`; the manager password is not a
-//! key, and the two sets never intersect because `find_key` runs first and the
-//! manager password is not a member of the key set.
+//! Both travel as `Authorization: Bearer <value>`. They never intersect, and the
+//! order below is what keeps them apart: a partner key is looked up in the
+//! database-backed key set first, and the manager password is not a member of
+//! that set — a key is generated, and no generated key can equal a password an
+//! operator chose.
+//!
+//! A partner key is resolved by hashing it and looking that hash up in an
+//! in-memory snapshot ([`crate::apikeys::ApiKeyStore`]). This is where a
+//! request must **not** touch SQLite: the snapshot is refreshed at start-up,
+//! after every local mutation and on a timer for siblings' commits, and a
+//! request never queries the database. The manager password stays a
+//! configuration credential, read from the config snapshot exactly as before.
 //!
 //! Implemented as an axum extractor rather than a middleware layer: a handler
 //! that takes `Authenticated` cannot be written without resolving an identity,
@@ -103,18 +112,21 @@ impl FromRequestParts<Arc<AppState>> for Authenticated {
     ) -> Result<Self, Self::Rejection> {
         let token = extract_bearer_token(parts)?;
 
-        // Read from the live snapshot, so a key or the manager password added
-        // or revoked by hot reload takes effect on the next request without a
-        // restart. `find_key` runs first: the manager password is a distinct
-        // credential, not a member of the key set.
-        let config = state.config.read();
-        if let Some(key_config) = config.config.find_key(token) {
+        // A partner key: hash it and look that hash up in the in-memory
+        // snapshot. No database query, and the snapshot is current as of the
+        // last refresh — a revoke through this instance has already been
+        // applied, and one through a sibling lands within the refresh interval.
+        if let Some(auth) = state.api_keys.authenticate(token) {
             return Ok(Authenticated(ConsumerContext::new(
-                key_config.consumer_id().to_string(),
-                key_config.name.clone(),
-                key_config.allowed_models.clone(),
+                auth.consumer_id,
+                auth.name,
+                auth.allowed_models,
             )));
         }
+
+        // The manager password is still a configuration credential. Read fresh,
+        // so a hot reload rotates it without a restart.
+        let config = state.config.read();
         if config.config.find_manager(token).is_some() {
             return Ok(Authenticated(ConsumerContext::manager()));
         }

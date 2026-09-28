@@ -28,8 +28,10 @@
 //!    ADR 0008 behaviour.
 
 pub mod admin;
+pub mod apikeys;
 pub mod auth;
 pub mod config;
+pub mod crypto;
 pub mod dashboard;
 pub mod ledger;
 pub mod proxy;

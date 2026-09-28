@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
+use crate::apikeys::ApiKeyStore;
 use crate::auth::ConsumerContext;
 use crate::config::{ConfigSnapshot, UpstreamConfig};
 use crate::dashboard::SseBroadcaster;
@@ -70,6 +71,11 @@ pub struct AppState {
     pub ledger: Arc<LedgerWriter>,
     pub pool: Arc<LedgerPool>,
     pub broadcaster: Arc<SseBroadcaster>,
+    /// The partner API keys, and the in-memory snapshot authentication reads.
+    ///
+    /// Reached on every request, and deliberately does no I/O: the lookup is a
+    /// keyed hash followed by a `HashMap` hit on the snapshot this store holds.
+    pub api_keys: Arc<ApiKeyStore>,
     /// Set when shutdown starts, so readiness fails before draining begins.
     pub shutting_down: Arc<AtomicBool>,
 }

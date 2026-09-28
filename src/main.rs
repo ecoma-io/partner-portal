@@ -56,6 +56,7 @@ use tracing::{error, info, warn};
 
 use partner_portal::{
     admin::create_admin_router,
+    apikeys::{self, ApiKeyRefresher, ApiKeyStore},
     auth::Authenticated,
     config::{ConfigLoader, HotReloader, listen_addr},
     dashboard::{SseBroadcaster, create_dashboard_router},
@@ -168,6 +169,51 @@ async fn main() -> anyhow::Result<()> {
     );
     let ledger = Arc::new(LedgerWriter::new(pool.writer(), writer_config));
 
+    // --- Partner API keys ---------------------------------------------------
+    //
+    // The key set is database-backed and the hash is keyed by a secret from the
+    // environment. The secret is required, not defaulted: a deployment that
+    // starts with a key set it cannot hash is a deployment that authenticates
+    // nobody and says only "Invalid API key" (ADR 0014).
+    let api_key_secret = apikeys::load_secret()
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e}. Generate one with `openssl rand -base64 32` and supply it \
+                 through the deployment's environment; it is never stored in the \
+                 database and never written to the config file"
+            )
+        })?;
+    let api_keys = Arc::new(ApiKeyStore::new(pool.clone(), api_key_secret));
+
+    // The refresher loads the key set at construction, so a key set that cannot
+    // be read is a start-up failure rather than an instance that answers every
+    // request with a 401. It also owns the poller that picks up a sibling's
+    // commits, which is what makes more than one instance correct.
+    let api_key_refresher = Arc::new(
+        ApiKeyRefresher::new(
+            &db_path,
+            api_keys.clone(),
+            config.server.api_key_refresh_ms,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to start the api key refresher: {e}"))?,
+    );
+    api_key_refresher.start();
+    // Zero is a legitimate state after a database was created but no partner
+    // has been provisioned, so it is logged rather than refused. The admin API
+    // and `partner-portal keygen` are how a key gets issued.
+    if api_key_refresher.initial_key_count() == 0 {
+        warn!(
+            "no active api keys in the database; every partner request will be \
+             rejected with 401 until a key is issued"
+        );
+    }
+    info!(
+        keys = api_key_refresher.initial_key_count(),
+        refresh_ms = config.server.api_key_refresh_ms,
+        "partner api keys loaded"
+    );
+
     // --- Configuration hot reload -------------------------------------------
 
     let reloader = HotReloader::new(config_path.clone(), config.clone());
@@ -194,6 +240,7 @@ async fn main() -> anyhow::Result<()> {
         ledger: ledger.clone(),
         pool: pool.clone(),
         broadcaster: broadcaster.clone(),
+        api_keys: api_keys.clone(),
         shutting_down: shutting_down.clone(),
     });
 

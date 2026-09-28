@@ -40,7 +40,11 @@ pub use writer::{LedgerWriter, LedgerWriterConfig, WriteError};
 /// * 2 — `cached_tokens`
 /// * 3 — `usage_records.instance_id` + `ledger_instances` (ownership-aware recovery)
 /// * 4 — bounded `usage_records.error_body` for non-2xx upstream responses
-pub const SCHEMA_VERSION: u32 = 4;
+/// * 5 — `api_keys`: partner API keys move out of `config.yaml` and into the
+///   database (ADR 0014). A new table needs no data migration, so this is
+///   additive in both directions: an older binary ignores it, and a database
+///   created by an older build gains an empty one.
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// A failure to bring the database up to the schema this binary expects.
 #[derive(Debug)]
@@ -411,6 +415,39 @@ mod tests {
     }
 
     #[test]
+    fn test_a_fresh_database_carries_the_api_keys_table() {
+        // The table is the source of truth for credentials, so its absence
+        // would be a silent "no partner may call" rather than a failure.
+        let dir = TempDir::new().unwrap();
+        let conn = new_db(&dir.path().join("t.db"));
+        init_schema(&conn).unwrap();
+
+        for column in [
+            "id",
+            "name",
+            "consumer_id",
+            "key_prefix",
+            "key_hash",
+            "allowed_models",
+            "status",
+            "created_at",
+            "updated_at",
+            "expires_at",
+            "revoked_at",
+        ] {
+            assert!(
+                column_exists(&conn, "api_keys", column).unwrap(),
+                "api_keys.{column} must exist"
+            );
+        }
+
+        let keys: i64 = conn
+            .query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(keys, 0, "a fresh database has no keys yet");
+    }
+
+    #[test]
     fn test_older_schema_is_migrated_forward_not_relabelled() {
         // Build a v3 database: the ledger as it shipped before bounded error
         // bodies, with ownership present and the version stamped 3.
@@ -449,11 +486,23 @@ mod tests {
 
         init_schema(&conn).unwrap();
 
-        assert_eq!(read_schema_version(&conn).unwrap(), 4);
+        assert_eq!(read_schema_version(&conn).unwrap(), SCHEMA_VERSION);
         assert!(
             column_exists(&conn, "usage_records", "error_body").unwrap(),
             "the migration must actually add the column, not just relabel the file"
         );
+        // A v3 file gains `api_keys` and nothing else: a new table is additive,
+        // so there is no row for the migration to carry over — and, stated
+        // plainly, a deployment that upgrades finds no partner keys waiting,
+        // because keys moved out of `config.yaml` (ADR 0014).
+        let key_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='api_keys'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(key_table, 1, "the migration must create api_keys");
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM usage_records", [], |r| r.get(0))
             .unwrap();

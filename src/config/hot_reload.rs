@@ -237,6 +237,13 @@ fn report_restart_required_changes(old: &Config, new: &Config) {
             new.server.sse_poll_interval_ms,
         );
     }
+    if old.server.api_key_refresh_ms != new.server.api_key_refresh_ms {
+        needs_restart(
+            "server.api_key_refresh_ms",
+            old.server.api_key_refresh_ms,
+            new.server.api_key_refresh_ms,
+        );
+    }
     if old.upstream.connect_timeout_secs != new.upstream.connect_timeout_secs {
         needs_restart(
             "upstream.connect_timeout_secs",
@@ -520,6 +527,7 @@ server:
   max_body_size: 10485760
   cors_allow_origins: []
   sse_poll_interval_ms: 500
+  api_key_refresh_ms: 1000
 upstream:
   base_url: https://api.openai.com
   api_key: sk-test
@@ -564,6 +572,11 @@ database:
                 "server.sse_poll_interval_ms",
                 "sse_poll_interval_ms: 500",
                 "sse_poll_interval_ms: 1000",
+            ),
+            (
+                "server.api_key_refresh_ms",
+                "api_key_refresh_ms: 1000",
+                "api_key_refresh_ms: 2000",
             ),
             (
                 "upstream.base_url",
