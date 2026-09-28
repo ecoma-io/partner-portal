@@ -93,11 +93,11 @@ seed() {
   _seed_name="$2"
   _seed_consumer="$3"
 
-  # One --allow-model per model, because the flag is repeatable and the
+  # One --allowed-model per model, because the flag is repeatable and the
   # allow-list is a list rather than a string.
   _seed_models=""
   for _m in $DEV_MODELS; do
-    _seed_models="$_seed_models --allow-model $_m"
+    _seed_models="$_seed_models --allowed-model $_m"
   done
 
   # stderr is captured and stdout discarded: `keygen` prints the plaintext on
@@ -107,7 +107,7 @@ seed() {
   _seed_out=$(PARTNER_PORTAL_CONFIG="$DEV_CONFIG" \
     cargo run --quiet --bin partner-portal -- keygen \
       --name "$_seed_name" \
-      --consumer "$_seed_consumer" \
+      --consumer-id "$_seed_consumer" \
       --plaintext "$_seed_key" \
       $_seed_models 2>&1 >/dev/null) || {
         echo "$SCRIPT_NAME: could not issue $_seed_name" >&2

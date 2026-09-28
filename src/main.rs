@@ -446,8 +446,13 @@ fn run_keygen(argv: &[String]) -> Result<(), String> {
         }
     };
 
-    let config_path = config_path();
-    let db_path = keygen::database_path(&config_path).map_err(|e| e.to_string())?;
+    // `--database` names the file directly and skips the configuration entirely
+    // rather than overriding it, so there is never a question of which of the
+    // two a run used.
+    let db_path = match &request.database {
+        Some(path) => path.clone(),
+        None => keygen::database_path(&config_path()).map_err(|e| e.to_string())?,
+    };
     let secret = keygen::load_hashing_secret()?;
 
     // Only the plaintext reaches stdout. Using `print!` and flushing explicitly

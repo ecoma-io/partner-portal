@@ -14,7 +14,8 @@
 //! **not** part of the runtime architecture: the server never invokes it, it
 //! holds no state, and nothing about serving a request depends on it having run.
 //! An operator runs it once per key, against the same database and the same
-//! secret the server uses.
+//! secret the server uses — named by the configuration file, or by `--database`
+//! when there is no server to share a configuration with.
 //!
 //! # The secret is half the operation
 //!
@@ -79,6 +80,11 @@ pub struct Request {
     pub consumer_id: String,
     pub allowed_models: Vec<String>,
     pub plaintext: Plaintext,
+    /// `--database <PATH>`, when the operator named a file directly.
+    ///
+    /// `Some` means the configuration file is not read at all, so there is no
+    /// question of which of the two wins.
+    pub database: Option<std::path::PathBuf>,
 }
 
 /// Why a command line was refused.
@@ -132,44 +138,55 @@ pub fn usage() -> String {
     let _ = writeln!(out, "Options:");
     let _ = writeln!(
         out,
-        "  --name <NAME>          a label for the key, shown in the listing"
+        "  --name <NAME>              a label for the key, shown in the listing"
     );
     let _ = writeln!(
         out,
-        "  --consumer <ID>        the consumer_id this key identifies as"
+        "  --consumer-id <ID>         the consumer_id this key identifies as"
     );
     let _ = writeln!(
         out,
-        "  --allow-model <MODEL>  a model the key may call; repeatable, and at"
+        "  --allowed-model <MODEL>    a model the key may call; repeatable, and at"
     );
-    let _ = writeln!(out, "                         least one is required");
+    let _ = writeln!(out, "                             least one is required");
     let _ = writeln!(
         out,
-        "  --plaintext <VALUE|->  register this plaintext instead of generating"
-    );
-    let _ = writeln!(
-        out,
-        "                         one; `-` reads a line from stdin. For migrating"
+        "  --plaintext <VALUE|->      register this plaintext instead of"
     );
     let _ = writeln!(
         out,
-        "                         an existing key and for fixtures — see below"
+        "                             generating one; `-` reads a line from stdin."
     );
-    let _ = writeln!(out, "  -h, --help             print this text");
+    let _ = writeln!(
+        out,
+        "                             For migrating and for fixtures"
+    );
+    let _ = writeln!(
+        out,
+        "  --database <PATH>          the ledger file. Without it the database comes"
+    );
+    let _ = writeln!(
+        out,
+        "                             from the configuration file (`{CONFIG_ENV}`,"
+    );
+    let _ = writeln!(
+        out,
+        "                             else config.yaml) — the same one the server"
+    );
+    let _ = writeln!(
+        out,
+        "                             reads. With it, no configuration file is read"
+    );
+    let _ = writeln!(out, "  -h, --help                 print this text");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
-        "The database comes from the configuration file (`{CONFIG_ENV}`, else"
+        "The hashing secret comes from PARTNER_PORTAL_API_KEY_SECRET and must be the"
     );
     let _ = writeln!(
         out,
-        "config.yaml) — the same one the server reads. The hashing secret comes from"
+        "secret the server runs with, or the key issued here authenticates nowhere."
     );
-    let _ = writeln!(
-        out,
-        "PARTNER_PORTAL_API_KEY_SECRET and must be the secret the server runs with, or"
-    );
-    let _ = writeln!(out, "the key issued here will not authenticate anywhere.");
     let _ = writeln!(out);
     let _ = writeln!(
         out,
@@ -211,13 +228,15 @@ pub fn usage() -> String {
 
 /// Parse the arguments that follow the subcommand word.
 ///
-/// Hand-rolled rather than `clap`: this is one subcommand with three flags, and
-/// `AGENTS.md` asks for a reason before a dependency is added.
+/// Hand-rolled rather than `clap`: this is one subcommand with five flags, all
+/// of them taking a value, and `AGENTS.md` asks for a reason before a dependency
+/// is added.
 pub fn parse(args: &[String]) -> Result<Request, UsageError> {
     let mut name: Option<String> = None;
     let mut consumer_id: Option<String> = None;
     let mut allowed_models: Vec<String> = Vec::new();
     let mut plaintext = Plaintext::Generated;
+    let mut database: Option<std::path::PathBuf> = None;
 
     let mut rest = args.iter().skip(1);
     // Skip the subcommand word itself.
@@ -236,19 +255,26 @@ pub fn parse(args: &[String]) -> Result<Request, UsageError> {
                 }
                 name = Some(value);
             }
-            "--consumer" => {
-                let value = value_for("--consumer")?;
+            "--consumer-id" => {
+                let value = value_for("--consumer-id")?;
                 if value.trim().is_empty() {
-                    return Err(UsageError::Blank("--consumer"));
+                    return Err(UsageError::Blank("--consumer-id"));
                 }
                 consumer_id = Some(value);
             }
-            "--allow-model" => {
-                let value = value_for("--allow-model")?;
+            "--allowed-model" => {
+                let value = value_for("--allowed-model")?;
                 if value.trim().is_empty() {
-                    return Err(UsageError::Blank("--allow-model"));
+                    return Err(UsageError::Blank("--allowed-model"));
                 }
                 allowed_models.push(value);
+            }
+            "--database" => {
+                let value = value_for("--database")?;
+                if value.trim().is_empty() {
+                    return Err(UsageError::Blank("--database"));
+                }
+                database = Some(std::path::PathBuf::from(value));
             }
             "--plaintext" => {
                 let value = value_for("--plaintext")?;
@@ -267,7 +293,7 @@ pub fn parse(args: &[String]) -> Result<Request, UsageError> {
     }
 
     if allowed_models.is_empty() {
-        return Err(UsageError::Missing("--allow-model"));
+        return Err(UsageError::Missing("--allowed-model"));
     }
 
     Ok(Request {
@@ -277,9 +303,10 @@ pub fn parse(args: &[String]) -> Result<Request, UsageError> {
         // guessed consumer_id is a key that attributes usage to the wrong
         // partner.
         name: name.unwrap_or_else(|| "unnamed".to_string()),
-        consumer_id: consumer_id.ok_or(UsageError::Missing("--consumer"))?,
+        consumer_id: consumer_id.ok_or(UsageError::Missing("--consumer-id"))?,
         allowed_models,
         plaintext,
+        database,
     })
 }
 
@@ -465,7 +492,7 @@ mod tests {
     #[test]
     fn test_the_subcommand_is_recognised_only_as_the_first_word() {
         assert!(requested(&args(&[])));
-        assert!(requested(&args(&["--name", "x", "--consumer", "y"])));
+        assert!(requested(&args(&["--name", "x", "--consumer-id", "y"])));
         // No arguments is the server, which is what this binary is. So is a
         // flag, so `partner-portal --help` does not provision anything.
         assert!(!requested(&["partner-portal".to_string()]));
@@ -484,20 +511,26 @@ mod tests {
         // The property worth pinning: this command cannot mint a credential with
         // unbounded authority, and it cannot mint one that authenticates but is
         // allowed nothing either — both would be surprising in opposite ways.
-        let err = parse(&args(&["--name", "alice", "--consumer", "acme"])).unwrap_err();
-        assert_eq!(err, UsageError::Missing("--allow-model"));
-        assert!(usage().contains("--allow-model"));
+        let err = parse(&args(&["--name", "alice", "--consumer-id", "acme"])).unwrap_err();
+        assert_eq!(err, UsageError::Missing("--allowed-model"));
+        assert!(usage().contains("--allowed-model"));
     }
 
     #[test]
     fn test_a_consumer_is_required_and_never_defaulted() {
         // consumer_id is the isolation boundary (invariant 7). A default would
         // silently attribute one partner's usage to another.
-        let err = parse(&args(&["--allow-model", "gpt-4o"])).unwrap_err();
-        assert_eq!(err, UsageError::Missing("--consumer"));
+        let err = parse(&args(&["--allowed-model", "gpt-4o"])).unwrap_err();
+        assert_eq!(err, UsageError::Missing("--consumer-id"));
 
         // The name, by contrast, is a label and has a stated default.
-        let request = parse(&args(&["--consumer", "acme", "--allow-model", "gpt-4o"])).unwrap();
+        let request = parse(&args(&[
+            "--consumer-id",
+            "acme",
+            "--allowed-model",
+            "gpt-4o",
+        ]))
+        .unwrap();
         assert_eq!(request.name, "unnamed");
         assert_eq!(request.consumer_id, "acme");
     }
@@ -505,13 +538,13 @@ mod tests {
     #[test]
     fn test_flags_parse_in_any_order_and_models_repeat() {
         let request = parse(&args(&[
-            "--allow-model",
+            "--allowed-model",
             "gpt-4o",
-            "--consumer",
+            "--consumer-id",
             "acme",
             "--name",
             "alice",
-            "--allow-model",
+            "--allowed-model",
             "gpt-4o-mini",
         ]))
         .unwrap();
@@ -524,7 +557,30 @@ mod tests {
                 // The default, asserted here so a bug that made `--plaintext`
                 // the default would be caught: every real key is generated.
                 plaintext: Plaintext::Generated,
+                // And no `--database` means the configuration file is the
+                // source, which is what makes `partner-portal keygen` find the
+                // same file the server runs against.
+                database: None,
             }
+        );
+    }
+
+    #[test]
+    fn test_a_named_database_is_taken_verbatim() {
+        let request = parse(&args(&[
+            "--database",
+            "/var/lib/partner-portal/partner-portal.db",
+            "--consumer-id",
+            "acme",
+            "--allowed-model",
+            "gpt-4o",
+        ]))
+        .unwrap();
+        assert_eq!(
+            request.database,
+            Some(std::path::PathBuf::from(
+                "/var/lib/partner-portal/partner-portal.db"
+            ))
         );
     }
 
@@ -533,9 +589,9 @@ mod tests {
         // The two forms, and the one that must not be confused with a value:
         // `-` selects the stdin path rather than registering a key called "-".
         let given = parse(&args(&[
-            "--consumer",
+            "--consumer-id",
             "acme",
-            "--allow-model",
+            "--allowed-model",
             "gpt-4o",
             "--plaintext",
             "dev-key",
@@ -544,9 +600,9 @@ mod tests {
         assert_eq!(given.plaintext, Plaintext::Supplied("dev-key".to_string()));
 
         let piped = parse(&args(&[
-            "--consumer",
+            "--consumer-id",
             "acme",
-            "--allow-model",
+            "--allowed-model",
             "gpt-4o",
             "--plaintext",
             "-",
@@ -558,26 +614,26 @@ mod tests {
     #[test]
     fn test_a_bad_command_line_is_refused_rather_than_guessed() {
         assert_eq!(
-            parse(&args(&["--consumer"])),
-            Err(UsageError::MissingValue("--consumer"))
+            parse(&args(&["--consumer-id"])),
+            Err(UsageError::MissingValue("--consumer-id"))
         );
         assert_eq!(
             parse(&args(&["--nope", "x"])),
             Err(UsageError::UnknownArgument("--nope".to_string()))
         );
         assert_eq!(
-            parse(&args(&["--consumer", "  ", "--allow-model", "gpt-4o"])),
-            Err(UsageError::Blank("--consumer"))
+            parse(&args(&["--consumer-id", "  ", "--allowed-model", "gpt-4o"])),
+            Err(UsageError::Blank("--consumer-id"))
         );
         assert_eq!(
-            parse(&args(&["--consumer", "acme", "--allow-model", " "])),
-            Err(UsageError::Blank("--allow-model"))
+            parse(&args(&["--consumer-id", "acme", "--allowed-model", " "])),
+            Err(UsageError::Blank("--allowed-model"))
         );
         // A value that looks like a flag is taken as the value, not as a flag:
         // `--name --consumer` would otherwise be a confusing partial parse.
         assert_eq!(
-            parse(&args(&["--name", "--consumer", "--consumer", "acme"])),
-            Err(UsageError::Missing("--allow-model"))
+            parse(&args(&["--name", "--consumer-id", "--consumer-id", "acme"])),
+            Err(UsageError::Missing("--allowed-model"))
         );
     }
 
@@ -593,9 +649,9 @@ mod tests {
         let request = parse(&args(&[
             "--name",
             "first",
-            "--consumer",
+            "--consumer-id",
             "acme",
-            "--allow-model",
+            "--allowed-model",
             "gpt-4o",
         ]))
         .unwrap();
@@ -644,7 +700,13 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let db_path = dir.path().join("ledger.db");
 
-        let request = parse(&args(&["--consumer", "acme", "--allow-model", "gpt-4o"])).unwrap();
+        let request = parse(&args(&[
+            "--consumer-id",
+            "acme",
+            "--allowed-model",
+            "gpt-4o",
+        ]))
+        .unwrap();
         let plaintext = run(
             &db_path,
             b"the-secret-keygen-ran-with-32-bytes".to_vec(),
