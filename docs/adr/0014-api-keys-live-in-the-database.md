@@ -7,6 +7,15 @@ relocates the list that [ADR 0012](0012-per-key-model-allow-list.md) gates
 traffic with. It narrows ADR 0008's "the config is the credential" clause and
 leaves every other decision in both records standing.
 
+Extended by [ADR 0015](0015-daily-postpaid-statements.md), which added a second
+table beside `api_keys` — `partners` — and reuses this record's `ManagerOnly`
+boundary for the whole commercial surface rather than only the key lifecycle. The
+same argument settles both: a credential that could mark a partner's own statement
+paid would end that partner's own suspension with one click, so the separation is
+between roles and not between screens. The same unconditional refresh interval
+that keeps revoked keys from outliving their revocation also keeps a suspended
+partner's status and a replaced price list from outliving the change.
+
 ## Context
 
 A partner API key was a plaintext line in `config.yaml`

@@ -137,10 +137,14 @@ as a settlement record and owes nothing.**
 
 * **The SMTP credential is a deployment environment variable and nothing else.**
   `PARTNER_PORTAL_SMTP_USERNAME` and `PARTNER_PORTAL_SMTP_PASSWORD`, read into
-  memory at startup, never written to SQLite and never present in YAML. The
-  username and password must be set together, because half a credential cannot
-  authenticate. `EmailConfig` has no password field at all, so `Config` cannot
-  be a place one ends up.
+  memory at startup, never written to SQLite and never present in YAML. The pair
+  is read as a pair: neither variable is an anonymous relay and not an error,
+  and exactly one is a warning plus a skipped send rather than a startup failure
+  — half a credential cannot authenticate, and a proxy that refuses to boot over
+  a mis-set mail variable is a worse outcome than a statement that was written
+  and not sent, which the manager's statement detail already reports.
+  `EmailConfig` has no password field at all, so `Config` cannot be a place one
+  ends up.
 
 * **The partner surface is read-only and the manager surface is the only write
   surface**, both behind the same `ManagerOnly` boundary as ADR 0014's key

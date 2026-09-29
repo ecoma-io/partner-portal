@@ -17,16 +17,22 @@ does not say, and what reading any one file will not tell you.
 
 `partner-portal` — an OpenAI-compatible reverse proxy in front of **one**
 upstream, with database-backed API-key authentication, a durable SQLite usage
-ledger, and a Vue dashboard embedded in the binary. Three proxied paths
+ledger, a commercial daily postpaid billing layer over that ledger, and a Vue
+dashboard embedded in the binary. Three proxied paths
 (`/v1/chat/completions`, `/v1/responses`, `/v1/models`), five self-scoped
-dashboard endpoints, three admin endpoints, the manager-only API-key lifecycle,
-one static SPA.
+dashboard endpoints, three admin endpoints, the partner-facing `/api/billing`
+surface, the manager-only API-key, partner and billing surfaces, and one static
+SPA that is four views inside one authenticated shell.
 
 It is deliberately **not** a general-purpose LLM gateway: no routing, no
-multi-provider failover, no request transformation, no pricing. Routing is a
-different product with a different failure model; the decisions that shaped this
-one are in [`docs/adr/`](docs/adr/) — read the ADR before changing anything it
-covers.
+multi-provider failover, no request transformation. It is also deliberately
+**not** a payments system: it issues a statement and records that money moved,
+and it collects nothing itself — no Stripe, no wallet, no subscription, no
+coupon, no tax engine, no automatic charging, no payment-provider abstraction.
+Routing is a different product with a different failure model, and so is
+collection; the decisions that shaped this one are in
+[`docs/adr/`](docs/adr/) — read the ADR before changing anything it covers,
+and read ADR 0015 before changing anything that touches money.
 
 ## The seven invariants
 
@@ -62,9 +68,10 @@ tests that enforce it, and the superseded ADR, in one pull request.
 | `src/proxy/` | Upstream client (`client.rs`), request handler and `StreamMeter` (`handler.rs`), SSE scanner (`sse_scan.rs`), per-endpoint usage extraction (`usage.rs`) |
 | `src/ledger/` | `schema.sql`, single-writer task (`writer.rs`), crash recovery (`recovery.rs`), retention (`retention.rs`), fixed-width timestamps (`timefmt.rs`), pool |
 | `src/dashboard/` | Consumer-scoped REST API (`api.rs`) and the invalidation-only SSE stream (`sse.rs`) |
-| `src/admin/` | `/healthz`, `/readyz`, `/version`, and the manager-only API-key lifecycle (`keys.rs`) |
+| `src/billing/` | The commercial layer (ADR 0015): fixed-point pricing (`pricing.rs`), the billing day and its close delay (`period.rs`), the statement generator (`statements.rs`), the derived service status (`status.rs`), the store (`store.rs`), the catch-up walk and the scheduler (`worker.rs`), the at-least-once email (`email.rs`), the partner contract and the request-path snapshot (`partner.rs`), and the partner-facing REST surface (`api.rs`) |
+| `src/admin/` | `/healthz`, `/readyz`, `/version`, the `ManagerOnly` boundary and its error mapping (`common.rs`), the manager-only API-key lifecycle (`keys.rs`), the commercial partner surface (`partners.rs`) and the manager-only billing surface (`billing.rs`) |
 | `src/web/` | Embedded asset table, SPA fallback, CSP, cache headers |
-| `dashboard/` | Vue 3 + Pinia + vite source; `dashboard/dist` is embedded by `build.rs` and is Git-ignored |
+| `dashboard/` | Vue 3 + Pinia + vite source, four views in one authenticated shell (`UsageDashboard`, `Billing`, `Partners`, `ManagerBilling`); `dashboard/dist` is embedded by `build.rs` and is Git-ignored |
 | `tests/` | Integration and end-to-end suites (below) |
 | `benches/` | `ledger_write` — commit-ack latency and throughput against the real writer |
 | `docs/` | [Architecture overview](docs/architecture/overview.md), [ADRs](docs/adr/) — indexed in [`docs/README.md`](docs/README.md) |
@@ -144,6 +151,28 @@ Two facts about the build:
 ## Rules for changes
 
 - **Do not add a second upstream, a model→provider map, or failover.** ADR 0001.
+- **Do not add a second upstream, a model→provider map, or failover.** ADR 0001.
+- **Do not add a payment provider, a wallet, a subscription, a coupon or a tax
+  engine.** ADR 0015 states why each was rejected, and a payment is an operator
+  recording that money moved elsewhere, on one endpoint. Money crosses no
+  boundary in this product.
+- **Do not route money through a float.** `MicroUsd` and `PricePerMillion` are
+  integers; the decimal string exists only at the config and wire edges. A new
+  `f64` on the billing path is a defect even when the arithmetic looks right.
+- **Do not round twice.** A component is rounded once, a line is the sum of its
+  rounded components, a statement is the sum of its lines. Rounding a total as
+  well makes a statement disagree with its own lines, which is a dispute nobody
+  can win.
+- **Do not store a status that can be derived.** Suspension is a comparison of a
+  clock against a due date, read through `status_for` by the request path, the
+  partner's status endpoint and the manager's summary alike. A stored flag is a
+  second source of truth that a payment has to clear and a crash can leave
+  stale.
+- **Do not put an SMTP password in `config.example.yaml`, in a deployment
+  fixture, in SQLite, or in a `Debug`.** `EmailConfig` has no password field, and
+  that is deliberate: the config type cannot become the place one ends up.
+- **Do not send a credential, an API key, an upstream credential or a request
+  body in a statement email.** The body carries the statement's own figures.
 - **Do not add a dependency that replaces ten lines of code you can read.** The
   dependency set is deliberate: `rusqlite` (bundled), `hyper`/`axum`, `serde_yaml`,
   `parking_lot`, `sha2`. Embedding the dashboard is `build.rs` generating
@@ -190,7 +219,13 @@ So, for a schema change:
 1. Edit `src/ledger/schema.sql` so a fresh database gets the shape you want.
 2. Bump `SCHEMA_VERSION` in `src/ledger/mod.rs`. It is recorded in
    `ledger_meta.schema_version` at startup and returned by `/version`
-   (`test_schema_version_is_recorded`).
+   (`test_schema_version_is_recorded`). It is 6: v6 added `partners`,
+   `partner_models`, `daily_statements`, `statement_lines` and the three price
+   snapshot columns on `usage_records` (ADR 0015). There is still no migration
+   runner, so a statement's tables must stay additive: an existing database gains
+   them empty, and a row written by a *previous* binary during a rolling update
+   has `NULL` price snapshots and is counted as incomplete rather than billed at
+   an assumed price.
 3. Decide, and write down in the pull request, what happens to an existing
    database — including one that a previous binary is still writing during a
    rolling update. Adding a table or a nullable column is safe; anything else
@@ -224,6 +259,15 @@ tests that enforce it — in one pull request.
   example: it hashes one in-memory instance twice, so it stays green while
   `Config::hash` on two *parses* of a file once diverged over map ordering — a
   hand-built value proves less than the input a deployment actually produces.
+- **A billing test writes its usage through `starting_ledger`, not through a
+  request.** A day closes once, and it closes about a second after the process
+  starts, so a test that made a request first would have its usage land on a day
+  the scheduler had already closed. The harness also anchors each partner two
+  days back with a zero-amount statement, so a test that accepted *any*
+  statement rather than the day it meant would pass on the anchor and assert
+  nothing. The price snapshots the harness writes differ from the seeded price
+  list by an order of magnitude on purpose: equal prices would pass against an
+  implementation that simply re-read the list.
 - **Benches are not tests.** `cargo bench --bench ledger_write` reports p50/p95/p99
   commit-ack latency; read the table, do not gate on it.
 
@@ -282,6 +326,27 @@ all fixed; what remains is what is genuinely still true.
   2822 parser — unreachable here, and the fix needs a newer toolchain than the
   declared MSRV). It is an ignore with a written reachability argument, not a
   clean report; it disappears when `rust-version` rises.
+- **A statement email is best-effort, and the deployment fixtures do not send
+  one.** The at-least-once path is covered by unit tests over the retry schedule
+  and the body; end to end it needs a real SMTP server, and the fixtures in
+  `deploy/` deliberately have none so the smoke run stays deterministic. The
+  conversation is always plaintext-then-`STARTTLS`: the client offers `STARTTLS`
+  if the relay advertises it and upgrades, and a relay that does not advertise it
+  gets **no** credential — the send fails with
+  "the relay does not offer STARTTLS" rather than putting a password on a
+  cleartext socket. There is therefore no implicit-TLS path: a relay that
+  expects TLS from the first byte (the usual port 465) will not complete the
+  greeting and the send fails. That is a limitation of the client, not a
+  misconfiguration, and it is why the gap is written down here rather than
+  discovered in production.
+- **A partner's `due_at` is measured from the period end, not from the moment
+  the statement was written.** With the default 720-minute terms and a close at
+  local midnight, a statement is overdue from midday on the day after the day it
+  bills — so a partner can be suspended hours after a day they have not yet
+  finished paying for. That is the design, and it is why the test moves
+  `due_at` to a fixed instant rather than depending on the time of day the suite
+  runs. Shorten `payment_terms_minutes`, not the derivation, if the window is
+  wrong for a deployment.
 - **The organisation's module-boundary gate does not run here.** `archkeep`
   judges module boundaries from a Moon project graph, and this repository is a
   plain Cargo workspace with no Moon project — so nothing is being exempted, there

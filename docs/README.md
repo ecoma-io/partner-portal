@@ -49,6 +49,7 @@ of the invariants listed in [`AGENTS.md`](../AGENTS.md).
 | [0012](adr/0012-per-key-model-allow-list.md) | Per-key model allow-list | Each key names the models it may call (strict-by-default); a refused model never reaches the upstream or the ledger, and `/v1/models` is filtered to the same list |
 | [0013](adr/0013-manager-sees-all-consumers.md) | Manager sees every consumer; config carries only what it must | The manager allow-list is gone — `consumers=` is a filter fed from the ledger, `keys[].metadata` is deleted, and the listen address is `PARTNER_PORTAL_LISTEN` |
 | [0014](adr/0014-api-keys-live-in-the-database.md) | Partner API keys live in the database, hashed, behind an in-memory snapshot | SQLite is the source of truth: `api_keys` holds a keyed HMAC and a prefix, auth is a snapshot lookup with no SQL on the request path, and the admin surface answers to the manager password |
+| [0015](adr/0015-daily-postpaid-statements.md) | Daily postpaid statements from frozen usage and price snapshots | One immutable statement per partner per day, priced from the snapshot on the usage row; invoice terms can suspend, reconciliation terms owe nothing |
 
 ### Adding an ADR
 

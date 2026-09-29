@@ -7,6 +7,10 @@ or transformation decision (see ADR 0001's closing note). Amended by
 `keys[].allowed_models` in the configuration to `api_keys.allowed_models` in the
 database. The decision — per-key, strict by default, enforced before the upstream
 and before metering, `/v1/models` filtered to the same list — is unchanged.
+Read together with [0015](0015-daily-postpaid-statements.md), which added a
+second strict-by-default gate on the same path for the same reason: a model a
+partner has no price for is a request that cannot be metered, so it is refused
+before the upstream and before the ledger rather than billed at an assumed price.
 
 ## Context
 

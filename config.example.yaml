@@ -35,7 +35,8 @@
 # The two this file holds are `upstream.api_key` and `manager.password`;
 # partner API keys are not here at all (see the block below), and neither is the
 # SMTP credential, which comes from `PARTNER_PORTAL_SMTP_USERNAME` and
-# `PARTNER_PORTAL_SMTP_PASSWORD` in the environment (src/config/smtp.rs).
+# `PARTNER_PORTAL_SMTP_PASSWORD` in the environment and is read as a pair
+# (src/config/smtp.rs).
 
 # ---------------------------------------------------------------------------
 # server — HTTP listener behaviour.
@@ -287,9 +288,10 @@ manager:
 #
 # There are no SMTP credentials here either. They come from
 # `PARTNER_PORTAL_SMTP_USERNAME` and `PARTNER_PORTAL_SMTP_PASSWORD` in the
-# environment, set together or not at all (src/config/smtp.rs): a password in
-# this file is a password in a file that gets committed, and this file is
-# re-read every second.
+# environment, read as a pair (src/config/smtp.rs): neither is an anonymous
+# relay, and exactly one is a warning and a skipped send rather than a startup
+# failure. A password in this file is a password in a file that gets committed,
+# and this file is re-read every second.
 # ---------------------------------------------------------------------------
 billing:
   # The billing calendar's distance from UTC, in minutes. Range: -720 (UTC-12)
@@ -362,6 +364,11 @@ billing:
 
     # The relay to hand the message to. A hostname or IP; STARTTLS is negotiated
     # on the submission port below.
+    # The conversation is always plaintext-then-STARTTLS: if the relay advertises
+    # STARTTLS the session is upgraded, and if it does not, a configured
+    # credential is withheld and the send fails rather than going out in the
+    # clear. There is no implicit-TLS path, so a relay that expects TLS from the
+    # first byte (the usual 465) will not complete the greeting.
     # Live: read per send, so a reload repoints the relay immediately.
     # Default: "" (nothing to send through).
     smtp_host: ""

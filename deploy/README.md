@@ -88,6 +88,52 @@ The dashboard is served by the edge at `/`; its API is under `/api/dashboard/*`
 and takes the same `Authorization: Bearer <partner key>` as the proxy, or the
 manager password for the cross-consumer view.
 
+## Partners and statements
+
+A **partner** is the commercial unit, and it is a row: `POST /api/admin/partners`
+with a contract mode, payment terms, a billing contact and a price list. The
+price list is replaced as a complete set by `PUT .../models` — a model with no
+price is a request that cannot be metered, so a half-applied list would be a
+partner whose traffic is refused for reasons they cannot see.
+
+The scheduler issues one immutable statement per partner per billing day, priced
+from the price snapshot frozen onto each usage row. `billing.scheduler_interval_secs`
+is how often the process *notices* a closed day; `billing.close_delay_minutes` is
+the actual deadline, and `billing.timezone_offset_minutes` names the day. The
+fixtures set `enabled: false` for email, deliberately: the smoke run must be
+deterministic, and a statement is durable whether or not a message left
+(ADR 0015).
+
+To turn on statement email, set `billing.email.enabled: true` with
+`smtp_host` and `from_address` in the config, and supply the credential through
+the compose environment — never in the YAML, and never in SQLite:
+
+```sh
+PARTNER_PORTAL_SMTP_USERNAME=...   # into deploy/.env, which is gitignored
+PARTNER_PORTAL_SMTP_PASSWORD=...   # read as a pair: neither set is an anonymous
+                                   # relay (not an error), exactly one set is a
+                                   # warning and the send is skipped — half a
+                                   # credential cannot authenticate, and a
+                                   # process that refused to start over it would
+                                   # take a working proxy offline
+```
+
+The conversation is plaintext-then-`STARTTLS` on the submission port: a relay
+that advertises `STARTTLS` is upgraded to TLS, and a relay that does not gets
+**no** credential — the send fails rather than putting a password on a cleartext
+socket. There is no implicit-TLS path, so a relay expecting TLS from the first
+byte (the usual port 465) will not complete the greeting; use 587 with a relay
+that offers `STARTTLS`.
+
+An invoice partner whose complete statement is past its due date and unpaid is
+refused with `403 billing_suspended` — before the upstream is contacted and
+before anything is metered. Paying it on
+`POST /api/admin/billing/statements/{id}/mark-paid` releases them on the next
+read, with no write to the partner row, because the status is derived from the
+statement table rather than stored. That is why a payment is the only
+remedy, and why a statement written by a build that was not yet this one cannot
+be half-enforced: an incomplete day is counted, not charged.
+
 Host ports default to 8080 (edge), 8081 and 8082 (the slots) and are overridable
 with `EDGE_PORT`, `PORTAL_A_PORT`, `PORTAL_B_PORT` — the ports the smoke test and
 the update script use are the same variables, so a machine that already listens
