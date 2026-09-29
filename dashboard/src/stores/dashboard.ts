@@ -121,6 +121,25 @@ function httpMessage(res: Response, what: string): string {
   return `Could not load ${what} (HTTP ${res.status})`
 }
 
+/**
+ * An error the server described, carrying the `code` it named.
+ *
+ * The dashboard renders `message` for a human and keeps `code` for the cases
+ * where the client must react to the *kind* of failure rather than the text —
+ * a 401 that ends the session, a 403 that a partner key is not allowed here.
+ * Everything else surfaces with the same text an inline fetch would produce.
+ */
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string | null,
+  ) {
+    super(message)
+    this.name = 'ApiError'
+  }
+}
+
 export const useDashboardStore = defineStore('dashboard', () => {
   const me = ref<Me | null>(null)
   /**
@@ -133,6 +152,15 @@ export const useDashboardStore = defineStore('dashboard', () => {
    * accepts the key.
    */
   const authenticated = ref(false)
+  /**
+   * Whether the stored credential has been *judged* yet.
+   *
+   * Distinct from `authenticated`, which is `false` both before the answer
+   * arrives and after a rejection. The router needs the difference: routing on
+   * `!authenticated` would bounce a signed-in visitor to the login screen on
+   * every reload, for the split second before `/api/me` answers.
+   */
+  const identityResolved = ref(false)
   const summary = ref<Summary | null>(null)
   const timeseries = ref<TimeseriesPoint[]>([])
   const requests = ref<RequestItem[]>([])
@@ -228,7 +256,13 @@ export const useDashboardStore = defineStore('dashboard', () => {
       authenticated.value = true
       error.value = null
     } catch (e) {
-      if (ticket === seq.me) error.value = messageOf(e)
+      if (ticket === seq.me) {
+        me.value = null
+        authenticated.value = false
+        error.value = messageOf(e)
+      }
+    } finally {
+      if (ticket === seq.me) identityResolved.value = true
     }
   }
 
@@ -241,6 +275,74 @@ export const useDashboardStore = defineStore('dashboard', () => {
     if (isManager.value && selectedConsumers.value.length > 0) {
       params.set('consumers', selectedConsumers.value.join(','))
     }
+  }
+
+  /**
+   * The `{ "error": { "message", "type", "code" } }` body every error response
+   * carries, read defensively: a proxy or a panic can return something else
+   * entirely, and a malformed body must not replace the status-line message.
+   */
+  function errorFromResponse(res: Response, what: string): ApiError {
+    if (res.status === 401 || res.status === 403) {
+      return new ApiError(
+        `Not authenticated — a valid API key is required to read ${what}`,
+        res.status,
+        res.status === 403 ? 'manager_required' : 'invalid_api_key',
+      )
+    }
+    return new ApiError(`Could not load ${what} (HTTP ${res.status})`, res.status, null)
+  }
+
+  /**
+   * One authenticated JSON round trip, shared by every surface in the SPA.
+   *
+   * The credential is read from the same one place as the usage queries and
+   * travels only in the `Authorization` header — never a URL or a query
+   * parameter. Nothing about the request is logged: a body can carry a
+   * commercial partner's address and a payment reference.
+   *
+   * A rejection prefers the server's own `error.message`, because that is where
+   * a validation rule or a conflict is explained, and falls back to the
+   * status line when the body is absent, unparseable, or silent.
+   *
+   * `what` names the resource in a sentence — "the partner list", not
+   * `/api/admin/partners` — because it is the text a user reads when the JSON
+   * error body is missing or something other than a proxy answered.
+   */
+  async function apiFetch<T>(path: string, init: RequestInit = {}, what: string = path): Promise<T> {
+    const res = await fetch(path, {
+      ...init,
+      headers: {
+        ...authHeaders(),
+        Accept: 'application/json',
+        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        ...init.headers,
+      },
+    })
+    if (!res.ok) {
+      const error = errorFromResponse(res, what)
+      if (error.status === 401 || error.status === 403) throw error
+      const body = await res.text()
+      throw detailFromBody(body, error)
+    }
+    return (await res.json()) as T
+  }
+
+  function detailFromBody(body: string, fallback: ApiError): ApiError {
+    try {
+      const parsed: unknown = JSON.parse(body)
+      const detail = (parsed as { error?: { message?: unknown; code?: unknown } } | null)?.error
+      if (detail && typeof detail.message === 'string' && detail.message !== '') {
+        return new ApiError(
+          detail.message,
+          fallback.status,
+          typeof detail.code === 'string' ? detail.code : null,
+        )
+      }
+    } catch {
+      // Not the shape we expect; the status-line message stands.
+    }
+    return fallback
   }
 
   async function fetchSummary() {
@@ -389,7 +491,17 @@ export const useDashboardStore = defineStore('dashboard', () => {
   /** Bursts of full reloads coalesce into at most one extra pass. */
   let refreshing = false
   let refreshQueued = false
-  /** Each SSE event also advances this counter so the view can show an alert. */
+  /**
+   * Advanced by every `data_changed` frame, and watched by each mounted view
+   * to reload the resources it owns.
+   *
+   * The stream is invalidation-only by design: it carries no ledger or billing
+   * data, so the client refetches the scoped REST endpoints it actually needs.
+   * Bumping here rather than refetching is what lets a page that is not mounted
+   * cost nothing, and what stops an invalidation from querying a surface the
+   * viewer cannot see. The usage view still runs its own coalesced
+   * [`refreshFromDataChange`] pass on the same signal.
+   */
   const dataChangeVersion = ref(0)
 
   /**
@@ -439,6 +551,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
     requests.value = []
     selectedConsumers.value = []
     latestRequest.value = null
+    models.value = []
     resetPagination()
     error.value = null
   }
@@ -488,6 +601,19 @@ export const useDashboardStore = defineStore('dashboard', () => {
   function resetAndFetchRequests() {
     resetPagination()
     void fetchRequests({ cursor: null, stack: [] })
+  }
+
+  /**
+   * The manager narrowed or widened the consumer scope.
+   *
+   * Every usage query is re-issued, and the request table returns to page one
+   * because the cursors it was paging through belong to the previous scope.
+   * Billing and partner views watch the same selection and refetch themselves —
+   * the scope is shared state, not a usage-only concept.
+   */
+  function onConsumersScopeChanged() {
+    resetAndFetchRequests()
+    void Promise.all([fetchSummary(), fetchTimeseries(), fetchModels()])
   }
 
   function setStatus(nextStatus: string) {
@@ -726,6 +852,7 @@ export const useDashboardStore = defineStore('dashboard', () => {
   return {
     me,
     authenticated,
+    identityResolved,
     summary,
     timeseries,
     requests,
@@ -760,8 +887,25 @@ export const useDashboardStore = defineStore('dashboard', () => {
     setStatus,
     setPageSize,
     resetAndFetchRequests,
+    onConsumersScopeChanged,
     connect,
     disconnect,
     refresh,
+    refreshFromDataChange,
+    /**
+     * The one credential and the one round trip every new surface uses. Exposed
+     * on the store rather than from a module so there is exactly one place that
+     * reads the stored key — a second `localStorage` reader is how a screen
+     * ends up sending a request with no Authorization header.
+     */
+    apiFetch,
+    authHeaders,
+    /**
+     * The manager's consumer scope, applied to any query that supports it.
+     * A partner credential never sends it: `applyConsumersScope` is gated on
+     * the role, so a partner cannot widen its own scope even by constructing
+     * the parameter itself.
+     */
+    applyConsumersScope,
   }
 })

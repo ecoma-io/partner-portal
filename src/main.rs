@@ -11,6 +11,7 @@
 //!     -> wait the grace period         (time for the balancer to notice)
 //!     -> close the dashboard streams    (SSE bodies never end on their own)
 //!     -> stop accepting connections    (axum drains requests already in flight)
+//!     -> stop the billing scheduler    (it writes on the same writer connection)
 //!     -> drain the metering pipeline   (flush and COMMIT every queued record)
 //!     -> await detached finalizers     (stream drop guards that could not await)
 //!     -> release the instance           (registration + advisory lock)
@@ -58,7 +59,10 @@ use partner_portal::{
     admin::create_admin_router,
     apikeys::{self, ApiKeyRefresher, ApiKeyStore},
     auth::Authenticated,
-    config::{CONFIG_ENV, ConfigLoader, HotReloader, listen_addr},
+    billing::{self, worker::Worker as BillingWorker},
+    config::{
+        BillingConfig, CONFIG_ENV, ConfigLoader, HotReloader, credentials_from_env, listen_addr,
+    },
     dashboard::{SseBroadcaster, create_dashboard_router},
     keygen,
     ledger::{
@@ -251,6 +255,25 @@ async fn main() -> anyhow::Result<()> {
     let (retention_stop_tx, retention_stop_rx) = watch::channel(());
     spawn_retention(pool.clone(), config.database.clone(), retention_stop_rx);
 
+    // --- Billing ------------------------------------------------------------
+    //
+    // The daily schedule: close the days that have settled, write their
+    // statements, email the invoices that are due. It runs beside the metering
+    // pipeline rather than through it, and that is a deliberate exception to the
+    // rule that every write goes through the metering queue — a statement is
+    // built by reading `usage_records` in aggregate, and routing an invoice
+    // through a queue that exists to keep accepted requests would make an
+    // invoice wait behind traffic. It writes short transactions on the same
+    // writer connection, so it still serialises with metering; it just does not
+    // join the queue. See `src/billing/worker.rs`.
+    let (billing_stop_tx, billing_stop_rx) = watch::channel(());
+    spawn_billing(
+        pool.clone(),
+        config.billing.clone(),
+        instance.id().to_string(),
+        billing_stop_rx,
+    )?;
+
     // --- Recovery sweeper ---------------------------------------------------
     //
     // Recovery at startup is not enough. A row can become stranded *later*: a
@@ -280,6 +303,10 @@ async fn main() -> anyhow::Result<()> {
     let app = Router::new()
         .merge(create_admin_router())
         .merge(create_dashboard_router())
+        // Statements and service status under `/api/billing`. Mounted from
+        // `billing` rather than from `dashboard` because `/api/billing` is its
+        // own surface: same authentication, same scope rules, different subject.
+        .merge(billing::api::create_billing_router())
         .route("/v1/chat/completions", any(proxy_handler))
         .route("/v1/responses", any(proxy_handler))
         .route("/v1/models", any(proxy_handler))
@@ -383,6 +410,12 @@ async fn main() -> anyhow::Result<()> {
     // finalizers written by stream drop guards, which cannot await.
 
     info!("listener stopped; draining the metering pipeline");
+    // Billing stops first of the three: it writes on the same writer connection
+    // the drain is about to close, and a statement half-way through its
+    // transaction is worse than a day stated a tick later. Stopping it costs
+    // nothing — the anchor is durable, so the next instance picks the day up
+    // exactly where this one left it.
+    billing_stop_tx.send(()).ok();
     retention_stop_tx.send(()).ok();
     sweeper_stop_tx.send(()).ok();
     ledger.shutdown().await;
@@ -540,6 +573,60 @@ fn spawn_retention(
             }
         }
     });
+}
+
+/// Run the daily billing schedule for the life of the process.
+///
+/// The SMTP credential is read here, once, from the environment, and it is the
+/// only billing input that is not in the config file or the database: a
+/// credential in either would be a credential in a backup, in a console dump and
+/// in a partner's support bundle. An environment the process cannot read is a
+/// warning and not a failure — the ledger, the request path and the statements
+/// themselves do not depend on email, and a deployment that has deliberately not
+/// configured a relay is a legitimate one.
+///
+/// The timezone offset is a hard failure. It decides which calendar day a
+/// statement is *for*, so a process that could not build it would mis-date
+/// bills; the loader already refuses a bad offset, so reaching the error means a
+/// config assembled rather than parsed, and stopping is the honest response.
+fn spawn_billing(
+    pool: Arc<LedgerPool>,
+    billing: BillingConfig,
+    instance_id: String,
+    stop_rx: watch::Receiver<()>,
+) -> anyhow::Result<()> {
+    let credentials = match credentials_from_env() {
+        Ok(credentials) => credentials,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "PARTNER_PORTAL_SMTP_USERNAME/PARTNER_PORTAL_SMTP_PASSWORD could not be read; \
+                 no statement email will be sent"
+            );
+            None
+        }
+    };
+
+    if credentials.is_some() && !billing.email.enabled {
+        // Set-but-unused is worth one line: a deployment that set the secrets
+        // and expected mail is one config edit away from working, and this is
+        // the only place the two halves are visible together.
+        warn!(
+            "PARTNER_PORTAL_SMTP_* are set but billing.email.enabled is false; \
+             statements will be written and never sent"
+        );
+    }
+
+    let worker = BillingWorker::new(pool, &billing, credentials, instance_id)
+        .map_err(|e| anyhow::anyhow!("billing scheduler could not be configured: {e}"))?;
+
+    info!(
+        interval_secs = worker.interval().as_secs(),
+        emails = worker.sends_email(),
+        "billing scheduler started"
+    );
+    worker.spawn(stop_rx);
+    Ok(())
 }
 
 /// Re-run recovery on a timer for the life of the process.

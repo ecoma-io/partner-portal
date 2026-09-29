@@ -241,10 +241,14 @@ mod tests {
 
         /// Insert a key through the sibling's writer connection — the write a
         /// real second process would make.
+        ///
+        /// Each call gets a fresh consumer, because a partner has exactly one
+        /// active key (docs/adr/0015) and a test that wanted two would be
+        /// asserting a shape the product no longer supports.
         fn sibling_creates(&self, name: &str, consumer: &str) -> String {
             let store = ApiKeyStore::new(Arc::clone(&self.sibling_pool), SECRET.to_vec());
             let (_, plaintext) = store
-                .create(name, consumer, vec!["gpt-4o".to_string()], None)
+                .create(name, consumer, None)
                 .expect("the sibling must be able to issue a key");
             plaintext
         }
@@ -278,7 +282,6 @@ mod tests {
             .create(
                 "brief",
                 "acme",
-                vec![],
                 Some(time::OffsetDateTime::now_utc() + time::Duration::milliseconds(50)),
             )
             .unwrap();
@@ -296,7 +299,7 @@ mod tests {
         let f = Fixture::new();
         assert!(f.store.authenticate("pp_anything").is_none());
 
-        let plaintext = f.sibling_creates("from-a-sibling", "acme");
+        let plaintext = f.sibling_creates("from-a-sibling", "sibling-partner");
         assert!(
             f.store.authenticate(&plaintext).is_none(),
             "the sibling's key is not in this instance's snapshot yet"
@@ -312,14 +315,14 @@ mod tests {
             .store
             .authenticate(&plaintext)
             .expect("now it authenticates");
-        assert_eq!(auth.consumer_id, "acme");
-        assert_eq!(auth.name, "from-a-sibling");
+        assert_eq!(auth.consumer_id, "sibling-partner");
+        assert_eq!(auth.key_name, "from-a-sibling");
     }
 
     #[tokio::test]
     async fn test_a_key_revoked_by_a_sibling_stops_authenticating_within_one_interval() {
         let f = Fixture::new();
-        let plaintext = f.sibling_creates("short-lived", "acme");
+        let plaintext = f.sibling_creates("short-lived", "short-lived-partner");
         f.refresher.start();
         f.wait_for("the initial key to propagate", || {
             f.store.authenticate(&plaintext).is_some()
@@ -344,7 +347,7 @@ mod tests {
         // *this* instance's own store is refreshed inside `mutate` before it
         // returns, so the next request already sees it.
         let f = Fixture::new();
-        let (row, plaintext) = f.store.create("local", "acme", vec![], None).unwrap();
+        let (row, plaintext) = f.store.create("local", "acme", None).unwrap();
 
         assert!(f.store.authenticate(&plaintext).is_some());
         f.store.revoke(row.id).unwrap();
@@ -360,7 +363,7 @@ mod tests {
         // partner offline because of one bad read. The snapshot is the last
         // state that was known good, and the next poll corrects it.
         let f = Fixture::new();
-        let plaintext = f.sibling_creates("survivor", "acme");
+        let plaintext = f.sibling_creates("survivor", "survivor-partner");
         f.refresher.start();
         f.wait_for("the initial key to propagate", || {
             f.store.authenticate(&plaintext).is_some()
@@ -390,7 +393,7 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        let late = f.sibling_creates("issued-while-broken", "acme");
+        let late = f.sibling_creates("issued-while-broken", "late-partner");
 
         f.refresher.reload().await;
         assert!(
@@ -410,7 +413,7 @@ mod tests {
         let path = dir.path().join("ledger.db");
         let sibling = Arc::new(LedgerPool::new(path.clone()).unwrap());
         ApiKeyStore::new(Arc::clone(&sibling), SECRET.to_vec())
-            .create("existing", "acme", vec!["gpt-4o".to_string()], None)
+            .create("existing", "acme", None)
             .unwrap();
 
         let store = Arc::new(ApiKeyStore::new(

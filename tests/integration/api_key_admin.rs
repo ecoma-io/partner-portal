@@ -8,6 +8,9 @@
 //!   in its life — by the create that issued it and by the rotate that replaced
 //!   it — and never again by any endpoint;
 //! - an identity is what the *row* says, not what the request asked for;
+//! - a key is only a credential: model access and its immutable-at-accept price
+//!   live on the partner account, so key issuance never smuggles an allow-list
+//!   into `api_keys` (ADR 0015);
 //! - revocation and expiry both stop authentication on the next request against
 //!   this instance, without a restart;
 //! - a revoked key is an audit record, not a deleted row, so a rotation leaves a
@@ -27,6 +30,7 @@ use crate::common::{
     Behaviour, HttpResponse, ManagerSpec, MockUpstream, Spec, TestClient, TestServer, WAIT_TIMEOUT,
     chat_request, row_count, wait_for_terminal, wait_for_terminal_count,
 };
+use bytes::Bytes;
 use http::{Method, StatusCode};
 use serde_json::{Value, json};
 
@@ -95,6 +99,80 @@ async fn chat(client: &TestClient, server: &TestServer, key: &str, model: &str) 
         .await
 }
 
+/// Open the commercial account a key authenticates for.
+///
+/// Key issuance deliberately does not do this implicitly. A credential can be
+/// provisioned before finance has supplied an email, mode and prices, but then
+/// it can authenticate and call no model. Tests that need inference put the
+/// account in the only surface that owns these facts rather than reintroducing
+/// an `allowed_models` field to the key endpoint.
+async fn create_partner(
+    client: &TestClient,
+    server: &TestServer,
+    consumer_id: &str,
+    models: &[&str],
+) -> HttpResponse {
+    let models = models
+        .iter()
+        .map(|model| {
+            json!({
+                "model": model,
+                "input_per_million": "0.095",
+                "cached_input_per_million": "0.002375",
+                "output_per_million": "0.475",
+            })
+        })
+        .collect::<Vec<_>>();
+    let response = client
+        .post_json(
+            &server.url("/api/admin/partners"),
+            Some(MANAGER_PASSWORD),
+            json!({
+                "consumer_id": consumer_id,
+                "name": format!("{consumer_id} partner"),
+                "billing_mode": "invoice",
+                "models": models,
+            }),
+        )
+        .await;
+    assert_eq!(
+        response.status,
+        StatusCode::CREATED,
+        "creating partner {consumer_id} failed: {}",
+        response.text()
+    );
+    response
+}
+
+/// Replace a partner's authoritative model/pricing map.
+async fn replace_models(
+    client: &TestClient,
+    server: &TestServer,
+    consumer_id: &str,
+    models: &[&str],
+) -> HttpResponse {
+    let models = models
+        .iter()
+        .map(|model| {
+            json!({
+                "model": model,
+                "input_per_million": "0.095",
+                "cached_input_per_million": "0.002375",
+                "output_per_million": "0.475",
+            })
+        })
+        .collect::<Vec<_>>();
+    client
+        .call(
+            Method::PUT,
+            &server.url(&format!("/api/admin/partners/{consumer_id}/models")),
+            Some(MANAGER_PASSWORD),
+            Bytes::from(serde_json::to_vec(&json!({ "models": models })).expect("serialize")),
+            &[],
+        )
+        .await
+}
+
 /// Send a request with a method `TestClient` has no helper for.
 async fn send_json(client: &TestClient, method: Method, url: &str, body: Value) -> HttpResponse {
     client
@@ -147,13 +225,13 @@ async fn a_created_key_authenticates_for_the_identity_it_was_issued_to() {
         StatusCode::UNAUTHORIZED
     );
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let created = issue(
         &client,
         &server,
         json!({
             "name": "acme-partner",
             "consumer_id": "acme",
-            "allowed_models": ["gpt-4o"],
         }),
     )
     .await;
@@ -212,16 +290,18 @@ async fn no_read_path_returns_a_stored_secret() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "a", &["gpt-4o"]).await;
+    create_partner(&client, &server, "b", &["gpt-4o-mini"]).await;
     let first = issue(
         &client,
         &server,
-        json!({"name": "first", "consumer_id": "a", "allowed_models": ["gpt-4o"]}),
+        json!({"name": "first", "consumer_id": "a"}),
     )
     .await;
     let second = issue(
         &client,
         &server,
-        json!({"name": "second", "consumer_id": "b", "allowed_models": ["gpt-4o-mini"]}),
+        json!({"name": "second", "consumer_id": "b"}),
     )
     .await;
     let secrets = [secret_of(&first), secret_of(&second)];
@@ -298,9 +378,10 @@ async fn no_read_path_returns_a_stored_secret() {
 // Editing
 // ---------------------------------------------------------------------------
 
-/// `PATCH` changes the name and the allow-list and never the secret.
+/// Key metadata and the partner's model map are separate writes, so changing
+/// capability never re-issues a credential.
 #[tokio::test]
-async fn a_key_can_be_renamed_and_restricted_without_changing_its_secret() {
+async fn a_key_can_be_renamed_and_its_partner_models_changed_without_rotating_it() {
     let upstream = MockUpstream::start(Behaviour::ChatJson {
         prompt: 3,
         completion: 2,
@@ -310,12 +391,14 @@ async fn a_key_can_be_renamed_and_restricted_without_changing_its_secret() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
-    // Issued with no allowed model, which is the strict default: it can
-    // authenticate and look at its own view, but it cannot call anything.
+    // Issued before the account's model map exists: it can authenticate and
+    // look at its own view, but it cannot call anything. The API key carries no
+    // model list that could make this behave differently.
+    create_partner(&client, &server, "acme", &[]).await;
     let created = issue(
         &client,
         &server,
-        json!({"name": "unrestricted", "consumer_id": "acme", "allowed_models": []}),
+        json!({"name": "unrestricted", "consumer_id": "acme"}),
     )
     .await;
     let secret = secret_of(&created);
@@ -335,20 +418,36 @@ async fn a_key_can_be_renamed_and_restricted_without_changing_its_secret() {
         &client,
         Method::PATCH,
         &server.url(&format!("/api/admin/api-keys/{id}")),
-        json!({"name": "renamed", "allowed_models": ["gpt-4o"]}),
+        json!({"name": "renamed"}),
     )
     .await;
     assert_eq!(patched.status, StatusCode::OK, "{}", patched.text());
     assert_eq!(patched.json()["name"], "renamed");
-    assert_eq!(patched.json()["allowed_models"], json!(["gpt-4o"]));
+    assert!(
+        patched.json().get("allowed_models").is_none(),
+        "a key response must not pretend credentials own capability: {}",
+        patched.text()
+    );
     assert!(
         patched.json().get("key_secret").is_none(),
         "an update must never re-issue the secret: {}",
         patched.text()
     );
 
-    // The same plaintext now passes the allow-list, which proves the edit took
-    // effect *and* that the secret was not replaced along with it.
+    let models = replace_models(&client, &server, "acme", &["gpt-4o"]).await;
+    assert_eq!(models.status, StatusCode::OK, "{}", models.text());
+    assert_eq!(
+        models.json(),
+        json!([{
+            "model": "gpt-4o",
+            "input_per_million": "0.095",
+            "cached_input_per_million": "0.002375",
+            "output_per_million": "0.475",
+        }])
+    );
+
+    // The same plaintext now passes the partner model map, which proves the
+    // commercial edit took effect *and* the credential was not replaced.
     let allowed = chat(&client, &server, &secret, "gpt-4o").await;
     assert_eq!(allowed.status, StatusCode::OK, "{}", allowed.text());
 
@@ -391,10 +490,11 @@ async fn a_revoked_key_is_refused_and_cannot_be_brought_back() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let created = issue(
         &client,
         &server,
-        json!({"name": "short-lived", "consumer_id": "acme", "allowed_models": ["gpt-4o"]}),
+        json!({"name": "short-lived", "consumer_id": "acme"}),
     )
     .await;
     let secret = secret_of(&created);
@@ -493,13 +593,13 @@ async fn a_rotation_replaces_the_secret_for_the_same_consumer() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let created = issue(
         &client,
         &server,
         json!({
             "name": "rolling",
             "consumer_id": "acme",
-            "allowed_models": ["gpt-4o"],
             "expires_at": "2999-01-01T00:00:00Z",
         }),
     )
@@ -525,11 +625,12 @@ async fn a_rotation_replaces_the_secret_for_the_same_consumer() {
         "the successor is a new row, so the predecessor stays as the record of \
          what was issued before"
     );
-    // The successor inherits the identity, the name, the allow-list and the
-    // expiry — a rotation changes the secret and nothing else.
+    // The successor inherits the identity, name and expiry. Its partner's
+    // model map stays where it was: a rotation changes the secret and nothing
+    // else.
     assert_eq!(rotated.json()["name"], "rolling");
     assert_eq!(rotated.json()["consumer_id"], "acme");
-    assert_eq!(rotated.json()["allowed_models"], json!(["gpt-4o"]));
+    assert!(rotated.json().get("allowed_models").is_none());
     assert_eq!(
         rotated.json()["expires_at"],
         "2999-01-01T00:00:00.000000000Z"
@@ -576,13 +677,13 @@ async fn an_expired_key_never_authenticates() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let past = issue(
         &client,
         &server,
         json!({
             "name": "stale",
             "consumer_id": "acme",
-            "allowed_models": ["gpt-4o"],
             "expires_at": "2020-01-01T00:00:00Z",
         }),
     )
@@ -609,13 +710,13 @@ async fn an_expired_key_never_authenticates() {
 
     // A key with a lifetime still ahead of it is unaffected by the same code
     // path, so the refusal above is the clock and not a blanket rule.
+    create_partner(&client, &server, "later", &["gpt-4o"]).await;
     let future = issue(
         &client,
         &server,
         json!({
             "name": "later",
-            "consumer_id": "acme",
-            "allowed_models": ["gpt-4o"],
+            "consumer_id": "later",
             "expires_at": "2999-01-01T00:00:00Z",
         }),
     )
@@ -633,8 +734,7 @@ async fn an_expired_key_never_authenticates() {
             Some(MANAGER_PASSWORD),
             json!({
                 "name": "typo",
-                "consumer_id": "acme",
-                "allowed_models": ["gpt-4o"],
+                "consumer_id": "typo",
                 "expires_at": "next tuesday",
             }),
         )
@@ -676,10 +776,11 @@ async fn a_key_issued_through_the_api_survives_a_restart() {
     let mut server = TestServer::start(spec.clone()).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let created = issue(
         &client,
         &server,
-        json!({"name": "durable", "consumer_id": "acme", "allowed_models": ["gpt-4o"]}),
+        json!({"name": "durable", "consumer_id": "acme"}),
     )
     .await;
     let secret = secret_of(&created);
@@ -743,10 +844,11 @@ async fn the_plaintext_never_reaches_the_database_the_log_or_a_read_endpoint() {
     let server = admin_server(&upstream).await;
     let client = TestClient::new();
 
+    create_partner(&client, &server, "acme", &["gpt-4o"]).await;
     let created = issue(
         &client,
         &server,
-        json!({"name": "watched", "consumer_id": "acme", "allowed_models": ["gpt-4o"]}),
+        json!({"name": "watched", "consumer_id": "acme"}),
     )
     .await;
     let secret = secret_of(&created);

@@ -54,6 +54,11 @@ MOCK_PORT="${MOCK_PORT:-19000}"
 # which would make "the listing never returns the secret" unassertable.
 KEY="smoke-key-please-replace"
 UPSTREAM_MODEL="mock-model"
+# `keygen --model` takes NAME:INPUT:CACHED:OUTPUT, because which models a
+# partner may call and what each costs are one list: a model with no price is a
+# model the partner cannot call (ADR 0012 as amended by 0015). The prices here are
+# nominal — this test asserts the request reached the upstream, not what it cost.
+PRICES="1.00:0.10:4.00"
 # The consumer the seeded key belongs to. It is what the dashboard scopes by, so
 # the image test provisions a key the way a deployment would rather than with a
 # placeholder.
@@ -174,7 +179,12 @@ say "Starting the stub upstream and the container"
 # `--add-host …:host-gateway` and then depends on the host's firewall and on the
 # daemon's bridge, and a smoke test that fails on a hardened host is a smoke test
 # that gets skipped.
-docker network create "$NETWORK" >/dev/null
+# An explicit subnet, so a daemon whose default address pool is exhausted — a
+# shared build host that has run out of 172.18.0.0/16, which happens long before
+# anyone notices — does not fail this gate for a reason that has nothing to do
+# with the image. It is a 256-address network for two containers; overlap is
+# still a real error and still reported as one.
+docker network create --subnet "${SMOKE_SUBNET:-10.253.0.0/24}" "$NETWORK" >/dev/null
 
 docker run -d --name "$MOCK_CONTAINER" \
     --network "$NETWORK" \
@@ -226,7 +236,7 @@ if ! seed_report="$(docker run --rm \
     --name partner-smoke \
     --consumer-id "$KEY_CONSUMER" \
     --plaintext "$KEY" \
-    --allowed-model "$UPSTREAM_MODEL" 2>&1)"; then
+    --model "$UPSTREAM_MODEL:$PRICES" 2>&1)"; then
     bad "could not seed the smoke key into a fresh volume"
     printf '%s\n' "$seed_report" >&2
     exit 1

@@ -11,7 +11,12 @@ use std::sync::Arc;
 
 use crate::proxy::handler::AppState;
 
+mod billing;
+mod common;
 pub mod keys;
+mod partners;
+
+pub use common::{AdminError, ManagerOnly, ManagerOnlyError, no_store};
 
 /// Admin router. Mount at the root.
 pub fn create_admin_router() -> Router<Arc<AppState>> {
@@ -19,10 +24,13 @@ pub fn create_admin_router() -> Router<Arc<AppState>> {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/version", get(version))
-        // The manager-only api-key surface. Merged here rather than in `main`
-        // so every route this product serves from `/api/admin` is one `Router`,
-        // and a new one cannot be forgotten at the composition root.
+        // The manager-only surfaces: api keys, partners, billing. Merged here
+        // rather than in `main` so every route this product serves from
+        // `/api/admin` is one `Router`, and a new one cannot be forgotten at the
+        // composition root.
         .merge(keys::create_key_router())
+        .merge(partners::create_partner_router())
+        .merge(billing::create_billing_router())
 }
 
 #[derive(Serialize)]

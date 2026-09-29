@@ -194,12 +194,16 @@ echo "    proxy       http://127.0.0.1:$PROXY_PORT/        (the built bundle, sa
 echo "    stub        http://127.0.0.1:$STUB_PORT/        (the upstream; x-dev-fail to make it fail)"
 echo
 echo "    log in with"
-echo "      dev-key         consumer 'acme'        (or dev-key-2 — same view, by design)"
-echo "      dev-key-beta    consumer 'beta'"
+echo "      dev-key         consumer 'acme', an invoice account"
+echo "      dev-key-beta    consumer 'beta', a reconciliation account"
 echo "      dev-manager     every consumer        (ADR 0013)"
 echo
 echo "    (those three are ledger rows, written by scripts/dev-seed-keys.sh;"
 echo "     the dashboard's own key list is at /api/admin/api-keys)"
+echo
+echo "    one key per consumer, deliberately: a partner holds at most one live"
+echo "    credential. The two keys differ in billing mode, which is what the"
+echo "    dashboard's Billing tab is showing."
 echo
 echo "    load        scripts/dev-load.sh"
 echo "    restart     scripts/dev-restart.sh     (after a Rust edit; the dashboard keeps HMR)"

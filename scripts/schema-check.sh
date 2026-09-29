@@ -133,7 +133,24 @@ tables = {
     row[0]
     for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
 }
-missing = [t for t in ("api_keys", "usage_records", "usage_hourly", "ledger_meta") if t not in tables]
+# Every table the binary reads, and not just the oldest four. A gate that lists
+# the tables a *previous* schema had would stay green through a change that
+# silently failed to create the new ones — which is exactly the change that
+# matters when a whole feature lands at once (ADR 0015 added four).
+missing = [
+    t
+    for t in (
+        "api_keys",
+        "usage_records",
+        "usage_hourly",
+        "ledger_meta",
+        "partners",
+        "partner_models",
+        "daily_statements",
+        "statement_lines",
+    )
+    if t not in tables
+]
 if missing:
     sys.exit(f"a fresh database is missing {missing}; it has {sorted(tables)}")
 
@@ -150,7 +167,9 @@ if [ -z "$read_report" ]; then
 fi
 
 if [ "$read_report" = "$expected" ]; then
-    ok "the database holds api_keys, usage_records, usage_hourly and ledger_meta"
+    ok "the database holds every table the binary reads: \
+api_keys, usage_records, usage_hourly, ledger_meta, partners, partner_models, \
+daily_statements, statement_lines"
     ok "ledger_meta records schema_version $read_report"
 else
     bad "a fresh database reports '$read_report' for ledger_meta.schema_version; expected $expected"

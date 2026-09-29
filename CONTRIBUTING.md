@@ -213,6 +213,41 @@ because it is in SQL:
 6. **Tests** — a scoping test with two consumers, and the window/pagination edge
    cases (unknown range falls back to 24 h, a range past retention is rejected).
 
+## Adding a billing endpoint
+
+`src/billing/api.rs` is the partner-facing surface and `src/admin/billing.rs` is
+the manager's; `src/admin/partners.rs` owns the commercial record. Before adding
+anything to any of them:
+
+1. **Decide which surface it belongs to before writing it.** A partner key gets
+   `403 manager_required` on every `/api/admin/*` route, and the reason is
+   structural rather than cosmetic: a credential that could mark a partner's own
+   statement paid would end that partner's own suspension with one click. A new
+   write goes behind `ManagerOnly` (`src/admin/common.rs`); a new read goes
+   behind the caller's own `consumer_id` (ADR 0015).
+2. **Never widen scope from the request.** `consumers=` is a filter for a manager
+   and is ignored for a partner key, resolved in `src/auth/scope.rs`. A handler
+   that applies a scope parameter unconditionally is a security defect
+   (ADR 0008), and the billing surface is where it would be most costly.
+3. **Never recompute money.** Read the statements that exist. Retention prunes
+   usage, so a total recomputed from `usage_records` would shrink when a sweep
+   ran, and a figure that moves is not a figure a partner can be invoiced on. A
+   new aggregate is a `SUM` over `daily_statements`, never over usage.
+4. **Return the server's own strings.** `MicroUsd` formats its own decimal and
+   the SPA renders what it was given; the browser never parses a price into a
+   number and never adds up a line. If a new field needs a number, decide
+   deliberately whether the API exposes the integer at all — the reason
+   `total_amount_micro_usd` exists beside `total_amount` is that a client must
+   not have to derive one from the other.
+5. **Errors stay opaque and stay uniform.** A statement outside the caller's
+   scope is a `404` whose body is *identical* to a nonexistent one. Ids are
+   rowids, so a message that echoes the requested id back is an oracle that
+   reveals the size of the table and the day each partner billed.
+6. **Tests** — a scoping test with two partners, a role test asserting `403` for
+   a partner key and `401` for no credential, and a test for whichever quiet
+   failure the endpoint could have: a suspended partner counted as active, an
+   incomplete statement billed, a paid statement counted as overdue.
+
 ## Changing the schema
 
 `src/ledger/schema.sql` is applied on every startup as a batch of
@@ -237,6 +272,14 @@ file and there is no migration directory — and `SCHEMA_VERSION` in
    (a deployment arrives with no keys and every partner 401s until one is
    provisioned) belongs in the pull request and in `deploy/`, and
    `scripts/schema-check.sh` is what proves the fresh-database path still works.
+   The billing tables (`SCHEMA_VERSION` 5 → 6,
+   [ADR 0015](docs/adr/0015-daily-postpaid-statements.md)) are the worked example
+   of the *nearly* safe case: a usage row written by the previous binary carries
+   `NULL` price snapshots, so the statement built from it counts that row as
+   incomplete rather than billing it at an assumed price. The columns were added
+   nullable for exactly this, and the `CHECK`s on `daily_statements` and
+   `statement_lines` are what stop a `NULL` from becoming a zero further
+   downstream.
 4. Update **both** write paths: `src/ledger/writer.rs` (the live path) and
    `src/ledger/recovery.rs` (the crash path). A column one of them does not know
    about is a difference between a clean shutdown and a crash, which is the

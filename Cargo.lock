@@ -1164,6 +1164,7 @@ dependencies = [
  "pretty_assertions",
  "proptest",
  "rusqlite",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -1179,6 +1180,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "webpki-roots",
  "wiremock",
 ]
 

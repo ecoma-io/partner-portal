@@ -33,7 +33,10 @@
 # No credentials are logged: the reloader reports *that* a credential changed
 # and which field it was, never the value (src/config/hot_reload.rs::report_changes).
 # The two this file holds are `upstream.api_key` and `manager.password`;
-# partner API keys are not here at all (see the block below).
+# partner API keys are not here at all (see the block below), and neither is the
+# SMTP credential, which comes from `PARTNER_PORTAL_SMTP_USERNAME` and
+# `PARTNER_PORTAL_SMTP_PASSWORD` in the environment and is read as a pair
+# (src/config/smtp.rs).
 
 # ---------------------------------------------------------------------------
 # server — HTTP listener behaviour.
@@ -178,18 +181,27 @@ upstream:
 #   * `key_hash`        `hex(HMAC-SHA256(secret, plaintext))`. The plaintext is
 #                       never stored, never logged, and never returned by any
 #                       read endpoint.
-#   * `allowed_models`  **strict**: an empty list is allowed *no* model. An
-#                       inference request naming anything unlisted is refused
-#                       `404 model_not_found` before the upstream is contacted
-#                       and before a metering row is written; `/v1/models`
-#                       answers the same filtered list (docs/adr/0012).
 #   * `status`          `active` or `revoked`. A key past `expires_at` is
 #                       filtered out at load and is never authenticated.
 #
-# Two rows that share a `consumer_id` deliberately share one usage view — the
+# A key carries no model list of its own. Which models a partner may call — and
+# what each of them costs — is the `partner_models` table, configured per partner
+# through `PUT /api/admin/partners/{consumer_id}/models` or `keygen` below. One
+# map answers both questions, so a model a partner can call is always a model with
+# a price, and a model with no entry is refused `404 model_not_found` before the
+# upstream is contacted and before a metering row is written; `/v1/models`
+# answers the same filtered list (docs/adr/0012 as amended by docs/adr/0015).
+#
+# A partner has **at most one active key**, enforced by a partial unique index
+# rather than by a check — a check-then-insert is a race between two instances,
+# and the thing that must never happen is a partner holding two live credentials.
+# To replace a key, rotate it: one transaction issues the new plaintext and
+# revokes the old one.
+#
+# Two keys that share a `consumer_id` deliberately share one usage view — the
 # rotation pattern. Granting that share is an explicit operator decision; no
-# request can assert it. Two rows that do not share one can never observe each
-# other's data (tests/e2e/dashboard_isolation.rs).
+# request can assert it. Two partners can never observe each other's data
+# (tests/e2e/dashboard_isolation.rs).
 #
 # # Issuing the first key
 #
@@ -197,18 +209,33 @@ upstream:
 # API — which is authenticated with the `manager` password below. To bootstrap
 # a deployment, either call the API with that password:
 #
+#   curl -sS -X POST http://127.0.0.1:8080/api/admin/partners \
+#     -H "Authorization: Bearer $MANAGER_PASSWORD" \
+#     -H 'content-type: application/json' \
+#     -d '{"consumer_id":"acme","name":"Acme","billing_mode":"invoice",
+#          "billing_email":"billing@acme.test"}'
+#
+# — then price the partner's models, and only then issue the key:
+#
+#   curl -sS -X PUT http://127.0.0.1:8080/api/admin/partners/acme/models \
+#     -H "Authorization: Bearer $MANAGER_PASSWORD" \
+#     -H 'content-type: application/json' \
+#     -d '{"models":[{"model":"gpt-4o","input_per_million":"0.095",
+#          "cached_input_per_million":"0.0475","output_per_million":"0.475"}]}'
+#
 #   curl -sS -X POST http://127.0.0.1:8080/api/admin/api-keys \
 #     -H "Authorization: Bearer $MANAGER_PASSWORD" \
 #     -H 'content-type: application/json' \
-#     -d '{"name":"acme-production","consumer_id":"acme",
-#          "allowed_models":["gpt-4o","gpt-4o-mini"]}'
+#     -d '{"name":"acme-production","consumer_id":"acme"}'
 #
 # — which prints the plaintext key exactly once — or run the one-shot helper
-# against the same database file, which needs no running instance:
+# against the same database file, which needs no running instance and creates the
+# partner row, its prices and the key in one transaction:
 #
 #   ./partner-portal keygen --database ./partner-portal.db \
 #     --name acme-production --consumer-id acme \
-#     --allowed-model gpt-4o --allowed-model gpt-4o-mini
+#     --billing-mode invoice --billing-email billing@acme.test \
+#     --model gpt-4o:0.095:0.0475:0.475 --model gpt-4o-mini:0.002375:0:0
 #
 # The plaintext exists in that one response and nowhere else. Losing it is not
 # recoverable by design: rotate the row, which issues a new plaintext and
@@ -244,6 +271,121 @@ manager:
   # password would parse and silently do nothing while reading as though it
   # granted access.
   password: "pp-manager-password-replace-me"
+
+# ---------------------------------------------------------------------------
+# billing — daily postpaid statements, and how they reach the partner.
+#
+# Optional as a block: omit it and every default below applies, which means
+# statements are closed on UTC days five minutes after they end and nothing is
+# emailed.
+#
+# What this block does NOT configure is what anything costs, who owes anything,
+# or where a statement goes. Those are per partner and live in the `partners` and
+# `partner_models` tables, edited through the admin API — a price is a commercial
+# fact about a customer, not a property of the deployment, and one file cannot
+# hold both without the file becoming the customer database
+# (docs/adr/0015).
+#
+# There are no SMTP credentials here either. They come from
+# `PARTNER_PORTAL_SMTP_USERNAME` and `PARTNER_PORTAL_SMTP_PASSWORD` in the
+# environment, read as a pair (src/config/smtp.rs): neither is an anonymous
+# relay, and exactly one is a warning and a skipped send rather than a startup
+# failure. A password in this file is a password in a file that gets committed,
+# and this file is re-read every second.
+# ---------------------------------------------------------------------------
+billing:
+  # The billing calendar's distance from UTC, in minutes. Range: -720 (UTC-12)
+  # to 840 (UTC+14), the whole set of real civil offsets; anything else is
+  # refused at load rather than silently falling back to UTC.
+  #
+  # A statement is "for 2026-09-27" in *this* calendar, so a partner reading it
+  # means their own 27th. Stored timestamps stay UTC; the offset is applied when
+  # a day is named and when a cutoff is computed, and nowhere else. Every
+  # statement row carries its own period bounds in UTC, so an old statement does
+  # not depend on this still being what it was.
+  #
+  # A fixed offset rather than a zone name on purpose: a zone name means a tz
+  # database, and a tz database update would move a statement by an hour. A
+  # deployment that wants daylight saving moves this value deliberately, at a
+  # boundary it chooses. Half-hour and 45-minute offsets work (330 is UTC+05:30).
+  # Live: read when the scheduler builds a generator. Restart required to change.
+  # Default: 0 (UTC).
+  timezone_offset_minutes: 0
+
+  # How long after a billing day ends it may be closed.
+  #
+  # A request accepted at 23:59:59 is metered *before* the upstream is contacted
+  # and finalised after it, so closing the day at the instant it ends would drop
+  # the last requests of the day — a systematic under-bill at exactly the
+  # boundary a customer can see. This is the window in which those rows land.
+  # Zero is valid and means "close it as soon as it ends"; negative is refused.
+  # Live: read when the scheduler builds a generator. Restart required to change.
+  # Default: 5.
+  close_delay_minutes: 5
+
+  # How often the scheduler looks for days to close, in seconds. Values below 1
+  # are clamped to 1.
+  #
+  # This is not the deadline — `close_delay_minutes` decides *when* a day may
+  # close, and this decides how promptly the process notices. The work is
+  # idempotent and a closed day is never reopened (`UNIQUE(consumer_id,
+  # billing_date)`), so a second instance running the same sweep is a no-op
+  # rather than a double bill.
+  # Read when the worker task is spawned. Restart required to change.
+  # Default: 30.
+  scheduler_interval_secs: 30
+
+  # -------------------------------------------------------------------------
+  # billing.email — whether a statement is also sent to the partner.
+  #
+  # Email is at-least-once and best-effort, and it is a *courtesy on top of the
+  # statement*, never the statement itself. Delivery state is bookkept on the
+  # statement row (`email_sent_at`, `email_attempts`, `email_last_error`,
+  # `email_next_retry_at`) and a failed send is retried with backoff — it never
+  # changes the amount owed and never blocks the statement from being issued.
+  #
+  # Nothing in a message is secret: a statement carries the partner's own model
+  # names, tokens and amounts. It carries no API key, no upstream credential and
+  # no request body, and the send is only attempted once the statement is already
+  # durable.
+  # -------------------------------------------------------------------------
+  email:
+    # Whether statements are emailed at all.
+    #
+    # Off by default. A deployment that has not configured a relay must not
+    # discover it by having statements bounce, and a staging instance pointed at
+    # production's database wants the statements without the mail. When this is
+    # true, `smtp_host` and `from_address` must both be set or the file is
+    # refused at load — an operator asking for email and getting silence is the
+    # failure this catches.
+    # Read when the worker task is spawned. Restart required to change.
+    # Default: false.
+    enabled: false
+
+    # The relay to hand the message to. A hostname or IP; STARTTLS is negotiated
+    # on the submission port below.
+    # The conversation is always plaintext-then-STARTTLS: if the relay advertises
+    # STARTTLS the session is upgraded, and if it does not, a configured
+    # credential is withheld and the send fails rather than going out in the
+    # clear. There is no implicit-TLS path, so a relay that expects TLS from the
+    # first byte (the usual 465) will not complete the greeting.
+    # Live: read per send, so a reload repoints the relay immediately.
+    # Default: "" (nothing to send through).
+    smtp_host: ""
+
+    # The relay's submission port. 587 is the standard submission port; 25 is for
+    # relay-to-relay traffic and is blocked by most networks. 1025 is what the
+    # dev fixture listens on.
+    # Live: read per send.
+    # Default: 587.
+    smtp_port: 587
+
+    # The envelope and header `From`. Not defaulted anywhere on purpose: a
+    # statement sent from an address nobody owns looks delivered, which is worse
+    # than one that visibly failed. A reply to it should reach a person.
+    # Live: read per send.
+    # Default: "" (refused when `enabled` is true).
+    from_address: ""
 
 # ---------------------------------------------------------------------------
 # database — the durable usage ledger.

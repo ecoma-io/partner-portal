@@ -30,6 +30,7 @@
 pub mod admin;
 pub mod apikeys;
 pub mod auth;
+pub mod billing;
 pub mod config;
 pub mod crypto;
 pub mod dashboard;

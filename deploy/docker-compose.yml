@@ -71,6 +71,19 @@ x-portal: &portal
     # partner request; the process itself also refuses to start without it.
     PARTNER_PORTAL_API_KEY_SECRET: ${PARTNER_PORTAL_API_KEY_SECRET:?set PARTNER_PORTAL_API_KEY_SECRET to at least 32 bytes in the environment; see deploy/README.md}
 
+    # The SMTP credential for statement email (docs/adr/0015), passed through
+    # the same way and for the same reason: it is a secret, so it lives in the
+    # environment and not in `config/`, which is committed.
+    #
+    # No `:?` — the pair is optional. A relay that needs no credential is a
+    # normal shape, and a deployment that does not email statements at all
+    # (`billing.email.enabled: false`) must not be forced to invent one. Both
+    # variables or neither: the process refuses half a credential at start-up
+    # rather than authenticating as the wrong account, and an empty value —
+    # which is what an undefined shell variable produces here — reads as unset.
+    PARTNER_PORTAL_SMTP_USERNAME: ${PARTNER_PORTAL_SMTP_USERNAME:-}
+    PARTNER_PORTAL_SMTP_PASSWORD: ${PARTNER_PORTAL_SMTP_PASSWORD:-}
+
   volumes:
     # Read-only: the configuration is re-read every second, and a container that
     # can write its own config has a config that no longer describes the
@@ -177,6 +190,18 @@ services:
       - ./mock-upstream.py:/app/mock-upstream.py:ro
     expose:
       - "9000"
+
+networks:
+  # An explicit subnet, for the same reason `scripts/docker-smoke-test.sh` gives
+  # its network one: a daemon whose default address pool is exhausted — a shared
+  # build host that has run out of 172.18.0.0/16 — cannot create a bridge network
+  # at all, and neither this gate nor a real deployment of this file should fail
+  # for a reason that has nothing to do with the image. Override it with
+  # `PARTNER_PORTAL_SUBNET` when 10.252.0.0/24 is already taken.
+  default:
+    ipam:
+      config:
+        - subnet: ${PARTNER_PORTAL_SUBNET:-10.252.0.0/24}
 
 volumes:
   portal-data:

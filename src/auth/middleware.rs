@@ -116,12 +116,8 @@ impl FromRequestParts<Arc<AppState>> for Authenticated {
         // snapshot. No database query, and the snapshot is current as of the
         // last refresh — a revoke through this instance has already been
         // applied, and one through a sibling lands within the refresh interval.
-        if let Some(auth) = state.api_keys.authenticate(token) {
-            return Ok(Authenticated(ConsumerContext::new(
-                auth.consumer_id,
-                auth.name,
-                auth.allowed_models,
-            )));
+        if let Some(partner) = state.api_keys.authenticate(token) {
+            return Ok(Authenticated(ConsumerContext::new(partner)));
         }
 
         // The manager password is still a configuration credential. Read fresh,

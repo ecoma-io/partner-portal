@@ -15,12 +15,13 @@ Status: pre-release (`0.1.0`), single-VPS deployment target.
 | It is | It is not |
 |---|---|
 | A reverse proxy in front of **one** OpenAI-compatible upstream | A general-purpose LLM gateway: there is no routing, no provider failover, no model→provider mapping |
-| A durable usage ledger (SQLite, WAL, `synchronous = FULL`) | A billing or pricing system: it records tokens and counts, never cost |
+| A durable usage ledger (SQLite, WAL, `synchronous = FULL`) | A payments system: it issues a daily postpaid statement and records that money moved, and collects nothing itself — no Stripe, no wallet, no subscription, no tax engine, no automatic charging |
 | A local API-key authenticator that replaces the credential upstream | An identity provider, OIDC client or rate limiter |
 | An incremental streaming proxy (frames forwarded as they arrive) | A body transformer: requests and responses pass through verbatim |
 | A partner-key lifecycle of its own: issue, list, rename, restrict, rotate and revoke through `/api/admin/api-keys`, hashed in SQLite, plus a first-run `keygen` subcommand | A user directory or an identity provider: no account, no password reset, no role richer than "a partner key, or the manager password" |
-| A per-consumer usage dashboard, plus an optional operator password with a cross-consumer view (`manager:` in config) | A multi-tenant admin console: no billing, no tenancy model, and no write surface outside that key lifecycle |
+| A per-consumer usage dashboard and billing view, plus an optional operator password with a cross-consumer view (`manager:` in config) and a manager-only commercial surface | A multi-tenant admin console: the tenancy unit is a partner, and the only writes an operator can make are a key, a price list, and the record that an invoice was paid |
 | A single static binary with the dashboard embedded | A TLS terminator: the listener is plain HTTP — put it behind something that speaks TLS |
+| One immutable statement per partner per billing day, priced from the price snapshot frozen onto each usage row | A recomputed bill: a statement does not move when a price list changes or when a retention sweep prunes the usage it summarises |
 
 Three paths are proxied: `/v1/chat/completions`, `/v1/responses`, `/v1/models`.
 Anything else under `/v1/` is a JSON `404`; there is no embeddings, audio, image
@@ -90,6 +91,16 @@ log line exist and the response is the caller's only route to either.
 | `PATCH /api/admin/api-keys/{id}` | manager | — | Rename it, or replace `allowed_models` |
 | `POST /api/admin/api-keys/{id}/rotate` | manager | — | Revoke the predecessor and issue the replacement in one transaction |
 | `POST /api/admin/api-keys/{id}/revoke` | manager | — | Stop it authenticating. Idempotent: revoking a revoked key is a success |
+| `GET /api/billing/status` | Bearer | — | This partner's derived service status: `active` or `suspended`, the reason, and the overdue count and total |
+| `GET /api/billing/statements` | Bearer | — | The caller's own statements, newest first; `unpaid=true` lists outstanding invoices; `consumers=` narrows a manager |
+| `GET /api/billing/statements/{id}` | Bearer | — | One statement with its priced lines. A statement outside the caller's scope is a `404` |
+| `GET/POST /api/admin/partners` | manager | — | The commercial partners, and the creation of one. Refused for a partner that already exists |
+| `GET/PATCH/DELETE /api/admin/partners/{consumer_id}` | manager | — | One partner. A partner with a statement cannot be deleted |
+| `GET/PUT /api/admin/partners/{consumer_id}/models` | manager | — | The price list, and its **complete** atomic replacement — a half-applied list is a partner whose traffic is refused for reasons they cannot see |
+| `GET /api/admin/billing/summary` | manager | — | What is owed across the scope, read from the statements that exist |
+| `GET /api/admin/billing/statements` | manager | — | Every statement in scope, including the payment columns |
+| `GET /api/admin/billing/statements/{id}` | manager | — | One statement, with `email_sent_at`, the attempt count and the last error |
+| `POST /api/admin/billing/statements/{id}/mark-paid` | manager | — | Record that money moved. Idempotent, and `409 statement_not_payable` on a reconciliation statement |
 | `GET /healthz` | none | — | Liveness |
 | `GET /readyz` | none | — | Readiness — 503 while shutting down or while the ledger is degraded |
 | `GET /version` | none | — | Version, commit, build time, schema version |
@@ -100,6 +111,14 @@ unknown `/v1/*` or `/api/*` path, and `"code":"manager_required"` when a partner
 key calls the admin surface (no credential at all is the same `401`
 `invalid_api_key` as anywhere else). Auth failures, and every admin response, are
 returned with `Cache-Control: no-store`.
+
+A partner whose service is suspended gets `403` with
+`"code":"billing_suspended"` on the proxy paths, and it is refused **before** the
+upstream is contacted and before anything is metered. It is deliberately not a
+`401`: a suspended partner's key is valid, and an operator who reads `401` here
+rotates a key that needs no rotation. The same code is returned on
+`/v1/models`, because answering discovery for a suspended partner would let them
+discover a service they cannot use.
 
 ## Quick start
 
@@ -122,7 +141,8 @@ export PARTNER_PORTAL_API_KEY_SECRET="$(openssl rand -base64 32)"
 #    it now — no endpoint can show it again. (An operator with the config file
 #    can also issue keys over the admin API; `keygen` is the first-run path.)
 ./target/release/partner-portal keygen --database ./partner-portal.db \
-    --name acme-production --consumer-id acme --allowed-model gpt-4o
+    --name acme-production --consumer-id acme \
+    --model 'gpt-4o:2.50:1.25:10.00'
 
 # 5. Run. The listen address is the PARTNER_PORTAL_LISTEN environment
 #    variable (default 0.0.0.0:8080) — a port belongs to the deployment, so it
@@ -229,6 +249,61 @@ short version of what it means in practice:
   from it, so a changed secret invalidates every issued key at once, and a
   database restored without it holds keys that authenticate nobody. It is a
   deployment secret to generate once and keep with the backups.
+
+## Daily statements
+
+**A day of usage becomes one immutable statement per partner**, issued by a
+scheduler after the day closes, and priced from the price snapshot frozen onto
+each usage row when that request was accepted. This is
+[ADR 0015](docs/adr/0015-daily-postpaid-statements.md); what it means in
+practice:
+
+* **A price change is not retroactive.** The accept commit writes
+  `input_price_snapshot`, `cached_input_price_snapshot` and
+  `output_price_snapshot` alongside the tokens — or none of them. A statement
+  reads the price off its own lines and never looks a price up, so an operator
+  who edits a price list today has changed what tomorrow's traffic costs and
+  nothing else. A price change *mid-day* keeps two lines on the same statement
+  rather than averaging them, because the statement is how anyone finds out what
+  it cost.
+* **Money is an integer.** Prices are micro-USD per million tokens, parsed digit
+  by digit from the decimal string and never through a float, and each component
+  is rounded half away from zero exactly once. A line total is the sum of its
+  rounded parts; a statement total is the sum of its lines. There is no `f64`
+  anywhere on the path.
+* **A request the provider did not measure is counted, not billed.** It appears
+  as a line with an `incomplete_usage_count` and no cost, and the statement is
+  visibly not a complete bill. It is never billed at zero — "we do not know what
+  this cost" and "this was free" are different statements, and invariant 3
+  survives having a money consequence attached to it.
+* **Two contract modes, not a flag.** `invoice` is an obligation: it has a
+  `due_at`, it is emailed, and it can suspend service. `reconciliation` is a
+  settlement record: it is priced and issued, it has **no** due date, it is never
+  payable, and no configuration of it can produce a deadline.
+* **Suspension is derived, never stored.** A partner on invoice terms is refused
+  with `403 billing_suspended` while a *complete* statement is past its due date
+  and unpaid. Paying it through `POST /api/admin/billing/statements/{id}/mark-paid`
+  releases them on the next read, with no write to the partner row — a stored
+  flag would have to be cleared by the payment, and a crash in between would
+  leave a paying partner suspended forever. An incomplete statement and a
+  zero-amount statement are both counted as overdue and neither suspends: a
+  partner does not stop owing the whole ledger the moment they miss a day, and
+  refusing a paying partner's traffic over `$0.000000` would be the worst
+  possible reading of "enforce the payment obligation".
+* **A statement is never deleted.** Retention prunes usage; a statement outlives
+  it, which is the whole reason a statement carries its own counts and prices.
+  A bill that moved when a sweep ran would not be a bill.
+* **The SMTP credential is environment-only.**
+  `PARTNER_PORTAL_SMTP_USERNAME` and `PARTNER_PORTAL_SMTP_PASSWORD` are read
+  into memory at startup, required as a pair, and never written to SQLite, never
+  present in YAML, and never rendered by a `Debug`. The email body carries the
+  statement's own figures and no API key, no upstream credential and no request
+  body.
+
+Create and price a partner through `/api/admin/partners`; the dashboard's
+**Partners** page does the same. A partner with a model that has no price is a
+request that cannot be metered, so the price list is replaced as a complete set
+in one write and an incomplete one is refused.
 
 ## Configuration
 

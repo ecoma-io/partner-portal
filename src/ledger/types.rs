@@ -184,6 +184,21 @@ pub struct RequestRecord {
     /// Bounded, lossy UTF-8 text from a non-streaming non-2xx upstream response.
     /// Never set from request, successful, or streaming bodies.
     pub error_body: Option<String>,
+    /// The partner's prices for this model at the instant the request was
+    /// accepted, if the partner had any.
+    ///
+    /// Snapshotted at accept rather than resolved at statement time, because a
+    /// price an operator changes tomorrow must not reprice yesterday's usage.
+    /// The column is the record of what the contract said when the request ran,
+    /// and it is what makes a statement reproducible from the ledger alone.
+    ///
+    /// `None` means "no price was in force", which is *not* a price of zero:
+    /// such a request is counted on its statement as unmeasurable and
+    /// contributes no money. Every request the proxy accepts has a price — the
+    /// model gate refuses a model the partner has none for — so a `None` here
+    /// on an accepted request means a configuration changed mid-flight or a row
+    /// predates billing.
+    pub pricing: Option<crate::billing::pricing::PricingSnapshot>,
 }
 
 impl RequestRecord {
@@ -209,7 +224,23 @@ impl RequestRecord {
             duration_ms: 0,
             error_message: None,
             error_body: None,
+            pricing: None,
         }
+    }
+
+    /// Attach the prices in force for this request, as the accept path does.
+    ///
+    /// A builder rather than a parameter of [`RequestRecord::new`], because the
+    /// two callers want different things: the proxy *must* set it (the model it
+    /// just gated has a price by construction), while a test or a maintenance
+    /// path constructs a record that has none. `None` is the safe default — an
+    /// unpriced row is counted as unmeasurable and charged nothing — so a later
+    /// change that drops this call degrades into "no money is billed", which is
+    /// loud in the statement's incomplete count, and never into a fabricated
+    /// charge.
+    pub fn with_pricing(mut self, prices: crate::billing::pricing::PricingSnapshot) -> Self {
+        self.pricing = Some(prices);
+        self
     }
 
     /// Mark as completed with usage

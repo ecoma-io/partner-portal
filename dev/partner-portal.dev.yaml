@@ -10,7 +10,8 @@
 # (ADR 0014), not configuration, so this file has no `keys:` block and cannot
 # have one — `Config` is `deny_unknown_fields`, and a leftover block is a parse
 # error rather than a silent second source of truth. `scripts/dev-seed-keys.sh`
-# writes this loop's three memorable keys into the database, with the same
+# writes this loop's two memorable keys — and the partners they belong to, with
+# the models each may call and their prices — into the database, with the same
 # plaintexts `scripts/dev-load.sh` defaults to.
 #
 # It differs from `deploy/config/partner-portal.smoke.yaml` in three ways, each
@@ -52,6 +53,39 @@ manager:
   # The cross-consumer view: a manager sees every consumer, and the dashboard's
   # consumer selector — fed from the ledger — narrows it (docs/adr/0013).
   password: "dev-manager"
+
+billing:
+  # The dev loop runs on UTC, like a default deployment. Nothing here is a
+  # deployment decision; the field reference is `config.example.yaml`.
+  timezone_offset_minutes: 0
+
+  # Five minutes after the day ends is the production default, and it is the
+  # right one here too — but the dev loop is impatient, and it is the *reason*
+  # this file states the block rather than inheriting it. A run that starts at
+  # 23:57 and asks where its statement is has five minutes to wait, and the
+  # answer "the day has not closed yet" is worth being able to see.
+  close_delay_minutes: 5
+
+  # A sweep every 30 seconds is the production cadence; the dev loop shortens it
+  # so a day that becomes closable is closed while the operator is still looking
+  # at the terminal. The work is idempotent — `UNIQUE(consumer_id, billing_date)`
+  # is what guarantees that — so a shorter interval costs a query, not a bill.
+  scheduler_interval_secs: 5
+
+  # No mail, deliberately. The dev loop has no relay, and the two things worth
+  # exercising locally — statements being issued and being *filed* — need
+  # none. `scripts/dev-seed-keys.sh` seeds both partners with no billing
+  # address, which is exactly the shape an operator meets on the day the relay
+  # is down: the statement is still produced, still durable, and simply not
+  # sent. To try the send path, point `smtp_host` at a local sink (port 1025 is
+  # the conventional one) and set `enabled: true` — the credentials, if the sink
+  # wants any, come from PARTNER_PORTAL_SMTP_USERNAME and
+  # PARTNER_PORTAL_SMTP_PASSWORD in the environment, never from a file.
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 1025
+    from_address: ""
 
 database:
   # Git-ignored, kept between runs on purpose: the point of the load script is

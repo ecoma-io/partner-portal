@@ -70,13 +70,33 @@ DEV_API_KEY_SECRET="${DEV_API_KEY_SECRET:-dev-api-key-secret-not-a-real-one!!}"
 PARTNER_PORTAL_API_KEY_SECRET="$DEV_API_KEY_SECRET"
 export PARTNER_PORTAL_API_KEY_SECRET
 
-# The three dev keys, and the models each may call. Both are read here rather
-# than in one script so `dev-seed-keys.sh` (which writes them) and `dev-up.sh`
-# (which prints them) cannot drift apart.
+# The dev keys. Two, and one consumer each, because a partner has at most one
+# live credential: `idx_api_keys_one_active_per_consumer` enforces it in the
+# database and `keygen` refuses to write a second partner record for a consumer
+# that already has one. The loop used to seed `dev-key` and `dev-key-2` for the
+# same consumer to show that two keys gave one view; the same thing is on show
+# now by logging in as `beta`, which is a different view rather than the same
+# one twice.
+#
+# Read here rather than in one script so `dev-seed-keys.sh` (which writes them)
+# and `dev-up.sh` (which prints them) cannot drift apart.
 DEV_KEY="dev-key"
-DEV_KEY_2="dev-key-2"
 DEV_BETA_KEY="dev-key-beta"
-DEV_MODELS="gpt-4o gpt-4o-mini claude-sonnet-4-20250514 gpt-4.1"
+
+# The models each dev partner may call, with the price each is billed at, in the
+# `NAME:INPUT:CACHED:OUTPUT` form `keygen --model` takes (dollars per million
+# tokens; ADR 0015).
+#
+# One list rather than names here and a price table beside it: `partner_models`
+# is the single authority for both "may this partner call it" and "what does it
+# cost", and a fixture that kept them apart could seed a model the loop can call
+# but nothing can price. A model with no price is a model the partner cannot
+# call, in the seed and in the request path alike.
+#
+# These are the four names `dev/request-generator.py` draws from, so the loop
+# exercises every one of them and the statement it produces has four lines
+# rather than the one a single-model fixture would ever show.
+DEV_MODELS="gpt-4o:2.5:1.25:10 gpt-4o-mini:0.15:0.075:0.6 claude-sonnet-4-20250514:3:0.3:15 gpt-4.1:2:0.5:8"
 
 STUB_PORT="${DEV_STUB_PORT:-9100}"
 PROXY_PORT="${DEV_PROXY_PORT:-8080}"

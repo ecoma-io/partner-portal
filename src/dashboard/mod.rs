@@ -3,7 +3,7 @@
 mod api;
 pub mod sse;
 
-pub use api::{DashboardQuery, create_api_router};
+pub use api::{DashboardError, DashboardQuery, create_api_router};
 pub use sse::{SseBroadcaster, sse_handler};
 
 use axum::{Router, routing::get};

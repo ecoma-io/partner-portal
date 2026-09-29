@@ -14,8 +14,7 @@ use std::time::Duration;
 
 use crate::common::{
     Behaviour, KeySpec, ManagerSpec, MockUpstream, Spec, TestClient, TestServer, WAIT_TIMEOUT,
-    chat_request, in_flight_count, raw_rollup_totals, row_count, wait_for_terminal,
-    wait_for_terminal_count,
+    chat_request, in_flight_count, row_count, wait_for_terminal,
 };
 use http::{Method, StatusCode};
 use serde_json::json;
@@ -215,59 +214,55 @@ async fn identity_comes_from_the_stored_row_not_the_request() {
     assert_eq!(me.json()["key_name"], "key-name");
 }
 
+/// A partner has precisely one active credential.
+///
+/// The partial unique index is the enforcement point, which is why this goes
+/// through a real HTTP request instead of trying to make the harness seed an
+/// impossible state. If the index were replaced with a pre-flight check, two
+/// concurrent instances could still issue two keys; the store translates its
+/// refusal into the explicit `key_already_active` conflict an operator acts on.
 #[tokio::test]
-async fn two_keys_configured_for_one_consumer_share_it_and_a_distinct_one_does_not() {
+async fn a_second_active_key_for_one_consumer_is_refused() {
     let upstream = MockUpstream::start(Behaviour::ChatJson {
         prompt: 3,
         completion: 2,
         cached: 0,
     })
     .await;
-    let spec = Spec::new(&upstream).with_keys(vec![
-        KeySpec::new("primary").with_consumer("shared-consumer"),
-        KeySpec::new("secondary").with_consumer("shared-consumer"),
-    ]);
+    let spec = Spec::new(&upstream)
+        .with_manager(ManagerSpec::new(MANAGER_PASSWORD))
+        .with_keys(vec![
+            KeySpec::new("primary").with_consumer("shared-consumer"),
+        ]);
     let server = TestServer::start(spec).await;
     let client = TestClient::new();
 
-    for index in 0..2 {
-        let me = client
-            .get_json(&server.url("/api/me"), Some(server.key_at(index)))
-            .await;
-        assert_eq!(me.status, StatusCode::OK);
-        assert_eq!(
-            me.json()["consumer_id"],
-            "shared-consumer",
-            "both keys are configured for the same consumer"
-        );
-        assert_ne!(
-            me.json()["key_name"],
-            "shared-consumer",
-            "the key name is reported separately from the consumer it maps to"
-        );
-    }
+    let original = client
+        .get_json(&server.url("/api/me"), Some(server.key()))
+        .await;
+    assert_eq!(original.status, StatusCode::OK);
+    assert_eq!(original.json()["consumer_id"], "shared-consumer");
 
-    // Both keys' traffic accrues to the one consumer they share.
-    for index in 0..2 {
-        let response = client
-            .call(
-                Method::POST,
-                &server.url("/v1/chat/completions"),
-                Some(server.key_at(index)),
-                chat_request("gpt-4o"),
-                &[],
-            )
-            .await;
-        assert_eq!(response.status, StatusCode::OK);
-    }
+    let second = client
+        .post_json(
+            &server.url("/api/admin/api-keys"),
+            Some(MANAGER_PASSWORD),
+            json!({"name": "second", "consumer_id": "shared-consumer"}),
+        )
+        .await;
+    assert_eq!(second.status, StatusCode::CONFLICT, "{}", second.text());
+    assert_eq!(second.json()["error"]["code"], "key_already_active");
 
-    let db = server.open_db();
-    wait_for_terminal_count(&server.db_path, 2, WAIT_TIMEOUT).await;
-    let (terminal, rolled) = raw_rollup_totals(&db);
-    assert_eq!(terminal, 2);
-    assert_eq!(rolled, 2, "two rows, one consumer, one rollup row each");
-    let shared = crate::common::rows_for_consumer(&db, "shared-consumer");
-    assert_eq!(shared.len(), 2);
+    // The refused issuance leaves the existing credential usable and creates no
+    // proxy work as a side effect.
+    assert_eq!(
+        client
+            .get_json(&server.url("/api/me"), Some(server.key()))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(upstream.request_count(), 0);
 }
 
 /// Revocation is now an admin call, not a config edit — the test is the same

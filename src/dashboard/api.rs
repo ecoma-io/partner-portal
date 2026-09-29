@@ -33,7 +33,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::Duration;
 
-use crate::auth::{Authenticated, ConsumerContext};
+use crate::auth::{Authenticated, resolve_scope, scope_clause};
 use crate::crypto::{base64url_decode, base64url_encode, constant_time_eq, hmac_sha256};
 use crate::ledger::timefmt;
 use crate::proxy::handler::AppState;
@@ -202,70 +202,6 @@ fn status_filter(query: &DashboardQuery) -> Option<&'static str> {
     }
 }
 
-/// How far a request may scope, resolved once per query.
-///
-/// For a consumer key this is exactly the key's one consumer. For a manager it
-/// is every consumer, or the consumers the `consumers` query parameter names —
-/// the parameter narrows, never widens (ADR 0013).
-#[derive(Debug, Clone)]
-enum Scope {
-    /// A single consumer; `consumer_id = ?`.
-    One(String),
-    /// The consumers the manager asked to see, verbatim.
-    List(Vec<String>),
-    /// Every consumer.
-    All,
-}
-
-/// Resolve the effective scope for an authenticated context and query.
-fn resolve_scope(consumer: &ConsumerContext, query: &DashboardQuery) -> Scope {
-    // A key context never consults the parameter: `consumers=acme` cannot
-    // widen a key into another consumer's data.
-    if !consumer.is_manager() {
-        return Scope::One(consumer.consumer_id().to_string());
-    }
-    let requested: Vec<String> = query
-        .consumers
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect();
-    if requested.is_empty() {
-        Scope::All
-    } else {
-        // Names are taken verbatim, so an unknown name is an empty result at
-        // query time — never a fall-back to everything.
-        Scope::List(requested)
-    }
-}
-
-/// Render a `Scope` into a `(WHERE fragment, params)` pair.
-///
-/// `One` yields `consumer_id = ?`; `List` yields `consumer_id IN (?,?,…)`; `All`
-/// yields `1 = 1` — a constant the planner folds away, kept explicit rather than
-/// omitting the `WHERE` entirely so the callers that always append
-/// `" AND …"` after the fragment never produce a dangling `AND`. An empty
-/// `List` yields `consumer_id IN ()` which SQLite evaluates to `FALSE` — the
-/// correct rendering of a filter nothing matches.
-fn scope_clause(scope: &Scope) -> (String, Vec<rusqlite::types::Value>) {
-    match scope {
-        Scope::One(id) => (
-            "consumer_id = ?".to_string(),
-            vec![rusqlite::types::Value::Text(id.clone())],
-        ),
-        Scope::List(list) => {
-            let placeholders = vec!["?"; list.len()].join(",");
-            let params = list
-                .iter()
-                .map(|c| rusqlite::types::Value::Text(c.clone()))
-                .collect();
-            (format!("consumer_id IN ({placeholders})"), params)
-        }
-        Scope::All => ("1 = 1".to_string(), Vec::new()),
-    }
-}
-
 /// `GET /api/me` — identify the authenticated credential.
 ///
 /// `role` is `"manager"` for a password session, `"consumer"` otherwise. For a
@@ -359,7 +295,7 @@ async fn get_summary(
     let window = TimeWindow::resolve(&query, retention_days)?;
     let model = model_filter(&query);
     let model_for_rollup = model.clone();
-    let scope = resolve_scope(&consumer, &query);
+    let scope = resolve_scope(&consumer, &query.consumers);
     let (scope_sql, scope_params) = scope_clause(&scope);
 
     let pool = state.pool.clone();
@@ -528,7 +464,7 @@ async fn get_timeseries(
     let retention_days = state.config.read().config.database.retention_days;
     let window = TimeWindow::resolve(&query, retention_days)?;
     let model = model_filter(&query);
-    let scope = resolve_scope(&consumer, &query);
+    let scope = resolve_scope(&consumer, &query.consumers);
     let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
@@ -646,7 +582,7 @@ async fn get_requests(
     let limit = query.limit.clamp(1, MAX_LIMIT);
     let model = model_filter(&query).map(|m| m.to_string());
     let status = status_filter(&query);
-    let scope = resolve_scope(&consumer, &query);
+    let scope = resolve_scope(&consumer, &query.consumers);
     let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
@@ -761,7 +697,7 @@ async fn get_models(
 ) -> Result<Json<ModelsResponse>, DashboardError> {
     let retention_days = state.config.read().config.database.retention_days;
     let window = TimeWindow::resolve(&query, retention_days)?;
-    let scope = resolve_scope(&consumer, &query);
+    let scope = resolve_scope(&consumer, &query.consumers);
     let (scope_sql, scope_params) = scope_clause(&scope);
     let pool = state.pool.clone();
 
@@ -896,6 +832,12 @@ fn verify_cursor(key: &[u8], raw: &str) -> Result<(String, i64), DashboardError>
 #[derive(Debug)]
 pub enum DashboardError {
     BadRequest(String),
+    /// Nothing matches, for this credential.
+    ///
+    /// One answer for "no such row" and "not yours", deliberately: the two must
+    /// be indistinguishable, or a 404 that said which would tell one consumer
+    /// that another consumer's row id exists.
+    NotFound(String),
     Database(rusqlite::Error),
     Internal(String),
 }
@@ -904,6 +846,7 @@ impl IntoResponse for DashboardError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             DashboardError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            DashboardError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             DashboardError::Database(e) => {
                 // Log the detail; do not hand database internals to the client.
                 tracing::error!(error = %e, "dashboard database error");
@@ -1226,83 +1169,6 @@ mod tests {
         assert_eq!(status_filter(&query), None);
     }
 
-    // ── manager scope resolution ──────────────────────────────────────────────
-
-    fn consumer_ctx(consumer_id: &str) -> ConsumerContext {
-        ConsumerContext::new(consumer_id.to_string(), consumer_id.to_string(), Vec::new())
-    }
-
-    fn manager_ctx() -> ConsumerContext {
-        ConsumerContext::manager()
-    }
-
-    fn q_with_consumers(consumers: &str) -> DashboardQuery {
-        DashboardQuery {
-            range: "24h".to_string(),
-            consumers: consumers.to_string(),
-            ..Default::default()
-        }
-    }
-
-    /// A consumer key is pinned to its own consumer no matter what the
-    /// `consumers` parameter says — the parameter never scopes a key.
-    #[test]
-    fn test_consumer_key_scope_ignores_the_consumers_parameter() {
-        let ctx = consumer_ctx("acme");
-        assert!(matches!(
-            resolve_scope(&ctx, &q_with_consumers("competitor")),
-            Scope::One(ref id) if id == "acme"
-        ));
-    }
-
-    /// A manager with no parameter sees every consumer.
-    #[test]
-    fn test_manager_without_a_parameter_sees_every_consumer() {
-        assert!(matches!(
-            resolve_scope(&manager_ctx(), &q_with_consumers("")),
-            Scope::All
-        ));
-    }
-
-    /// A manager's request names its consumers verbatim — the request narrows,
-    /// never widens, and there is no config list to intersect with any more.
-    #[test]
-    fn test_manager_request_narrows_to_the_named_consumers() {
-        assert!(matches!(
-            resolve_scope(&manager_ctx(), &q_with_consumers("b,d")),
-            Scope::List(ref list) if *list == vec!["b".to_string(), "d".to_string()]
-        ));
-    }
-
-    /// An unknown name is taken verbatim and matches no rows at query time —
-    /// the wrong answer would be a silent fall-back to everything. This pins
-    /// that a future re-introduction of config-capping cannot go unnoticed.
-    #[test]
-    fn test_manager_requesting_an_unknown_consumer_gets_it_verbatim() {
-        assert!(matches!(
-            resolve_scope(&manager_ctx(), &q_with_consumers("ghost")),
-            Scope::List(ref list) if *list == vec!["ghost".to_string()]
-        ));
-    }
-
-    /// Separators with no name in them are a typo'd empty request, not a
-    /// filter: the manager still sees everything.
-    #[test]
-    fn test_manager_request_with_only_separators_means_all() {
-        assert!(matches!(
-            resolve_scope(&manager_ctx(), &q_with_consumers(" , ,")),
-            Scope::All
-        ));
-    }
-
-    #[test]
-    fn test_manager_query_parameter_commas_and_whitespace_are_split() {
-        assert!(matches!(
-            resolve_scope(&manager_ctx(), &q_with_consumers(" a ,,b ")),
-            Scope::List(ref list) if *list == vec!["a".to_string(), "b".to_string()]
-        ));
-    }
-
     /// `/api/me` offers exactly the consumers the ledger holds terminal rows
     /// for, ordered — the same table the other tabs read, deduplicated.
     #[test]
@@ -1325,28 +1191,6 @@ mod tests {
             distinct_consumers(&conn).unwrap(),
             vec!["acme".to_string(), "beta".to_string()]
         );
-    }
-
-    /// The SQL fragment shapes: a single consumer pins, a list becomes an
-    /// `IN (...)`, and the everything scope is a constant the planner folds.
-    #[test]
-    fn test_scope_clause_renders_sql_fragments() {
-        let (one_sql, one_params) = scope_clause(&Scope::One("acme".into()));
-        assert_eq!(one_sql, "consumer_id = ?");
-        assert_eq!(one_params.len(), 1);
-
-        let (list_sql, list_params) = scope_clause(&Scope::List(vec!["a".into(), "b".into()]));
-        assert_eq!(list_sql, "consumer_id IN (?,?)");
-        assert_eq!(list_params.len(), 2);
-
-        let (all_sql, all_params) = scope_clause(&Scope::All);
-        assert_eq!(all_sql, "1 = 1");
-        assert!(all_params.is_empty());
-
-        // Empty list -> IN () -> SQLite FALSE, the correct "nothing granted".
-        let (empty_sql, empty_params) = scope_clause(&Scope::List(Vec::new()));
-        assert_eq!(empty_sql, "consumer_id IN ()");
-        assert!(empty_params.is_empty());
     }
 
     #[test]
