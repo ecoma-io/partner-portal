@@ -5,6 +5,35 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0](https://github.com/ecoma-io/partner-portal/compare/v0.1.1...v0.2.0) (2026-09-29)
+
+
+### Features
+
+* **admin:** add the manager-only api key lifecycle endpoints ([371a83e](https://github.com/ecoma-io/partner-portal/commit/371a83efc36b089c49ef10f3f58f3b801d1d44d2))
+* **apikeys:** move partner api keys into the database ([fa91bde](https://github.com/ecoma-io/partner-portal/commit/fa91bdeb66a0ebab6b02cdf776dc5d1e36f93c5d))
+* **apikeys:** move partner API-key management into the database ([744554f](https://github.com/ecoma-io/partner-portal/commit/744554f4dd2b52928bcc5a35ae903ce9c30600dd))
+* **billing:** daily postpaid statements, and nothing that charges a card ([591bfdc](https://github.com/ecoma-io/partner-portal/commit/591bfdc74b910cd0bb40c24bab3f8e015082cf4b))
+* **billing:** the commercial daily postpaid billing layer ([1cfb308](https://github.com/ecoma-io/partner-portal/commit/1cfb308a91fef6059f06ad9fc39b481c6c825f80))
+* **dashboard:** split the usage monolith and add Billing, Partners and Invoices ([8ee5668](https://github.com/ecoma-io/partner-portal/commit/8ee566881992ebb70009647c3e0a1e244b08ebb7))
+* **keygen:** provision a partner key from the shell ([c5c3a6c](https://github.com/ecoma-io/partner-portal/commit/c5c3a6cb972d849dc46038e26f4435e93af85d6d))
+
+
+### Bug Fixes
+
+* **apikeys:** reload the key snapshot on the interval, not on a change signal ([054151c](https://github.com/ecoma-io/partner-portal/commit/054151cde805d07f5ff73b36379fe1ab000f6a16))
+* **billing:** three things a review of this branch found ([db5f21c](https://github.com/ecoma-io/partner-portal/commit/db5f21cdc704c1a0f1abdc7af573b11cd1805f55))
+* **deploy:** the smoke fixtures speak the v6 keygen and price-list API ([5e251f3](https://github.com/ecoma-io/partner-portal/commit/5e251f3f5163f040e2e4e8387d8a7fd7bd577de6))
+* **deploy:** the smoke test survives a volume that outlives a run ([70fc246](https://github.com/ecoma-io/partner-portal/commit/70fc246a6012da30a4789f40756c48f2c22316cc))
+* **keygen:** name the flags after the fields they set, and take --database ([88ada95](https://github.com/ecoma-io/partner-portal/commit/88ada954de69ed377d242161a1d01880f4c56cff))
+
+
+### Documentation
+
+* carry the billing layer through the prose and the guides ([5dd7812](https://github.com/ecoma-io/partner-portal/commit/5dd7812191ba1cb84ab4e25f5aea17ca248de151))
+* document the database-backed key lifecycle ([12bfa0d](https://github.com/ecoma-io/partner-portal/commit/12bfa0d245f3ad9edf6ab1275a8daea10ad63aff))
+* record the daily postpaid statements decision ([72f7bdf](https://github.com/ecoma-io/partner-portal/commit/72f7bdf0d5794700aec0e49ba6fc92cf544f03b3))
+
 ## [0.1.1](https://github.com/ecoma-io/partner-portal/compare/v0.1.0...v0.1.1) (2026-09-25)
 
 
