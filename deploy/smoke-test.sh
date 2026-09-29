@@ -401,6 +401,44 @@ fi
 ok "stack started"
 
 # ---------------------------------------------------------------------------
+say "The partner's price list names the models this run serves"
+# ---------------------------------------------------------------------------
+# `MODEL` is a per-run timestamp and the key is a fixed string, so a volume that
+# outlives one run holds a partner whose price list names models nobody will ask
+# for again — and every request in this run would be refused by the gate. That is
+# the product behaving correctly and this script reporting a mystery, so the list
+# is set to the models this run serves before any traffic.
+#
+# It goes through the API rather than the database because that is the only way a
+# deployment can change it: `keygen` creates a partner and refuses one that
+# exists (`PartnerExists`), which is the right rule for an operator tool and makes
+# it the wrong tool for a second run. The write also lands in the instance's
+# snapshot inside the call, so the very next request is served — no wait, and
+# which is the same property the gate section below relies on.
+price_list='{"models":['
+for m in "mock-model" "$MODEL" "$SWITCH_MODEL" "$GATE_MODEL"; do
+    if [ "$price_list" != '{"models":[' ]; then
+        price_list="$price_list,"
+    fi
+    price_list="$price_list{\"model\":\"$m\",\"input_per_million\":\"1.00\",\"cached_input_per_million\":\"0.10\",\"output_per_million\":\"4.00\"}"
+done
+price_list="$price_list]}"
+
+fetch "$PORTAL_A/api/admin/partners/$KEY_CONSUMER/models" \
+    -X PUT \
+    -H "Authorization: Bearer $MANAGER" \
+    -H 'Content-Type: application/json' \
+    -d "$price_list"
+expect_eq "PUT sets the price list this run serves" "200" "$(status)"
+# Compared as a set, not a sequence: the reply is the rows as stored, and a
+# table that keeps them in another order has still stored exactly this list.
+# Both sides go through the same sort, so the check cannot be defeated by
+# writing the expected list in an order this one guessed wrong.
+expect_eq "and it names this run's four models" \
+    "$(printf '%s\n' "mock-model" "$MODEL" "$SWITCH_MODEL" "$GATE_MODEL" | sort | python3 -c 'import sys; print(sys.stdin.read().split())')" \
+    "$(body | python3 -c 'import json, sys; print(sorted(m["model"] for m in json.load(sys.stdin)))')"
+
+# ---------------------------------------------------------------------------
 say "Probes on each instance directly (bypassing the edge)"
 # ---------------------------------------------------------------------------
 for pair in "portal-a:$PORTAL_A" "portal-b:$PORTAL_B"; do
