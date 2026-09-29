@@ -63,6 +63,7 @@ use time::OffsetDateTime;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::auth::Scope;
 use crate::billing::email::{self, Settings};
 use crate::billing::partner::Partner;
 use crate::billing::period::{BillingDay, BillingTimezone};
@@ -439,7 +440,11 @@ impl Worker {
                 }
             };
 
-            let lines = match self.store.statement_lines(statement.id) {
+            // `Scope::All` because the worker holds no credential and is not
+            // answering a partner: it has already chosen which statement it is
+            // sending, and this read is part of building that one email rather
+            // than a lookup anybody can aim at a different row.
+            let lines = match self.store.statement_lines(statement.id, &Scope::All) {
                 Ok(lines) => lines,
                 Err(e) => {
                     warn!(statement_id = statement.id, error = %e, "billing_email_lines_read_failed");

@@ -916,25 +916,42 @@ impl BillingStore {
             .map_err(Into::into)
     }
 
-    /// A statement's lines, in a stable order.
-    pub fn statement_lines(&self, statement_id: i64) -> Result<Vec<StatementLine>> {
+    /// A statement's lines, in a stable order, for a caller in `scope`.
+    ///
+    /// `statement_lines` carries no `consumer_id` of its own, so the filter that
+    /// keeps one partner's per-model prices and token counts out of another's
+    /// response cannot live in this table's own `WHERE` — it has to come
+    /// through the statement. Joining on `daily_statements` and applying the
+    /// scope there is what puts that check *in the query*, instead of leaving it
+    /// to depend on every caller having fetched the statement first and
+    /// returned early when it was not theirs. A statement that is not the
+    /// caller's yields no rows, which is the same answer the statement lookup
+    /// gives, so the two agree rather than one of them being the only thing
+    /// standing between a guessable row id and a competitor's prices.
+    pub fn statement_lines(&self, statement_id: i64, scope: &Scope) -> Result<Vec<StatementLine>> {
+        let (scope_sql, mut scope_params) = scope_clause(scope);
+        scope_params.push(rusqlite::types::Value::from(statement_id));
+
         self.pool
             .read(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, statement_id, model, \
-                     input_price_micro_usd_per_million, \
-                     cached_input_price_micro_usd_per_million, \
-                     output_price_micro_usd_per_million, \
-                     request_count, input_tokens, cached_input_tokens, \
-                     uncached_input_tokens, output_tokens, \
-                     input_cost_micro_usd, cached_input_cost_micro_usd, \
-                     output_cost_micro_usd, total_cost_micro_usd \
-                     FROM statement_lines WHERE statement_id = ?1 \
-                     ORDER BY model, input_price_micro_usd_per_million, \
-                              cached_input_price_micro_usd_per_million, \
-                              output_price_micro_usd_per_million, id",
-                )?;
-                let rows = stmt.query_map([statement_id], |row| {
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT l.id, l.statement_id, l.model, \
+                     l.input_price_micro_usd_per_million, \
+                     l.cached_input_price_micro_usd_per_million, \
+                     l.output_price_micro_usd_per_million, \
+                     l.request_count, l.input_tokens, l.cached_input_tokens, \
+                     l.uncached_input_tokens, l.output_tokens, \
+                     l.input_cost_micro_usd, l.cached_input_cost_micro_usd, \
+                     l.output_cost_micro_usd, l.total_cost_micro_usd \
+                     FROM statement_lines l \
+                     JOIN daily_statements s ON s.id = l.statement_id \
+                     WHERE {scope_sql} AND l.statement_id = ?{} \
+                     ORDER BY l.model, l.input_price_micro_usd_per_million, \
+                              l.cached_input_price_micro_usd_per_million, \
+                              l.output_price_micro_usd_per_million, l.id",
+                    scope_params.len()
+                ))?;
+                let rows = stmt.query_map(params_from_iter(scope_params.iter()), |row| {
                     Ok(StatementLine {
                         id: row.get(0)?,
                         statement_id: row.get(1)?,
@@ -1679,6 +1696,107 @@ mod tests {
         assert_eq!(
             PricingSnapshot::from_columns(Some(0), Some(0), Some(0)).unwrap(),
             snapshot
+        );
+    }
+
+    /// One priced line for a model, enough to make a statement non-empty.
+    fn a_line(model: &str, tokens: i64) -> StatementLineDraft {
+        StatementLineDraft {
+            model: model.to_string(),
+            prices: prices(1_000_000, 100_000, 4_000_000),
+            request_count: 1,
+            input_tokens: tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            cost: LineCost {
+                uncached_input_tokens: tokens as u64,
+                input_cost: MicroUsd::from_i64(tokens),
+                cached_input_cost: MicroUsd::from_i64(0),
+                output_cost: MicroUsd::from_i64(0),
+                total: MicroUsd::from_i64(tokens),
+            },
+        }
+    }
+
+    fn a_draft(consumer_id: &str, day: &str) -> StatementDraft {
+        StatementDraft {
+            consumer_id: consumer_id.to_string(),
+            billing_date: BillingDay::parse(day).expect("a parseable day"),
+            billing_mode: BillingMode::Invoice,
+            period_start: format!("{day}T00:00:00.000000000Z"),
+            period_end: format!("{day}T00:00:00.000000000Z"),
+            billing_cutoff_at: format!("{day}T00:00:00.000000000Z"),
+            // An invoice statement has to carry a due date — the store refuses
+            // one without, which is the same check a real write goes through.
+            due_at: Some(time::macros::datetime!(2026-10-02 00:00 UTC)),
+            incomplete_usage_count: 0,
+            lines: vec![a_line("gpt-4o", 1_000)],
+        }
+    }
+
+    /// A partner's statement lines are filtered by the scope *in the query*.
+    ///
+    /// `statement_lines` has no `consumer_id` column of its own, so for a while
+    /// the only thing keeping beta's per-model prices and token counts out of
+    /// acme's response was that the HTTP handler fetched the statement first
+    /// and returned early when it was not theirs. That is a filter held in
+    /// control flow rather than in SQL: reorder those two lines, or fetch the
+    /// lines first to render a count on a list endpoint, and the guard is gone
+    /// with nothing left to make it look wrong. The join puts the scope in the
+    /// query, and this is the test that goes red if it is ever taken back out.
+    #[test]
+    fn test_statement_lines_are_filtered_by_scope_and_not_by_caller_ordering() {
+        let (_dir, store) = store();
+        store.create_partner(new_partner("acme")).unwrap();
+        store.create_partner(new_partner("beta")).unwrap();
+
+        let acme_id = store
+            .write_statement(&a_draft("acme", "2026-09-25"))
+            .expect("acme's statement is written")
+            .statement()
+            .id;
+        let beta_id = store
+            .write_statement(&a_draft("beta", "2026-09-25"))
+            .expect("beta's statement is written")
+            .statement()
+            .id;
+        assert_ne!(acme_id, beta_id, "the two fixtures must be distinct rows");
+
+        // Asked directly, with no statement lookup in front of it at all.
+        let foreign = store
+            .statement_lines(beta_id, &Scope::One("acme".to_string()))
+            .expect("the read is answered");
+        assert!(
+            foreign.is_empty(),
+            "another consumer's lines must not come back, and this asks for them by \
+             id with nothing else having authorised it: {foreign:?}"
+        );
+
+        // Their own lines, and a scope that names them, still work — the join is
+        // a filter, not a way of dropping rows a legitimate caller wanted.
+        assert_eq!(
+            store
+                .statement_lines(acme_id, &Scope::One("acme".to_string()))
+                .expect("the read is answered")
+                .len(),
+            1,
+            "a partner reads their own line"
+        );
+        assert_eq!(
+            store
+                .statement_lines(acme_id, &Scope::All)
+                .expect("the read is answered")
+                .len(),
+            1,
+            "a manager reads any line"
+        );
+        assert_eq!(
+            store
+                .statement_lines(beta_id, &Scope::List(vec!["acme".into(), "beta".into()]))
+                .expect("the read is answered")
+                .len(),
+            1,
+            "a manager list that includes the owner still reads it"
         );
     }
 }

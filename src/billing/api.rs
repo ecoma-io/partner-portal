@@ -381,7 +381,7 @@ async fn get_statement(
             return Ok::<_, crate::billing::store::BillingError>(None);
         };
         let lines: Vec<StatementLineView> = store
-            .statement_lines(id)?
+            .statement_lines(id, &scope)?
             .iter()
             .map(StatementLineView::from_row)
             .collect();
@@ -490,9 +490,21 @@ pub(crate) fn statuses_in_scope(
     // One read for every partner's overdue rows, grouped here rather than queried
     // per partner: the number of partners is small and grows slowly, and a query
     // per partner is a query per partner.
+    //
+    // ...but only *that* read is allowed to be wide. A partner's own status asks
+    // this for one consumer, and the whole point of `Scope::One` is that the
+    // credential's id is the only one that reaches the database — passing `None`
+    // here would read every partner's bill ids, dates, due dates and amounts and
+    // discard them, which is a claim this function could not honestly make in a
+    // comment. A manager's `List`/`All` still reads the wide set it is entitled
+    // to and narrows in memory.
+    let overdue_for: Option<&str> = match scope {
+        Scope::One(id) => Some(id.as_str()),
+        _ => None,
+    };
     let mut overdue: std::collections::HashMap<String, Vec<crate::billing::status::OverdueRow>> =
         std::collections::HashMap::new();
-    for statement in store.overdue_statements(None)? {
+    for statement in store.overdue_statements(overdue_for)? {
         overdue
             .entry(statement.consumer_id.clone())
             .or_default()

@@ -116,7 +116,7 @@ async fn get_statement(
             return Ok::<_, BillingError>(None);
         };
         let lines: Vec<StatementLineView> = store
-            .statement_lines(id)?
+            .statement_lines(id, &Scope::All)?
             .iter()
             .map(StatementLineView::from_row)
             .collect();

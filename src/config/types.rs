@@ -349,12 +349,17 @@ impl std::fmt::Debug for ManagerConfig {
 impl Config {
     /// Match a presented Bearer token against the manager password.
     ///
-    /// Exact string equality, like a key value. Returns the manager config so a
-    /// caller can tell a manager credential from a key.
+    /// Compared without an early exit, like a key value. `==` on a `String`
+    /// stops at the first differing byte, and this is the one credential in the
+    /// tree that is not hashed first — partner keys are HMAC'd and then looked
+    /// up, so a wrong guess costs a map probe rather than a comparison — which
+    /// makes a constant-time compare here the difference between "one password"
+    /// and "one password, compared one byte at a time".
     pub fn find_manager(&self, token: &str) -> Option<&ManagerConfig> {
-        self.manager
-            .as_ref()
-            .filter(|m| !m.password.is_empty() && m.password == token)
+        self.manager.as_ref().filter(|m| {
+            !m.password.is_empty()
+                && crate::crypto::constant_time_eq(m.password.as_bytes(), token.as_bytes())
+        })
     }
 }
 
