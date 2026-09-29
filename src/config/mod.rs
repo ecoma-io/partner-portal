@@ -6,6 +6,7 @@
 mod hot_reload;
 mod listen;
 mod loader;
+mod smtp;
 mod types;
 
 /// Environment variable that names the configuration file to read.
@@ -19,4 +20,8 @@ pub const CONFIG_ENV: &str = "PARTNER_PORTAL_CONFIG";
 pub use hot_reload::{ConfigSnapshot, HotReloader};
 pub use listen::{DEFAULT_LISTEN_ADDR, LISTEN_ENV, listen_addr, parse_listen_addr};
 pub use loader::{ConfigError, ConfigLoader};
-pub use types::{Config, DatabaseConfig, ServerConfig, UpstreamConfig, redact_credentials};
+pub use smtp::{SMTP_PASSWORD_ENV, SMTP_USERNAME_ENV, SmtpCredentials, credentials_from_env};
+pub use types::{
+    BillingConfig, Config, DatabaseConfig, EmailConfig, ServerConfig, UpstreamConfig,
+    redact_credentials,
+};

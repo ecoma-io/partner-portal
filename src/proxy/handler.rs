@@ -136,6 +136,33 @@ pub async fn handle_proxy(
         );
     };
 
+    // Suspension, before anything is metered and before the upstream is
+    // contacted. A partner whose invoice is past its due date has no service at
+    // all — including `/v1/models`, which is why this sits above the unmetered
+    // short circuit: answering discovery for a suspended partner would make the
+    // suspension look partial.
+    //
+    // The status is a property of the credential's partner, resolved from the
+    // in-memory snapshot, so this is a field read and not a query. It is
+    // *derived* rather than stored (see `crate::billing::status`): it is
+    // suspended because a complete unpaid statement is past its due date, which
+    // means marking that statement paid resumes the partner on the next refresh
+    // without anything having to remember to clear a flag.
+    //
+    // Nothing is written to the ledger on this path. The request was never
+    // accepted — no upstream call, no tokens, no usage — and a row for it would
+    // be an unpriced, unmeasurable entry on the statement that caused the
+    // refusal.
+    if let Some(message) = consumer.service_status().suspension_message() {
+        tracing::warn!(
+            request_id = %request_id,
+            consumer_id = consumer.consumer_id(),
+            status = %consumer.service_status(),
+            "Refusing request: partner service is suspended"
+        );
+        return billing_suspended_error(&request_id, message);
+    }
+
     // `/v1/models` is discovery, not inference. It is authenticated and proxied,
     // but deliberately not metered: it consumes no tokens, and recording it
     // would add noise with zero usage to every usage view and rollup.
@@ -158,14 +185,16 @@ pub async fn handle_proxy(
         None => "unknown".to_string(),
     };
 
-    // Per-key model allow-list (ADR 0012). Strict: a key whose list omits the
-    // requested model — or that has no list at all — is refused before metering,
-    // so a disallowed model never reaches the upstream and never mints a ledger
-    // row. `/v1/models` exits above; only inference endpoints can reach here,
-    // and an empty body degrades to "unknown", which no list ever contains.
-    if !consumer.allowed_models().iter().any(|m| m == &model) {
+    // The partner's configured models (ADR 0012 as amended by ADR 0015). One
+    // lookup answers both questions — may this partner call this model, and what
+    // does it cost — because the answer comes from the same map. A model absent
+    // from it is refused before metering, so a disallowed model never reaches
+    // the upstream and never mints a ledger row. `/v1/models` exits above; only
+    // inference endpoints reach here, and an empty body degrades to "unknown",
+    // which no partner has configured.
+    let Some(prices) = consumer.pricing_for(&model) else {
         return model_not_allowed_error(&request_id, &model);
-    }
+    };
 
     let wants_stream = request_value
         .as_ref()
@@ -173,13 +202,18 @@ pub async fn handle_proxy(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // The prices are attached *here*, at accept, and travel to the ledger row
+    // with the request. A price an operator changes tomorrow must not reprice a
+    // request that ran today, so the statement reads the price off the row
+    // rather than resolving it at statement time.
     let record = RequestRecord::new(
         request_id.clone(),
         consumer.consumer_id().to_string(),
         model,
         endpoint,
         wants_stream,
-    );
+    )
+    .with_pricing(prices);
 
     // Durable accept, before the upstream is contacted. A request we cannot
     // account for is not served.
@@ -475,7 +509,7 @@ async fn proxy_unmetered(
                     "upstream_error",
                 );
             }
-            let body = filter_models_response(&bytes, consumer.allowed_models());
+            let body = filter_models_response(&bytes, &consumer.allowed_models());
 
             let builder = ProxyClient::forward_response_headers(
                 Response::builder().status(status),
@@ -1057,6 +1091,40 @@ pub fn error_response(
         .unwrap_or_else(|_| Response::new(AxumBody::empty()))
 }
 
+/// Refuse a request from a partner whose service is suspended.
+///
+/// `403`, not `402` and not `401`. The credential is valid and the partner is
+/// known — this is not an authentication failure, and a client that treats a
+/// `401` as "refresh my key" would retry forever against a bill. `permission_error`
+/// with `code: "billing_suspended"` is the machine-readable half; the message is
+/// the single string [`ServiceStatus::suspension_message`] produces, so the
+/// refusal says the same thing wherever it is logged or rendered.
+///
+/// The message deliberately names the cause and not the remedy. The remedy is a
+/// manager marking a statement paid, and a client-side "pay here" link would be
+/// an instruction this API cannot honour.
+pub fn billing_suspended_error(request_id: &str, message: &str) -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "permission_error",
+            "code": "billing_suspended",
+        }
+    });
+
+    let json = serde_json::to_string(&body).unwrap_or_else(|_| r#"{"error":{}}"#.to_string());
+
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-request-id", request_id)
+        // A suspension lifts the moment a payment is recorded, and a cache
+        // holding this response would outlive the reason for it.
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(AxumBody::from(json))
+        .unwrap_or_else(|_| Response::new(AxumBody::empty()))
+}
+
 /// Refuse a model a key is not allowed to call, before anything is metered.
 ///
 /// OpenAI-compatible: "The model 'x' does not exist" is the signal clients
@@ -1283,6 +1351,59 @@ mod tests {
             status, "completed",
             "the guard must not overwrite a terminal state"
         );
+    }
+
+    /// The suspension refusal, as a client sees it.
+    ///
+    /// The status and the `code` are what a client branches on, and both are
+    /// load-bearing: `403` keeps a suspended partner from being told to re-key
+    /// (which is what a `401` means and would loop forever), and
+    /// `billing_suspended` is the code an operator greps for. The message is the
+    /// same string the status produces, so the refusal a partner sees and the
+    /// suspension an operator reads cannot diverge.
+    #[tokio::test]
+    async fn test_a_suspended_partner_is_refused_with_a_billing_code() {
+        let status = crate::billing::status::status_for(
+            "invoice",
+            time::macros::datetime!(2026-09-28 12:00 UTC),
+            &[crate::billing::status::OverdueRow {
+                billing_mode: "invoice".into(),
+                id: 4,
+                billing_date: "2026-09-27".into(),
+                due_at: "2026-09-28T00:00:00.000000000Z".into(),
+                total_amount_micro_usd: 1_250_000,
+                incomplete_usage_count: 0,
+            }],
+        );
+        let message = status.suspension_message().expect("suspended");
+
+        let response = billing_suspended_error("req-1", message);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "a cached 403 would outlive the payment that lifts it"
+        );
+
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.headers.get("x-request-id").unwrap(), "req-1");
+        let rendered =
+            String::from_utf8_lossy(&axum::body::to_bytes(body, 64 * 1024).await.unwrap())
+                .into_owned();
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(parsed["error"]["code"], "billing_suspended");
+        assert_eq!(parsed["error"]["type"], "permission_error");
+        assert_eq!(
+            parsed["error"]["message"],
+            "Service is suspended because an invoice is overdue"
+        );
+        // The bill behind the suspension is deliberately not in the body: the
+        // partner is told their service stopped, not handed a statement id to
+        // reconcile against. An operator reads that from the admin API.
+        assert!(!rendered.contains("2026-09-27"), "{rendered}");
     }
 
     #[test]

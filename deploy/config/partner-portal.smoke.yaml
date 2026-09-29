@@ -33,6 +33,22 @@ manager:
   # list through the API instead of editing this file (docs/adr/0014).
   password: "smoke-manager"
 
+# The smoke configuration states the billing block rather than inheriting it,
+# for two reasons the run depends on. `timezone_offset_minutes: 0` is what makes
+# the billing day the UTC day the smoke test can compute for itself, and
+# `email.enabled: false` keeps the run from needing a relay it does not start —
+# the statements are still issued, which is the part being proved
+# (docs/adr/0015; the field reference is config.example.yaml).
+billing:
+  timezone_offset_minutes: 0
+  close_delay_minutes: 5
+  scheduler_interval_secs: 30
+  email:
+    enabled: false
+    smtp_host: ""
+    smtp_port: 587
+    from_address: ""
+
 database:
   path: "/var/lib/partner-portal/partner-portal.db"
   retention_days: 60

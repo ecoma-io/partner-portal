@@ -31,6 +31,24 @@ tower-http = { version = "0.6", features = ["cors", "limit", "trace", "request-i
 # or multi-provider doors (the ADR still holds).
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "webpki-roots", "ring"], optional = true }
 
+# TLS for SMTP STARTTLS, under the same feature as the connector above.
+#
+# Statement email needs it for one reason: the relay credential. STARTTLS is how
+# a submission relay offers an encrypted channel on port 587, and a password sent
+# down a cleartext socket is a credential disclosed — the same thing this product
+# refuses to put in a log line or in the database. Where the feature is off the
+# worker still sends anonymous mail to a relay that needs no credential (a
+# sidecar on the same host is the usual shape), and refuses to authenticate.
+#
+# Declared separately rather than reached for through `hyper-rustls` because a
+# transitive dependency is not a dependency: consuming it directly without
+# naming it is how a version bump of the connector silently changes the TLS
+# stack under the mailer. `ring` for the same reason `hyper-rustls` chose it —
+# no OpenSSL at build or run time — and `webpki-roots` so a minimal container
+# needs no CA store on disk.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -101,4 +119,9 @@ name = "ledger_write"
 harness = false
 
 [features]
-hyper-rustls = ["dep:hyper-rustls"]
+# One feature for "this build can speak TLS", which is two things now: the
+# upstream connector and SMTP STARTTLS. Both are the same decision — a published
+# artifact is expected to reach `https://` upstreams and a submission relay, and
+# a local debug build is not — and splitting it in two would produce a binary
+# that can do one and not the other with no way to name that state.
+hyper-rustls = ["dep:hyper-rustls", "dep:rustls", "dep:webpki-roots"]

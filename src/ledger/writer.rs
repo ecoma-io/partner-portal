@@ -648,8 +648,9 @@ fn insert_accept(
             request_id, created_at, consumer_id, model, endpoint, streaming,
             http_status, request_status, instance_id, input_tokens, output_tokens,
             cached_tokens, ttft_ms, duration_ms, usage_status, error_message,
-            error_body
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', ?7, NULL, NULL, NULL, NULL, 0, 'unavailable', NULL, NULL)
+            error_body, input_price_snapshot, cached_input_price_snapshot,
+            output_price_snapshot
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, 'in_flight', ?7, NULL, NULL, NULL, NULL, 0, 'unavailable', NULL, NULL, ?8, ?9, ?10)
         ON CONFLICT(request_id) DO NOTHING
         "#,
         rusqlite::params![
@@ -660,6 +661,14 @@ fn insert_accept(
             record.endpoint.as_str(),
             record.streaming as i32,
             instance_id,
+            // Written here, at accept, because this is the only moment the
+            // price is the one the partner agreed to. A statement is built from
+            // these columns months later, after the operator may have changed
+            // the price twice, and repricing settled usage is not a thing this
+            // product may do.
+            record.pricing.map(|p| p.as_tuple().0),
+            record.pricing.map(|p| p.as_tuple().1),
+            record.pricing.map(|p| p.as_tuple().2),
         ],
     )?;
     Ok(())
@@ -728,7 +737,17 @@ fn finalize_record(
                     duration_ms = ?9,
                     usage_status = ?10,
                     error_message = ?11,
-                    error_body = ?12
+                    error_body = ?12,
+                    -- `COALESCE`, not a plain assignment. The snapshot is an
+                    -- accept-time fact that nothing afterwards may revise, and a
+                    -- finalize that carries no price has nothing to say about
+                    -- it — overwriting a stored price with `NULL` would turn a
+                    -- priced request into an unpriced one and drop it out of its
+                    -- statement. The accept already wrote the value this row is
+                    -- billed against.
+                    input_price_snapshot = COALESCE(?13, input_price_snapshot),
+                    cached_input_price_snapshot = COALESCE(?14, cached_input_price_snapshot),
+                    output_price_snapshot = COALESCE(?15, output_price_snapshot)
                 WHERE request_id = ?1
                 "#,
                 rusqlite::params![
@@ -744,6 +763,9 @@ fn finalize_record(
                     record.usage_status().as_str(),
                     record.error_message,
                     record.error_body,
+                    record.pricing.map(|p| p.as_tuple().0),
+                    record.pricing.map(|p| p.as_tuple().1),
+                    record.pricing.map(|p| p.as_tuple().2),
                 ],
             )?;
 
@@ -760,8 +782,10 @@ fn finalize_record(
                     request_id, created_at, consumer_id, model, endpoint, streaming,
                     http_status, request_status, instance_id, input_tokens,
                     output_tokens, cached_tokens, ttft_ms, duration_ms,
-                    usage_status, error_message, error_body
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                    usage_status, error_message, error_body,
+                    input_price_snapshot, cached_input_price_snapshot,
+                    output_price_snapshot
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
                 "#,
                 rusqlite::params![
                     record.request_id,
@@ -781,6 +805,13 @@ fn finalize_record(
                     record.usage_status().as_str(),
                     record.error_message,
                     record.error_body,
+                    // There is no accept row here, so this record is the only
+                    // chance to record the price the request ran at. A `NULL`
+                    // means the request was never priced, which its statement
+                    // counts as unmeasurable.
+                    record.pricing.map(|p| p.as_tuple().0),
+                    record.pricing.map(|p| p.as_tuple().1),
+                    record.pricing.map(|p| p.as_tuple().2),
                 ],
             )?;
         }
@@ -831,8 +862,44 @@ fn is_busy(e: &rusqlite::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::pricing::{PricePerMillion, PricingSnapshot};
     use crate::ledger::{Endpoint, Usage};
     use tempfile::TempDir;
+
+    /// A partner's price list at the size the billing tests use: the numbers
+    /// `keygen` parses out of `--model gpt-4o:0.095:0.0475:0.475`.
+    fn prices() -> PricingSnapshot {
+        PricingSnapshot::new(
+            PricePerMillion::new(95_000),
+            PricePerMillion::new(47_500),
+            PricePerMillion::new(475_000),
+        )
+    }
+
+    /// The three snapshot columns, as stored.
+    fn stored_prices(
+        conn: &Connection,
+        request_id: &str,
+    ) -> (Option<i64>, Option<i64>, Option<i64>) {
+        conn.query_row(
+            "SELECT input_price_snapshot, cached_input_price_snapshot, output_price_snapshot
+             FROM usage_records WHERE request_id = ?1",
+            [request_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap()
+    }
+
+    fn record_with_prices(request_id: &str) -> RequestRecord {
+        RequestRecord::new(
+            request_id.into(),
+            "c".into(),
+            "gpt-4o".into(),
+            Endpoint::ChatCompletions,
+            false,
+        )
+        .with_pricing(prices())
+    }
 
     fn test_writer(path: &std::path::Path, batch_size: usize, timeout_ms: u64) -> LedgerWriter {
         let conn = Connection::open(path).unwrap();
@@ -1012,6 +1079,129 @@ mod tests {
             .unwrap();
         assert_eq!(input, None, "unavailable usage must persist as NULL, not 0");
         assert_eq!(usage_status, "unavailable");
+    }
+
+    /// The price a request ran at is decided before the upstream is contacted,
+    /// so it must be on the row from the accept onwards. A statement built from
+    /// this table months later has no other source for it.
+    #[tokio::test]
+    async fn test_the_price_snapshot_is_durable_from_accept_through_finalize() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = test_writer(&path, 1, 1);
+
+        let mut record = record_with_prices("req-priced");
+        writer.accept(record.clone()).await.unwrap();
+        assert_eq!(
+            stored_prices(&open(&path), "req-priced"),
+            (Some(95_000), Some(47_500), Some(475_000)),
+            "the accept must carry the price the request is billed against"
+        );
+
+        record.complete(200, Usage::new(Some(100), Some(50), Some(20)), 10);
+        writer.finalize(record).await.unwrap();
+        assert_eq!(
+            stored_prices(&open(&path), "req-priced"),
+            (Some(95_000), Some(47_500), Some(475_000)),
+            "finalizing must not disturb the accept-time snapshot"
+        );
+    }
+
+    /// The quiet failure this pins: a plain assignment in the UPDATE would let
+    /// a finalize that carries no prices blank the ones the accept wrote, and
+    /// the request would drop out of its statement as unmeasurable — losing
+    /// money with no error anywhere.
+    #[tokio::test]
+    async fn test_a_finalize_without_a_price_does_not_erase_the_accept_time_price() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = test_writer(&path, 1, 1);
+
+        writer
+            .accept(record_with_prices("req-keeps"))
+            .await
+            .unwrap();
+
+        // A finalize built from scratch: same request, no snapshot attached.
+        // The recovery and maintenance paths construct records this way.
+        let mut bare = RequestRecord::new(
+            "req-keeps".into(),
+            "c".into(),
+            "gpt-4o".into(),
+            Endpoint::ChatCompletions,
+            false,
+        );
+        bare.complete(200, Usage::new(Some(100), Some(50), None), 10);
+        writer.finalize(bare).await.unwrap();
+
+        assert_eq!(
+            stored_prices(&open(&path), "req-keeps"),
+            (Some(95_000), Some(47_500), Some(475_000)),
+            "a finalize with nothing to say about price must leave the stored \
+             snapshot alone, not overwrite it with NULL"
+        );
+    }
+
+    /// The fast path has no accept row to inherit from, so the finalize's own
+    /// snapshot is the only chance to record the price.
+    #[tokio::test]
+    async fn test_the_single_batch_fast_path_still_records_the_price() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = test_writer(&path, 100, 200);
+
+        let mut record = record_with_prices("req-fast-price");
+        let w = &writer;
+        let accept_fut = w.accept(record.clone());
+        let finalize_fut = async {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            record.complete(200, Usage::new(Some(3), Some(4), None), 42);
+            writer.finalize(record).await
+        };
+        let (a, f) = tokio::join!(accept_fut, finalize_fut);
+        a.unwrap();
+        f.unwrap();
+
+        let conn = open(&path);
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM usage_records WHERE request_id='req-fast-price'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "the collapsed path must still write exactly one row"
+        );
+        assert_eq!(
+            stored_prices(&conn, "req-fast-price"),
+            (Some(95_000), Some(47_500), Some(475_000))
+        );
+    }
+
+    /// A request that was never priced is not a request with a price of zero.
+    #[tokio::test]
+    async fn test_an_unpriced_request_persists_null_prices_not_zero() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let writer = test_writer(&path, 1, 1);
+
+        let mut record = RequestRecord::new(
+            "req-unpriced".into(),
+            "c".into(),
+            "gpt-4o".into(),
+            Endpoint::ChatCompletions,
+            false,
+        );
+        record.complete(200, Usage::new(Some(1), Some(1), None), 5);
+        writer.finalize(record).await.unwrap();
+
+        assert_eq!(
+            stored_prices(&open(&path), "req-unpriced"),
+            (None, None, None),
+            "no price is NULL, never a price of zero"
+        );
     }
 
     #[tokio::test]

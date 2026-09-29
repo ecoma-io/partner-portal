@@ -414,6 +414,20 @@ mod tests {
     use std::time::Duration;
     use tempfile::TempDir;
 
+    /// What a recovered row carries: the terminal status, the three token
+    /// counts, and the three price snapshots as the row holds them.
+    ///
+    /// A named tuple rather than six bindings out of one `query_row`, so a test
+    /// that reads this row says which facts it is checking instead of spelling
+    /// their types.
+    type RecoveredRow = (
+        String,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        (Option<i64>, Option<i64>, Option<i64>),
+    );
+
     fn setup(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();
         crate::ledger::configure_sqlite(&conn).unwrap();
@@ -503,6 +517,70 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(failures, 1);
         assert_eq!(tokens, 0);
+    }
+
+    /// A crash resolves a request's *outcome*, never its price.
+    ///
+    /// The two are decided at different moments: the price is fixed at accept,
+    /// when the partner's price list is read, and the outcome is whatever
+    /// happened afterwards. Recovery's UPDATE therefore must not touch the
+    /// snapshot columns — and if someone later widens that statement to
+    /// "clear the columns a dead process may have half-written", a stranded
+    /// request would silently fall out of the statement that bills its
+    /// partner. Recovered rows stay unbillable because their tokens are NULL,
+    /// which is the honest reason, not because their price was erased.
+    #[test]
+    fn test_recovery_keeps_the_price_snapshot_and_invents_no_usage() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("t.db");
+        let mut conn = setup(&path);
+
+        conn.execute(
+            "INSERT INTO usage_records (
+                request_id, created_at, consumer_id, model, endpoint, streaming,
+                request_status, duration_ms, usage_status,
+                input_price_snapshot, cached_input_price_snapshot, output_price_snapshot
+             ) VALUES ('req-priced', '2026-09-24T07:12:33.000000000Z', 'c1', 'gpt-4o',
+                       'chat_completions', 1, 'in_flight', 0, 'unavailable',
+                       95000, 47500, 475000)",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(
+            recover_in_flight(&mut conn, &ctx(&path)).unwrap().recovered,
+            1
+        );
+
+        let (status, input, output, cached, prices): RecoveredRow = conn
+            .query_row(
+                "SELECT request_status, input_tokens, output_tokens, cached_tokens,
+                        input_price_snapshot, cached_input_price_snapshot, output_price_snapshot
+                 FROM usage_records WHERE request_id='req-priced'",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        (r.get(4)?, r.get(5)?, r.get(6)?),
+                    ))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(status, "interrupted");
+        assert_eq!(
+            (input, output, cached),
+            (None, None, None),
+            "recovery must not invent the tokens a dead process never reported"
+        );
+        assert_eq!(
+            prices,
+            (Some(95_000), Some(47_500), Some(475_000)),
+            "the accept-time price survives the crash that lost the outcome"
+        );
     }
 
     #[test]

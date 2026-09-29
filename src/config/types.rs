@@ -40,9 +40,144 @@ pub struct Config {
     /// and docs/adr/0013, which superseded the allow-list it once carried.
     #[serde(default)]
     pub manager: Option<ManagerConfig>,
+
+    /// Daily billing: which calendar days close, and whether statements are
+    /// emailed.
+    #[serde(default)]
+    pub billing: BillingConfig,
+}
+
+/// When a billing day closes and how a statement reaches the partner.
+///
+/// # No credentials in here
+///
+/// There is deliberately no `smtp_username` or `smtp_password` field. An SMTP
+/// credential in this file is a password in a file that gets committed, copied
+/// into a ticket and echoed by `config.example.yaml` — so it comes from the
+/// environment instead ([`crate::config::smtp`]), where a deployment already
+/// puts secrets and where nothing reads it back out into a log.
+///
+/// `enabled` is separate from `smtp_host` on purpose: a deployment can hold a
+/// complete SMTP configuration and still not send, which is what a staging
+/// instance pointed at production's database wants. And a partner with no
+/// address on file needs no configuration change at all — the statement is still
+/// issued, it is just not sent, which is the honest reading of "we do not know
+/// where to send it".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BillingConfig {
+    /// The billing calendar's distance from UTC, in minutes.
+    ///
+    /// The day boundary is a business decision, and a partner reading
+    /// "2026-09-27" means their own 27th. Stored timestamps stay UTC; the offset
+    /// is applied when a day is *named* and when the cutoff is computed, and
+    /// nowhere else. A fixed offset rather than a zone name, so a tz database
+    /// update cannot move a statement by an hour — see
+    /// [`crate::billing::period`].
+    #[serde(default)]
+    pub timezone_offset_minutes: i32,
+
+    /// How long after a day ends it may be closed.
+    ///
+    /// A request accepted at 23:59:59 is metered before the upstream is
+    /// contacted and finalised after it, so closing a day at the instant it ends
+    /// would drop the last requests of the day — a systematic under-bill at the
+    /// boundary a customer can see. This is the window in which those rows land.
+    #[serde(default = "default_close_delay_minutes")]
+    pub close_delay_minutes: i64,
+
+    /// How often the scheduler looks for days to close, in seconds.
+    ///
+    /// The work is idempotent and a closed day is never reopened, so this trades
+    /// "how late can a statement be" against "how often does an idle instance
+    /// check". It is not the deadline: `close_delay_minutes` decides *when* a day
+    /// may close, and this decides how promptly the process notices.
+    #[serde(default = "default_scheduler_interval_secs")]
+    pub scheduler_interval_secs: u64,
+
+    #[serde(default)]
+    pub email: EmailConfig,
+}
+
+impl Default for BillingConfig {
+    fn default() -> Self {
+        Self {
+            timezone_offset_minutes: 0,
+            close_delay_minutes: default_close_delay_minutes(),
+            scheduler_interval_secs: default_scheduler_interval_secs(),
+            email: EmailConfig::default(),
+        }
+    }
+}
+
+fn default_close_delay_minutes() -> i64 {
+    5
+}
+fn default_scheduler_interval_secs() -> u64 {
+    30
+}
+
+/// Where a statement email goes out from.
+///
+/// `Debug` is derived deliberately: nothing here is a secret, and the whole
+/// point of keeping the credential out of this type is that a `{:?}` of a config
+/// snapshot can be logged without care.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EmailConfig {
+    /// Whether statements are sent at all.
+    ///
+    /// Off by default. A deployment that has not configured a mail relay must
+    /// not discover it by having statements bounce, and email is a courtesy on
+    /// top of the statement — the statement is the record and exists either way.
+    pub enabled: bool,
+
+    /// The relay to hand the message to.
+    pub smtp_host: String,
+
+    /// The relay's submission port. 587 — the standard submission port, with
+    /// STARTTLS — rather than 25, which is for relay-to-relay traffic and is
+    /// blocked by most networks.
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+
+    /// The envelope and header `From`.
+    ///
+    /// Deliberately not defaulted to anything: a statement from an address
+    /// nobody owns is worse than one that failed to send, because it looks
+    /// delivered.
+    pub from_address: String,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: default_smtp_port(),
+            from_address: String::new(),
+        }
+    }
+}
+
+fn default_smtp_port() -> u16 {
+    587
 }
 
 impl Config {
+    /// Whether statements can actually be sent.
+    ///
+    /// All four conditions, in one place, because they are checked from three
+    /// (the worker, the admin API's view, and the start-up log line) and they
+    /// would otherwise drift. A relay that is configured but switched off, or a
+    /// relay with no `From`, is not a working mail path, and the product's answer
+    /// to "will this partner be emailed" has to be the same everywhere.
+    pub fn sends_statement_email(&self) -> bool {
+        self.billing.email.enabled
+            && !self.billing.email.smtp_host.trim().is_empty()
+            && !self.billing.email.from_address.trim().is_empty()
+    }
+
     /// Compute a hash of the configuration for change detection
     ///
     /// Every field participates, through serde — the hash covers exactly what
@@ -400,6 +535,7 @@ mod tests {
             },
             database: DatabaseConfig::default(),
             manager: None,
+            billing: BillingConfig::default(),
         };
 
         let hash1 = config.hash();
@@ -587,6 +723,7 @@ upstream:
             manager: Some(ManagerConfig {
                 password: String::new(),
             }),
+            billing: BillingConfig::default(),
         };
         assert!(
             with_empty_password.find_manager("").is_none(),

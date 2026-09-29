@@ -4,6 +4,8 @@
 
 mod context;
 mod middleware;
+mod scope;
 
 pub use context::{ConsumerContext, ConsumerIdentity, ManagerRole};
 pub use middleware::{AuthError, Authenticated};
+pub use scope::{Scope, resolve_scope, scope_clause};

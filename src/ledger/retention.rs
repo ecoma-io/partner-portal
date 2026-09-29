@@ -345,6 +345,92 @@ mod tests {
             .unwrap()
     }
 
+    /// A partner with a settled statement, at an age far past any retention
+    /// horizon, and the sweep run over it.
+    fn statement_fixture(conn: &Arc<Mutex<Connection>>) -> i64 {
+        let guard = conn.lock();
+        guard
+            .execute(
+                "INSERT INTO partners (consumer_id, name, billing_mode,
+                                       created_at, updated_at)
+                 VALUES ('acme', 'Acme', 'invoice', ?1, ?1)",
+                [timefmt::format_ts(timefmt::now())],
+            )
+            .unwrap();
+        guard
+            .execute(
+                "INSERT INTO daily_statements (
+                    consumer_id, billing_date, billing_mode, period_start,
+                    period_end, billing_cutoff_at, total_amount_micro_usd,
+                    created_at, updated_at
+                 ) VALUES ('acme', '2026-01-01', 'invoice', ?1, ?2, ?2, 95000, ?3, ?3)",
+                rusqlite::params![
+                    "2026-01-01T00:00:00.000000000Z",
+                    "2026-01-02T00:00:00.000000000Z",
+                    timefmt::format_ts(timefmt::now()),
+                ],
+            )
+            .unwrap();
+        let statement_id = guard.last_insert_rowid();
+        guard
+            .execute(
+                "INSERT INTO statement_lines (
+                    statement_id, model, input_price_micro_usd_per_million,
+                    cached_input_price_micro_usd_per_million,
+                    output_price_micro_usd_per_million, request_count,
+                    input_tokens, cached_input_tokens, uncached_input_tokens,
+                    output_tokens, input_cost_micro_usd, cached_input_cost_micro_usd,
+                    output_cost_micro_usd, total_cost_micro_usd
+                 ) VALUES (?1, 'gpt-4o', 95000, 47500, 475000, 1, 1000000, 0, 1000000,
+                           0, 95000, 0, 0, 95000)",
+                [statement_id],
+            )
+            .unwrap();
+        statement_id
+    }
+
+    /// The sweep prunes usage, never money.
+    ///
+    /// A statement outlives the rows it summarises on purpose — that is the
+    /// point of snapshotting prices onto the lines — so a retention change that
+    /// added the financial tables to the delete list would destroy settled
+    /// history with no error and no test in this file would notice. This is the
+    /// test that notices.
+    #[test]
+    fn test_a_sweep_never_deletes_a_statement_or_its_lines() {
+        let dir = TempDir::new().unwrap();
+        let conn = setup(&dir.path().join("t.db"));
+        let statement_id = statement_fixture(&conn);
+
+        // Usage old enough to be pruned several times over, so the sweep is
+        // doing real work alongside the rows that must survive.
+        insert(&conn, "ancient", 900);
+        insert(&conn, "old", 90);
+
+        let stats = run_retention(&conn, 60, DEFAULT_BATCH_SIZE, DEFAULT_MAX_BATCHES).unwrap();
+        assert_eq!(stats.raw_deleted, 2, "the usage is genuinely pruned");
+        assert_eq!(count(&conn, "daily_statements"), 1);
+        assert_eq!(count(&conn, "statement_lines"), 1);
+
+        let (amount, line_total): (i64, i64) = {
+            let guard = conn.lock();
+            guard
+                .query_row(
+                    "SELECT s.total_amount_micro_usd, l.total_cost_micro_usd
+                     FROM daily_statements s JOIN statement_lines l ON l.statement_id = s.id
+                     WHERE s.id = ?1",
+                    [statement_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            amount, 95_000,
+            "a settled amount is not a function of retention"
+        );
+        assert_eq!(line_total, 95_000);
+    }
+
     #[test]
     fn test_prunes_only_rows_past_retention() {
         let dir = TempDir::new().unwrap();

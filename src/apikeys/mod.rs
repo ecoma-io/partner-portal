@@ -35,7 +35,7 @@ use std::io::Read;
 use crate::crypto::{base64url_encode, hmac_sha256};
 
 pub use refresher::{ApiKeyRefresher, StartupError};
-pub use store::{ApiKeyAuth, ApiKeyError, ApiKeyRow, ApiKeySnapshot, ApiKeyStore};
+pub use store::{ApiKeyError, ApiKeyRow, ApiKeyStore, KeyStatus};
 
 /// Environment variable holding the secret that keys every API-key hash.
 pub const SECRET_ENV: &str = "PARTNER_PORTAL_API_KEY_SECRET";

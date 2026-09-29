@@ -19,7 +19,7 @@
 //! same thing the dashboard does. Nothing on the *authentication* path calls
 //! any of these: authentication reads an in-memory [`ApiKeySnapshot`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
@@ -27,6 +27,9 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use time::OffsetDateTime;
 
 use crate::apikeys::{derive_key_hash, generate_plaintext, key_prefix_of};
+use crate::billing::partner::{BillingMode, PartnerRuntimeConfig, PartnerSnapshot};
+use crate::billing::pricing::{PricePerMillion, PricingSnapshot};
+use crate::billing::status::{OverdueRow, ServiceStatus, status_for};
 use crate::ledger::pool::LedgerPool;
 use crate::ledger::timefmt;
 
@@ -41,7 +44,6 @@ pub struct ApiKeyRow {
     pub name: String,
     pub consumer_id: String,
     pub key_prefix: String,
-    pub allowed_models: Vec<String>,
     pub status: KeyStatus,
     pub created_at: String,
     pub updated_at: String,
@@ -66,44 +68,37 @@ impl KeyStatus {
     }
 }
 
-/// What authentication needs, and the only thing it is given.
-#[derive(Debug, Clone)]
-pub struct ApiKeyAuth {
-    pub name: String,
-    pub consumer_id: String,
-    pub allowed_models: Vec<String>,
-}
+// The snapshot type a request authenticates against used to live here, as
+// `ApiKeyAuth` and `ApiKeySnapshot`. It moved to
+// [`crate::billing::partner::PartnerRuntimeConfig`] and
+// [`crate::billing::partner::PartnerSnapshot`] when model capability moved out
+// of `api_keys.allowed_models` and into `partner_models` (ADR 0015): the thing
+// a request resolves is no longer "which key is this" but "which partner is
+// this, what may they call, what does it cost, and are they currently served".
+// Those are one object now, because they are one lookup.
 
-/// An immutable map from key hash to the identity that key carries.
+/// A partner already has a usable key, and the database refused a second one.
 ///
-/// Replaced wholesale, never mutated. A request therefore sees either the whole
-/// previous key set or the whole next one; there is no window in which a
-/// revocation is half-applied and a concurrent request sees neither state.
-#[derive(Debug, Default)]
-pub struct ApiKeySnapshot {
-    by_hash: HashMap<String, ApiKeyAuth>,
+/// The rule is "one partner, one active key" (docs/adr/0015) and it is enforced
+/// by a partial unique index rather than by a check in this module — a
+/// check-then-insert is a race between two instances serving two concurrent
+/// creates, and the thing that must never happen is a partner ending up with
+/// two live credentials. Naming it as its own error is what lets the admin API
+/// answer `409` with an explanation instead of leaking a SQLite constraint
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartnerKeyExists {
+    pub consumer_id: String,
 }
 
-impl ApiKeySnapshot {
-    /// Build a snapshot from the rows a `load_active` returned.
-    pub fn from_rows(rows: Vec<(String, ApiKeyAuth)>) -> Self {
-        Self {
-            by_hash: rows.into_iter().collect(),
-        }
-    }
-
-    /// Number of keys that will authenticate.
-    pub fn len(&self) -> usize {
-        self.by_hash.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
-    }
-
-    /// Resolve a plaintext key to the identity it was issued for.
-    pub fn get(&self, hash: &str) -> Option<&ApiKeyAuth> {
-        self.by_hash.get(hash)
+impl std::fmt::Display for PartnerKeyExists {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "consumer {:?} already has an active api key; rotate it instead of \
+             creating a second one",
+            self.consumer_id
+        )
     }
 }
 
@@ -117,6 +112,8 @@ pub enum ApiKeyError {
     /// The operation needs a key that is still usable, and this one is not —
     /// rotating an already-revoked key, for instance.
     NotActive(i64),
+    /// This consumer already has an active key.
+    AlreadyActive(PartnerKeyExists),
     /// A field was empty or malformed before it reached SQL.
     Invalid(String),
 }
@@ -129,6 +126,11 @@ impl std::fmt::Display for ApiKeyError {
             ApiKeyError::NotActive(id) => {
                 write!(f, "api key {id} is revoked and cannot be changed")
             }
+            // `PartnerKeyExists` carries the whole sentence, including the
+            // remedy: it is rendered on its own in an HTTP body and as the
+            // `Display` of this variant, and prefixing it here produced
+            // "consumer consumer ..." in one of the two.
+            ApiKeyError::AlreadyActive(conflict) => write!(f, "{conflict}"),
             ApiKeyError::Invalid(msg) => write!(f, "invalid api key: {msg}"),
         }
     }
@@ -151,11 +153,38 @@ impl From<rusqlite::Error> for ApiKeyError {
 
 type Result<T> = std::result::Result<T, ApiKeyError>;
 
+/// `SQLITE_CONSTRAINT_UNIQUE`, the extended code behind every `UNIQUE`
+/// violation — including a partial unique index, which reports it as a plain
+/// unique violation rather than as anything index-shaped.
+const SQLITE_CONSTRAINT_UNIQUE: i32 = 2067;
+
+/// Whether a SQLite error is a `UNIQUE` violation.
+fn unique_violation(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(e, _) if e.extended_code == SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
+/// Whether this consumer already has a key that would authenticate.
+///
+/// Read *after* a unique violation, so it is a disambiguation of a failure
+/// that has already happened rather than a guard against one: at this point
+/// the answer cannot change the outcome, only which error is reported.
+fn active_key_exists(conn: &Connection, consumer_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM api_keys WHERE consumer_id = ?1 AND status = 'active' LIMIT 1",
+        [consumer_id],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
 /// The key store: repository plus the snapshot authentication reads.
 pub struct ApiKeyStore {
     pool: Arc<LedgerPool>,
     secret: Arc<Vec<u8>>,
-    snapshot: Arc<RwLock<ApiKeySnapshot>>,
+    snapshot: Arc<RwLock<PartnerSnapshot>>,
 }
 
 impl ApiKeyStore {
@@ -163,17 +192,31 @@ impl ApiKeyStore {
         Self {
             pool,
             secret: Arc::new(secret),
-            snapshot: Arc::new(RwLock::new(ApiKeySnapshot::default())),
+            snapshot: Arc::new(RwLock::new(PartnerSnapshot::default())),
         }
     }
 
     /// The live snapshot, for the authentication extractor.
-    pub fn snapshot(&self) -> Arc<RwLock<ApiKeySnapshot>> {
+    pub fn snapshot(&self) -> Arc<RwLock<PartnerSnapshot>> {
         Arc::clone(&self.snapshot)
     }
 
+    /// The ledger this store writes to.
+    ///
+    /// Shared rather than owned per repository: `partner_models` is written by
+    /// the billing store and read by this one's snapshot, and two handles to
+    /// one pool is what keeps them serialising against each other.
+    pub fn pool(&self) -> &Arc<LedgerPool> {
+        &self.pool
+    }
+
     /// Authenticate a plaintext key. No SQLite, no I/O — a hash and a lookup.
-    pub fn authenticate(&self, plaintext: &str) -> Option<ApiKeyAuth> {
+    ///
+    /// Returns the whole partner configuration, not just an identity: the model
+    /// allow-list, each model's price and the service status all come from this
+    /// one object, so a request cannot be authenticated against one revision of
+    /// the configuration and priced against another.
+    pub fn authenticate(&self, plaintext: &str) -> Option<Arc<PartnerRuntimeConfig>> {
         let hash = derive_key_hash(&self.secret, plaintext);
         self.snapshot.read().get(&hash).cloned()
     }
@@ -192,50 +235,189 @@ impl ApiKeyStore {
     pub fn refresh(&self) -> Result<usize> {
         let rows = self.load_active()?;
         let count = rows.len();
-        *self.snapshot.write() = ApiKeySnapshot::from_rows(rows);
+
+        // Reported as *transitions*, not as states. This runs once a second, so
+        // a line per rebuild saying "this partner is suspended" would be ten
+        // thousand lines a day saying nothing happened; a line saying "this
+        // partner just lost service, for statement 12, $1.25, due then" is the
+        // one an operator acts on. The comparison is by key hash, so a partner
+        // whose key was rotated reads as a new credential rather than a status
+        // change — and a revoked key disappearing is not a resume, which is why
+        // only hashes present in both snapshots are compared.
+        let next = PartnerSnapshot::from_rows(rows);
+        {
+            // Scoped: the write guard below must not be taken while this read
+            // guard is alive, or the refresh deadlocks against itself.
+            let previous = self.snapshot.read();
+            log_service_transitions(&previous, &next);
+        }
+        *self.snapshot.write() = next;
         Ok(count)
     }
 
-    /// Every key that would authenticate right now.
+    /// Every key that would authenticate right now, with the partner it belongs
+    /// to resolved whole.
     ///
-    /// The expiry test lives here rather than on the request path: a key past
-    /// its `expires_at` is simply absent from the set, so authentication is a
-    /// lookup and the clock is read once per refresh, not once per request.
-    fn load_active(&self) -> Result<Vec<(String, ApiKeyAuth)>> {
-        let now = timefmt::format_ts(timefmt::now());
+    /// # Why this is one read transaction
+    ///
+    /// It runs four queries — active keys, partners, configured models, the
+    /// oldest overdue invoice — and the snapshot they produce has to be a
+    /// picture of *one* moment. Without a transaction each statement takes its
+    /// own read snapshot, so a `partner_models` replace committing between the
+    /// keys query and the models query would publish a partner whose model list
+    /// is neither the old one nor the new one. The concurrency this guards is
+    /// not hypothetical: replacing a partner's models is a single write and the
+    /// refresher runs every second.
+    ///
+    /// `BEGIN DEFERRED` on a WAL connection is enough — the read snapshot is
+    /// taken at the first statement and held until commit — and it takes no
+    /// write lock, so it cannot block the metering writer.
+    ///
+    /// # The expiry test lives here
+    ///
+    /// Not on the request path: a key past its `expires_at` is simply absent
+    /// from the set, so authentication is a lookup and the clock is read once
+    /// per refresh, not once per request.
+    fn load_active(&self) -> Result<Vec<(String, Arc<PartnerRuntimeConfig>)>> {
         self.pool
             .read(|conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT key_hash, name, consumer_id, allowed_models \
-                 FROM api_keys \
-                 WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?1)",
+                let tx = conn.unchecked_transaction()?;
+
+                // Model capability *and* pricing for every partner, in one
+                // query. A model absent here is a model the partner cannot
+                // call — there is no second list to consult.
+                let mut models: HashMap<String, BTreeMap<String, PricingSnapshot>> = HashMap::new();
+                {
+                    let mut stmt = tx.prepare(
+                        "SELECT consumer_id, model, input_price_micro_usd_per_million, \
+                         cached_input_price_micro_usd_per_million, \
+                         output_price_micro_usd_per_million \
+                         FROM partner_models",
+                    )?;
+                    let rows = stmt.query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            PricingSnapshot::new(
+                                PricePerMillion::new(row.get(2)?),
+                                PricePerMillion::new(row.get(3)?),
+                                PricePerMillion::new(row.get(4)?),
+                            ),
+                        ))
+                    })?;
+                    for row in rows {
+                        let (consumer_id, model, prices) = row?;
+                        models.entry(consumer_id).or_default().insert(model, prices);
+                    }
+                }
+
+                // The active keys, their partner row, and — for a partner with
+                // one — the oldest *complete, non-zero* unpaid invoice that is
+                // already past its due date. That subquery is the definition of
+                // "what suspends a partner"; `status_for` re-checks the same
+                // three facts defensively, and its comment says which of the two
+                // is authoritative.
+                //
+                // A `LEFT JOIN` on `partners` on purpose. A key whose consumer
+                // has no partner row is anomalous, and the two ways to react are
+                // to stop authenticating it or to let it authenticate with no
+                // models. The second is right: a 401 for a key that exists is a
+                // lie, whereas a partner who may call nothing fails the model
+                // gate, which is both true and visible in the logs.
+                let mut stmt = tx.prepare(
+                    "SELECT k.key_hash, k.name, k.consumer_id, \
+                            COALESCE(p.billing_mode, 'invoice'), \
+                            COALESCE(p.billing_email, ''), \
+                            s.id, s.billing_date, s.due_at, s.total_amount_micro_usd, \
+                            s.incomplete_usage_count \
+                     FROM api_keys k \
+                     LEFT JOIN partners p ON p.consumer_id = k.consumer_id \
+                     LEFT JOIN daily_statements s ON s.id = ( \
+                         SELECT d.id FROM daily_statements d \
+                         WHERE d.consumer_id = k.consumer_id \
+                           AND d.billing_mode = 'invoice' \
+                           AND d.paid_at IS NULL \
+                           AND d.incomplete_usage_count = 0 \
+                           AND d.total_amount_micro_usd > 0 \
+                           AND d.due_at IS NOT NULL \
+                           AND d.due_at <= ?1 \
+                         ORDER BY d.due_at, d.id \
+                         LIMIT 1 \
+                     ) \
+                     WHERE k.status = 'active' \
+                       AND (k.expires_at IS NULL OR k.expires_at > ?1) \
+                     ORDER BY k.consumer_id",
                 )?;
-                let rows = stmt.query_map([&now], |row| {
+                let now = timefmt::now();
+                let now_text = timefmt::format_ts(now);
+                let rows = stmt.query_map([&now_text], |row| {
                     let hash: String = row.get(0)?;
-                    let auth = ApiKeyAuth {
-                        name: row.get(1)?,
-                        consumer_id: row.get(2)?,
-                        allowed_models: decode_models(&row.get::<_, String>(3)?)?,
-                    };
-                    Ok((hash, auth))
+                    let name: String = row.get(1)?;
+                    let consumer_id: String = row.get(2)?;
+                    let mode_text: String = row.get(3)?;
+                    let billing_email: String = row.get(4)?;
+
+                    // The column has a CHECK, so an unreadable mode can only
+                    // mean a row this product did not write. Refusing to parse
+                    // it would take the key out of service over a value nobody
+                    // chose; defaulting to `invoice` with an empty model list
+                    // leaves the partner unable to call anything and cannot
+                    // invent a payment obligation they will be suspended for.
+                    let billing_mode =
+                        BillingMode::parse(&mode_text).unwrap_or(BillingMode::Invoice);
+
+                    let overdue_id: Option<i64> = row.get(5)?;
+                    let overdue = overdue_id
+                        .map(|id| -> rusqlite::Result<OverdueRow> {
+                            Ok(OverdueRow {
+                                billing_mode: BillingMode::Invoice.as_str().to_string(),
+                                id,
+                                billing_date: row.get(6)?,
+                                due_at: row.get(7)?,
+                                total_amount_micro_usd: row.get(8)?,
+                                incomplete_usage_count: row.get(9)?,
+                            })
+                        })
+                        .transpose()?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+
+                    let service_status = status_for(&mode_text, now, &overdue);
+                    let config = PartnerRuntimeConfig::new(
+                        consumer_id.clone(),
+                        name,
+                        billing_mode,
+                        billing_email,
+                        service_status,
+                        models.remove(&consumer_id).unwrap_or_default(),
+                    );
+                    Ok((hash, Arc::new(config)))
                 })?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()
+                let collected = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+                drop(stmt);
+
+                tx.commit()?;
+                Ok(collected)
             })
             .map_err(Into::into)
     }
 
     /// Issue a new key. The returned plaintext is the only copy that exists.
+    ///
+    /// A key carries no model list of its own (ADR 0015). Which models the
+    /// partner may call, and what each costs, is configured once in
+    /// `partner_models` and applies to the partner — not to the credential. A
+    /// key created here for a partner with no configured models authenticates
+    /// and can call nothing, which is the visible and safe state to be in.
     pub fn create(
         &self,
         name: &str,
         consumer_id: &str,
-        allowed_models: Vec<String>,
         expires_at: Option<OffsetDateTime>,
     ) -> Result<(ApiKeyRow, String)> {
         let plaintext = generate_plaintext()
             .map_err(|e| ApiKeyError::Invalid(format!("could not read system entropy: {e}")))?;
-        let row =
-            self.create_with_plaintext(name, consumer_id, allowed_models, expires_at, &plaintext)?;
+        let row = self.create_with_plaintext(name, consumer_id, expires_at, &plaintext)?;
         Ok((row, plaintext))
     }
 
@@ -265,7 +447,6 @@ impl ApiKeyStore {
         &self,
         name: &str,
         consumer_id: &str,
-        allowed_models: Vec<String>,
         expires_at: Option<OffsetDateTime>,
         plaintext: &str,
     ) -> Result<ApiKeyRow> {
@@ -281,15 +462,13 @@ impl ApiKeyStore {
                 "plaintext must not be empty".to_string(),
             ));
         }
-        validate_models(&allowed_models)?;
-
         let hash = derive_key_hash(&self.secret, plaintext);
         let prefix = key_prefix_of(plaintext);
         let now = timefmt::format_ts(timefmt::now());
         let expires_at = expires_at.map(timefmt::format_ts);
 
         let created = self
-            .mutate(|tx| {
+            .mutate_domain(|tx| {
                 insert_key(
                     tx,
                     NewKey {
@@ -297,11 +476,30 @@ impl ApiKeyStore {
                         consumer_id: &consumer_id,
                         prefix: &prefix,
                         hash: &hash,
-                        allowed_models: &allowed_models,
                         now: &now,
                         expires_at: expires_at.as_deref(),
                     },
-                )?;
+                )
+                // The partial unique index is the enforcement point, so its
+                // violation is translated here rather than pre-checked: a
+                // pre-check would be the race the index exists to close.
+                //
+                // Both conditions are needed. Without the extended-code test a
+                // `UNIQUE(key_hash)` collision — the same plaintext issued
+                // twice — would be reported as "this consumer already has a
+                // key" whenever the consumer happens to have one, which is a
+                // wrong diagnosis of a real mistake. Without the `active_key_exists`
+                // read, an insert refused by the index could only be reported as
+                // a raw constraint failure.
+                .map_err(|e| {
+                    if unique_violation(&e) && active_key_exists(tx, &consumer_id) {
+                        Mutation::Domain(ApiKeyError::AlreadyActive(PartnerKeyExists {
+                            consumer_id: consumer_id.clone(),
+                        }))
+                    } else {
+                        Mutation::Sqlite(e)
+                    }
+                })?;
                 Ok(Outcome::Done(fetch_written_row(
                     tx,
                     tx.last_insert_rowid(),
@@ -332,18 +530,11 @@ impl ApiKeyStore {
             .map_err(Into::into)
     }
 
-    /// Change a key's name or allow-list. Never changes the secret.
-    pub fn update(
-        &self,
-        id: i64,
-        name: Option<&str>,
-        allowed_models: Option<Vec<String>>,
-    ) -> Result<ApiKeyRow> {
+    /// Change a key's name. Never changes the secret, and never changes what
+    /// the key may call — that is a property of the partner (ADR 0015).
+    pub fn update(&self, id: i64, name: Option<&str>) -> Result<ApiKeyRow> {
         if let Some(name) = name {
             require_text("name", name)?;
-        }
-        if let Some(models) = &allowed_models {
-            validate_models(models)?;
         }
         let now = timefmt::format_ts(timefmt::now());
 
@@ -359,14 +550,9 @@ impl ApiKeyStore {
             }
 
             let new_name = name.unwrap_or(&current.name).to_string();
-            let models = allowed_models
-                .as_deref()
-                .map(encode_models)
-                .unwrap_or_else(|| encode_models(&current.allowed_models));
             tx.execute(
-                "UPDATE api_keys SET name = ?2, allowed_models = ?3, updated_at = ?4 \
-                 WHERE id = ?1",
-                params![id, new_name, models, now],
+                "UPDATE api_keys SET name = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, new_name, now],
             )?;
             Ok(Outcome::Done(fetch_written_row(tx, id)?))
         })?;
@@ -436,7 +622,6 @@ impl ApiKeyStore {
                         consumer_id: &current.consumer_id,
                         prefix: &prefix,
                         hash: &hash,
-                        allowed_models: &current.allowed_models,
                         now: &now,
                         expires_at: current.expires_at.as_deref(),
                     },
@@ -477,15 +662,54 @@ impl ApiKeyStore {
     where
         F: FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<Outcome<T>>,
     {
-        let outcome = self
-            .pool
-            .write(|conn| {
-                let tx = conn.transaction()?;
-                let out = f(&tx)?;
-                tx.commit()?;
-                Ok(out)
-            })
-            .map_err(ApiKeyError::from)?;
+        self.mutate_domain(|tx| f(tx).map_err(|e| e.into()))
+    }
+
+    /// As [`ApiKeyStore::mutate`], for a transaction that can refuse for a
+    /// domain reason and not merely for a SQLite one.
+    ///
+    /// The split exists because the unique index is the *enforcement point* for
+    /// one key per partner, and the database cannot raise a domain error. So
+    /// the transaction returns `AlreadyActive` and it is translated here, after
+    /// the rollback that discards a half-written insert has already happened. A
+    /// domain error raised *before* the commit is a failure of the whole
+    /// transaction, which is the right outcome for a refused create — nothing
+    /// was written, so there is no useful work to abandon.
+    fn mutate_domain<F, T>(&self, f: F) -> Result<Outcome<T>>
+    where
+        F: FnOnce(&rusqlite::Transaction<'_>) -> std::result::Result<Outcome<T>, Mutation>,
+    {
+        // A domain refusal leaves through this `Option`, out of band.
+        //
+        // `LedgerPool::write` is pinned to `rusqlite::Result`, and a refusal
+        // smuggled through an error variant comes back out as "database error"
+        // with the reason lost — which is exactly what the split into `Mutation`
+        // exists to prevent, and is what a first version of this did. The
+        // transaction is rolled back by its `Drop` on the way out, so the
+        // stand-in error only has to end the closure without committing.
+        let mut refused: Option<ApiKeyError> = None;
+
+        let outcome = self.pool.write(|conn| {
+            let tx = conn.transaction()?;
+            let out = match f(&tx) {
+                Ok(out) => out,
+                Err(Mutation::Sqlite(e)) => return Err(e),
+                Err(Mutation::Domain(domain)) => {
+                    refused = Some(domain);
+                    return Err(rusqlite::Error::InvalidQuery);
+                }
+            };
+            tx.commit()?;
+            Ok(out)
+        });
+
+        let outcome = match (refused, outcome) {
+            // Set and returned together, so `Some` here means the closure did
+            // not commit and the failure is this refusal, not the stand-in.
+            (Some(domain), _) => return Err(domain),
+            (None, Ok(out)) => out,
+            (None, Err(e)) => return Err(ApiKeyError::from(e)),
+        };
 
         if let Err(e) = self.refresh() {
             tracing::error!(
@@ -498,6 +722,42 @@ impl ApiKeyStore {
     }
 }
 
+/// Why a mutation did not happen.
+///
+/// A domain refusal and a SQLite failure are different things: one is a
+/// decision, the other is an accident, and only the second deserves a stack
+/// trace in a log. Neither is ever wrapped into the other, because a
+/// constraint violation that has been given a name must not also be reported
+/// as "database error" — an operator reading a 500 learns nothing.
+///
+/// There used to be a `From<ApiKeyError> for rusqlite::Error` that boxed a
+/// refusal into `ToSqlConversionFailure` so it could cross the `rusqlite::Result`
+/// boundary `LedgerPool::write` is pinned to. It propagated — the write failed
+/// and rolled back — but it came back out as `Database(..)`: the 409 the admin
+/// API renders became a 500, and "this partner already has an active key",
+/// which is actionable, became "database error", which is not. A conversion
+/// whose only reader cannot recover what it wrote is not worth keeping, so the
+/// refusal is now held in an `Option` beside the closure (see `mutate_domain`).
+enum Mutation {
+    Sqlite(rusqlite::Error),
+    Domain(ApiKeyError),
+}
+
+impl From<rusqlite::Error> for Mutation {
+    fn from(e: rusqlite::Error) -> Self {
+        Mutation::Sqlite(e)
+    }
+}
+
+impl From<ApiKeyError> for Mutation {
+    fn from(e: ApiKeyError) -> Self {
+        Mutation::Domain(e)
+    }
+}
+
+/// A domain refusal is carried out of a transaction body in a variable, not in
+/// an error.
+///
 /// What a mutation did, as data rather than as an error.
 ///
 /// `pool.write` is pinned to `rusqlite::Result`, so a domain error cannot cross
@@ -546,6 +806,70 @@ fn require_active(row: &ApiKeyRow) -> Result<()> {
     }
 }
 
+/// Log a partner gaining or losing service between two snapshots.
+///
+/// # Why the status is only reported on change
+///
+/// Suspension is derived, and the refresh runs once a second, so "is this
+/// partner suspended" is a question asked ten thousand times a day with the same
+/// answer. Only the *crossing* is an event: a partner who was being served and
+/// now is not has had their calls start failing, and that is worth waking
+/// someone for. Logging the state instead of the transition would bury it.
+///
+/// # Why a hash absent from one side is not a transition
+///
+/// The snapshot is keyed by the key hash that authenticates, and the two sides
+/// are a second apart. A key created, revoked or rotated in between changes the
+/// hash without anything having happened to the partner's service. So only
+/// hashes present in *both* snapshots are compared — a revoked key vanishing is
+/// not a resume, and reading it as one would log exactly the opposite of what
+/// happened at the moment it matters most.
+///
+/// A hash that appears for the first time and is already suspended *is*
+/// reported: that is a bill going unpaid and a fresh credential arriving to
+/// carry it, and an operator should see it.
+///
+/// The message *is* the event name (`partner_suspended`, `partner_resumed`), not
+/// a sentence about it. These two are operational signals something watches for,
+/// and `grep partner_suspended` has to find them; the fields beside it carry what
+/// a human needs to act.
+fn log_service_transitions(previous: &PartnerSnapshot, next: &PartnerSnapshot) {
+    let before: HashMap<&str, &Arc<PartnerRuntimeConfig>> = previous.entries().collect();
+
+    for (hash, config) in next.entries() {
+        let was_suspended = match before.get(hash) {
+            Some(old) => {
+                if old.is_suspended() == config.is_suspended() {
+                    // Most of the time, and the whole point of this function.
+                    continue;
+                }
+                Some(old.is_suspended())
+            }
+            None => None,
+        };
+
+        match (&config.service_status, was_suspended) {
+            (ServiceStatus::Suspended { reason }, Some(false))
+            | (ServiceStatus::Suspended { reason }, None) => {
+                tracing::warn!(
+                    consumer_id = %config.consumer_id,
+                    status = %config.service_status,
+                    reason = ?reason,
+                    "partner_suspended"
+                );
+            }
+            (ServiceStatus::Active, Some(true)) => {
+                tracing::info!(
+                    consumer_id = %config.consumer_id,
+                    "partner_resumed"
+                );
+            }
+            // A new active key, or a state this match already handled.
+            _ => {}
+        }
+    }
+}
+
 /// A new key, ready to be written.
 ///
 /// Grouped rather than passed as eight arguments because `create` and `rotate`
@@ -556,7 +880,6 @@ struct NewKey<'a> {
     consumer_id: &'a str,
     prefix: &'a str,
     hash: &'a str,
-    allowed_models: &'a [String],
     now: &'a str,
     expires_at: Option<&'a str>,
 }
@@ -565,15 +888,14 @@ struct NewKey<'a> {
 fn insert_key(conn: &Connection, key: NewKey<'_>) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO api_keys \
-         (name, consumer_id, key_prefix, key_hash, allowed_models, status, \
+         (name, consumer_id, key_prefix, key_hash, status, \
           created_at, updated_at, expires_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6, ?7)",
+         VALUES (?1, ?2, ?3, ?4, 'active', ?5, ?5, ?6)",
         params![
             key.name,
             key.consumer_id,
             key.prefix,
             key.hash,
-            encode_models(key.allowed_models),
             key.now,
             key.expires_at
         ],
@@ -583,7 +905,7 @@ fn insert_key(conn: &Connection, key: NewKey<'_>) -> rusqlite::Result<()> {
 
 /// `SELECT *` order must match [`row_to_api_key`]; the two are one list.
 const SELECT_COLUMNS: &str = "id, name, consumer_id, key_prefix, key_hash, \
-     allowed_models, status, created_at, updated_at, expires_at, revoked_at";
+     status, created_at, updated_at, expires_at, revoked_at";
 
 fn fetch_row(conn: &Connection, id: i64) -> rusqlite::Result<Option<ApiKeyRow>> {
     conn.query_row(
@@ -607,34 +929,19 @@ fn fetch_written_row(conn: &Connection, id: i64) -> rusqlite::Result<ApiKeyRow> 
 /// Map a row. Never reads the plaintext — there is none — and never surfaces
 /// the hash, which would leak the digest into a response body or a log line.
 fn row_to_api_key(row: &Row<'_>) -> rusqlite::Result<ApiKeyRow> {
-    let status: String = row.get(6)?;
+    let status: String = row.get(5)?;
     Ok(ApiKeyRow {
         id: row.get(0)?,
         name: row.get(1)?,
         consumer_id: row.get(2)?,
         key_prefix: row.get(3)?,
-        allowed_models: decode_models(&row.get::<_, String>(5)?)?,
         status: KeyStatus::parse(&status).ok_or_else(|| {
-            rusqlite::Error::InvalidColumnType(6, "status".to_string(), rusqlite::types::Type::Text)
+            rusqlite::Error::InvalidColumnType(5, "status".to_string(), rusqlite::types::Type::Text)
         })?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
-        expires_at: row.get(9)?,
-        revoked_at: row.get(10)?,
-    })
-}
-
-fn encode_models(models: &[String]) -> String {
-    serde_json::to_string(models).unwrap_or_else(|_| "[]".to_string())
-}
-
-fn decode_models(text: &str) -> rusqlite::Result<Vec<String>> {
-    serde_json::from_str(text).map_err(|e| {
-        rusqlite::Error::InvalidColumnType(
-            0,
-            format!("allowed_models is not a JSON array: {e}"),
-            rusqlite::types::Type::Text,
-        )
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        expires_at: row.get(8)?,
+        revoked_at: row.get(9)?,
     })
 }
 
@@ -646,20 +953,12 @@ fn require_text(field: &str, value: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn validate_models(models: &[String]) -> Result<()> {
-    for model in models {
-        if model.trim().is_empty() {
-            return Err(ApiKeyError::Invalid(
-                "allowed_models must not contain a blank model name".to_string(),
-            ));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::billing::partner::ModelPrice;
+    use crate::billing::pricing::{PricePerMillion, PricingSnapshot};
+    use crate::billing::store::{BillingStore, NewPartner};
     use crate::ledger::LedgerPool;
     use time::Duration;
 
@@ -676,6 +975,45 @@ mod tests {
         list.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Configure a partner and its models, the way the admin API does.
+    ///
+    /// A key carries no model list of its own (ADR 0015), so a test that wants
+    /// a partner that may call something has to say so here — and the price is
+    /// part of the same row, which is why this takes one number per model and
+    /// uses it for all three components.
+    fn partner(store: &ApiKeyStore, consumer: &str, list: &[(&str, i64)]) {
+        let billing = BillingStore::new(Arc::clone(store.pool()));
+        if billing.get_partner(consumer).unwrap().is_some() {
+            // Idempotent: several tests create two keys for one consumer, and
+            // the second call is a reconfiguration of the same partner rather
+            // than a new one.
+            return;
+        }
+        billing
+            .create_partner(NewPartner {
+                consumer_id: consumer.to_string(),
+                name: consumer.to_string(),
+                billing_email: format!("billing@{consumer}.test"),
+                billing_mode: BillingMode::Invoice,
+                payment_terms_minutes: crate::billing::DEFAULT_PAYMENT_TERMS_MINUTES,
+            })
+            .expect("the partner must be created");
+        let rows: Vec<ModelPrice> = list
+            .iter()
+            .map(|(name, price)| ModelPrice {
+                model: (*name).to_string(),
+                prices: PricingSnapshot::new(
+                    PricePerMillion::new(*price),
+                    PricePerMillion::new(*price),
+                    PricePerMillion::new(*price),
+                ),
+            })
+            .collect();
+        billing
+            .replace_models(consumer, &rows)
+            .expect("the models must be written");
+    }
+
     /// A store whose snapshot is loaded, which is what startup does.
     fn loaded() -> (tempfile::TempDir, ApiKeyStore) {
         let (dir, store) = store();
@@ -685,9 +1023,11 @@ mod tests {
         (dir, store)
     }
 
+    /// A partner with one model and a key for it — the ordinary case.
     fn create(store: &ApiKeyStore, name: &str, consumer: &str) -> (ApiKeyRow, String) {
+        partner(store, consumer, &[("gpt-4o", 95_000)]);
         store
-            .create(name, consumer, models(&["gpt-4o"]), None)
+            .create(name, consumer, None)
             .expect("create must succeed")
     }
 
@@ -700,8 +1040,8 @@ mod tests {
             .authenticate(&plaintext)
             .expect("the key must authenticate");
         assert_eq!(auth.consumer_id, "acme");
-        assert_eq!(auth.name, "primary");
-        assert_eq!(auth.allowed_models, models(&["gpt-4o"]));
+        assert_eq!(auth.key_name, "primary");
+        assert_eq!(auth.allowed_models(), models(&["gpt-4o"]));
 
         // Nothing else does: not the prefix, not the name, not the row id.
         assert!(store.authenticate(&row.key_prefix).is_none());
@@ -730,9 +1070,7 @@ mod tests {
                 Arc::new(LedgerPool::new(path.clone()).unwrap()),
                 SECRET.to_vec(),
             );
-            first
-                .create("primary", "acme", models(&["gpt-4o"]), None)
-                .unwrap();
+            first.create("primary", "acme", None).unwrap();
         }
         let other = ApiKeyStore::new(
             Arc::new(LedgerPool::new(path).unwrap()),
@@ -774,7 +1112,6 @@ mod tests {
         assert_ne!(rotated.id, original.id, "rotation issues a new row");
         assert_eq!(rotated.consumer_id, "acme", "identity is preserved");
         assert_eq!(rotated.name, "primary");
-        assert_eq!(rotated.allowed_models, models(&["gpt-4o"]));
         assert_ne!(rotated.key_prefix, original.key_prefix);
         assert_ne!(new_plaintext, old_plaintext);
 
@@ -787,6 +1124,12 @@ mod tests {
             .authenticate(&new_plaintext)
             .expect("the new secret must work");
         assert_eq!(auth.consumer_id, "acme");
+        // Rotation changes the secret and nothing else: the successor resolves
+        // to the same partner configuration, because that configuration is the
+        // partner's (ADR 0015) and a rotation that changed it would silently
+        // change what the partner may call and what they pay.
+        assert_eq!(auth.allowed_models(), models(&["gpt-4o"]));
+        assert_eq!(auth.pricing_for("gpt-4o").unwrap().input.as_i64(), 95_000);
 
         // The predecessor is retained as history, not overwritten.
         let previous = store
@@ -817,8 +1160,9 @@ mod tests {
         let (_dir, store) = loaded();
         let expiry = timefmt::now() + Duration::days(7);
 
+        partner(&store, "expiring-partner", &[("gpt-4o", 95_000)]);
         let (expiring, _) = store
-            .create("expiring", "acme", models(&["gpt-4o"]), Some(expiry))
+            .create("expiring", "expiring-partner", Some(expiry))
             .unwrap();
         let (rotated, _) = store.rotate(expiring.id).unwrap();
         assert_eq!(
@@ -827,7 +1171,7 @@ mod tests {
             "a rotation inherits the deadline it was given"
         );
 
-        let (perpetual, _) = create(&store, "perpetual", "acme");
+        let (perpetual, _) = create(&store, "perpetual", "perpetual-partner");
         let (rotated, _) = store.rotate(perpetual.id).unwrap();
         assert_eq!(rotated.expires_at, None, "no expiry means none is added");
     }
@@ -835,62 +1179,72 @@ mod tests {
     #[test]
     fn test_an_expired_key_is_not_authenticatable() {
         let (_dir, store) = loaded();
+        partner(&store, "expiring-partner", &[("gpt-4o", 95_000)]);
+        partner(&store, "active-partner", &[("gpt-4o", 95_000)]);
         let (past, _) = store
             .create(
                 "expired",
-                "acme",
-                models(&["gpt-4o"]),
+                "expiring-partner",
                 Some(timefmt::now() - Duration::hours(1)),
             )
             .unwrap();
         let (_future, future_plaintext) = store
             .create(
                 "valid",
-                "acme",
-                models(&["gpt-4o"]),
+                "active-partner",
                 Some(timefmt::now() + Duration::hours(1)),
             )
             .unwrap();
 
         // Expiry is a load-time predicate, so the row still exists and still
         // reports itself active — it simply is not in the authenticating set.
+        // It also still occupies the partner's one active slot, which is
+        // deliberate: the row is what a partner would rotate or revoke, and
+        // letting an expired key be silently displaced by a new one would mean
+        // the old key's row changed status without anyone asking.
         assert_eq!(
             store.get(past.id).unwrap().unwrap().status,
             KeyStatus::Active
         );
         assert_eq!(store.active_count(), 1);
         assert!(store.authenticate(&future_plaintext).is_some());
+        assert!(store.authenticate("pp_expired").is_none());
     }
 
     #[test]
-    fn test_update_changes_name_and_allow_list_but_not_the_secret() {
+    fn test_update_renames_a_key_and_never_the_partner_configuration() {
+        // A key's update surface is its label. What the partner may call and
+        // what each model costs are not properties of a credential, and the
+        // method takes no argument that could change them (ADR 0015) — this
+        // test is here so that adding one is a deliberate act rather than a
+        // convenience.
         let (_dir, store) = loaded();
         let (row, plaintext) = create(&store, "primary", "acme");
 
         let updated = store
-            .update(row.id, Some("renamed"), Some(models(&["gpt-4o", "gpt-5"])))
+            .update(row.id, Some("renamed"))
             .expect("update must succeed");
         assert_eq!(updated.name, "renamed");
-        assert_eq!(updated.allowed_models, models(&["gpt-4o", "gpt-5"]));
+        assert_eq!(updated.consumer_id, "acme");
 
         let auth = store.authenticate(&plaintext).expect("the key still works");
-        assert_eq!(auth.name, "renamed");
-        assert_eq!(auth.allowed_models, models(&["gpt-4o", "gpt-5"]));
-
-        // A partial update leaves the untouched field alone.
-        let only_name = store.update(row.id, Some("again"), None).unwrap();
-        assert_eq!(only_name.allowed_models, models(&["gpt-4o", "gpt-5"]));
+        assert_eq!(
+            auth.key_name, "renamed",
+            "the new name is what a request sees"
+        );
+        assert_eq!(auth.allowed_models(), models(&["gpt-4o"]));
+        assert_eq!(auth.pricing_for("gpt-4o").unwrap().input.as_i64(), 95_000);
     }
 
     #[test]
     fn test_update_is_refused_for_a_revoked_key_and_changes_nothing() {
         let (_dir, store) = loaded();
         let (row, _) = create(&store, "primary", "acme");
-        store.update(row.id, Some("renamed"), None).unwrap();
+        store.update(row.id, Some("renamed")).unwrap();
         store.revoke(row.id).unwrap();
 
         assert!(matches!(
-            store.update(row.id, Some("sneaky"), None),
+            store.update(row.id, Some("sneaky")),
             Err(ApiKeyError::NotActive(1))
         ));
         assert_eq!(store.get(row.id).unwrap().unwrap().name, "renamed");
@@ -903,7 +1257,7 @@ mod tests {
         assert!(matches!(store.revoke(404), Err(ApiKeyError::NotFound(404))));
         assert!(matches!(store.rotate(404), Err(ApiKeyError::NotFound(404))));
         assert!(matches!(
-            store.update(404, Some("x"), None),
+            store.update(404, Some("x")),
             Err(ApiKeyError::NotFound(404))
         ));
         assert_eq!(
@@ -913,47 +1267,43 @@ mod tests {
         );
     }
 
-    /// The strict-by-default allow-list, which moved out of `config.yaml` with
-    /// the keys and must keep behaving exactly as it did.
+    /// The model gate, now that it comes from the partner's own price list.
     ///
-    /// A declared list admits exactly its members; matching is literal, not
-    /// case-insensitive; and the empty list is the strict case — *no* model,
-    /// never "everything". The last one is the dangerous direction, so it is
-    /// asserted from the stored row rather than from a struct the test built.
+    /// A configured list admits exactly its members; matching is literal, not
+    /// case-insensitive; a model absent from `partner_models` has no permission
+    /// *and* no price; and a partner with no rows may call nothing — never
+    /// "everything". That last one is the dangerous direction, so it is asserted
+    /// through the snapshot the request path actually reads.
     #[test]
-    fn test_the_allow_list_is_strict_and_exact() {
+    fn test_the_model_gate_is_strict_exact_and_comes_with_a_price() {
         let (_dir, store) = loaded();
+        partner(
+            &store,
+            "listed-partner",
+            &[("gpt-4o", 95_000), ("gpt-4o-mini", 15_000)],
+        );
+        let (_listed, plaintext) = store.create("listed", "listed-partner", None).unwrap();
 
-        let (_listed, plaintext) = store
-            .create("listed", "acme", models(&["gpt-4o", "gpt-4o-mini"]), None)
-            .unwrap();
         let auth = store.authenticate(&plaintext).unwrap();
-        assert!(auth.allowed_models.iter().any(|m| m == "gpt-4o"));
-        assert!(auth.allowed_models.iter().any(|m| m == "gpt-4o-mini"));
-        assert!(!auth.allowed_models.iter().any(|m| m == "gpt-5"));
+        assert!(auth.allows("gpt-4o"));
+        assert!(auth.allows("gpt-4o-mini"));
+        assert!(!auth.allows("gpt-5"), "an unlisted model has no permission");
         assert!(
-            !auth.allowed_models.iter().any(|m| m == "GPT-4o"),
+            !auth.allows("GPT-4o"),
             "matching is exact, not case-insensitive"
         );
-
-        // The empty list is the default for a key that names no models, and it
-        // denies everything rather than admitting everything.
-        let (empty, plaintext) = store.create("empty", "acme", Vec::new(), None).unwrap();
-        assert!(empty.allowed_models.is_empty());
-        assert!(
-            store
-                .authenticate(&plaintext)
-                .unwrap()
-                .allowed_models
-                .is_empty()
+        assert_eq!(auth.pricing_for("gpt-5"), None, "and no price either");
+        assert_eq!(
+            auth.pricing_for("gpt-4o-mini").unwrap().input.as_i64(),
+            15_000
         );
 
-        // And it is still the strict case after a round trip through storage.
-        let reread = store.get(empty.id).unwrap().unwrap();
-        assert!(
-            reread.allowed_models.is_empty(),
-            "an empty allow-list must not come back as permissive"
-        );
+        // A partner with no rows at all: no permission, and no price.
+        let (_empty, plaintext) = store.create("empty", "empty-partner", None).unwrap();
+        let auth = store.authenticate(&plaintext).unwrap();
+        assert!(auth.allowed_models().is_empty());
+        assert!(!auth.allows("gpt-4o"));
+        assert_eq!(auth.pricing_for("gpt-4o"), None);
     }
 
     #[test]
@@ -961,15 +1311,11 @@ mod tests {
         let (_dir, store) = loaded();
         for bad in ["", "   ", "\t\n"] {
             assert!(matches!(
-                store.create(bad, "acme", models(&["gpt-4o"]), None),
+                store.create(bad, "acme", None),
                 Err(ApiKeyError::Invalid(_))
             ));
             assert!(matches!(
-                store.create("name", bad, models(&["gpt-4o"]), None),
-                Err(ApiKeyError::Invalid(_))
-            ));
-            assert!(matches!(
-                store.create("name", "acme", models(&["gpt-4o", " "]), None),
+                store.create("name", bad, None),
                 Err(ApiKeyError::Invalid(_))
             ));
         }
@@ -988,7 +1334,7 @@ mod tests {
         // and silently altering a credential produces a 401 that points nowhere.
         let supplied = "  dev-key-with-spaces  ";
         store
-            .create_with_plaintext("fixture", "acme", models(&["gpt-4o"]), None, supplied)
+            .create_with_plaintext("fixture", "acme", None, supplied)
             .unwrap();
         store.refresh().unwrap();
         assert!(
@@ -1004,7 +1350,7 @@ mod tests {
         // Blank is still refused, and nothing was written.
         for bad in ["", "   ", "\t\n"] {
             assert!(matches!(
-                store.create_with_plaintext("fixture", "acme", models(&["gpt-4o"]), None, bad),
+                store.create_with_plaintext("fixture", "acme", None, bad),
                 Err(ApiKeyError::Invalid(_))
             ));
         }
@@ -1020,47 +1366,13 @@ mod tests {
         // live key for the same credential.
         let (_dir, store) = loaded();
         store
-            .create_with_plaintext("first", "acme", models(&["gpt-4o"]), None, "dev-key")
+            .create_with_plaintext("first", "acme", None, "dev-key")
             .unwrap();
         assert!(matches!(
-            store.create_with_plaintext("again", "beta", models(&["gpt-4o"]), None, "dev-key"),
+            store.create_with_plaintext("again", "beta", None, "dev-key"),
             Err(ApiKeyError::Database(_))
         ));
         assert_eq!(store.list().unwrap().len(), 1, "and it wrote nothing");
-    }
-
-    #[test]
-    fn test_the_allow_list_round_trips_through_json_including_quotes_and_unicode() {
-        let (_dir, store) = loaded();
-        // Values that would break a naive join/split encoding: a quote, a
-        // backslash, a comma and a non-ASCII model name.
-        let awkward = models(&["a\"b", "c\\d", "e,f", "gpt-4ö", "日本語"]);
-        let (row, _) = store
-            .create("awkward", "acme", awkward.clone(), None)
-            .unwrap();
-
-        assert_eq!(store.get(row.id).unwrap().unwrap().allowed_models, awkward);
-        store.refresh().unwrap();
-        let auth = store.authenticate(&store.list().unwrap()[0].key_prefix);
-        // The prefix is not a key, so this is None — the point is that the
-        // round trip above already proved the encoding.
-        assert!(auth.is_none());
-        assert_eq!(store.list().unwrap()[0].allowed_models, awkward);
-    }
-
-    #[test]
-    fn test_an_empty_allow_list_survives_the_round_trip_as_empty() {
-        let (_dir, store) = loaded();
-        let (row, plaintext) = store.create("strict", "acme", vec![], None).unwrap();
-        assert_eq!(
-            store.get(row.id).unwrap().unwrap().allowed_models,
-            Vec::<String>::new()
-        );
-
-        let auth = store
-            .authenticate(&plaintext)
-            .expect("an empty list still authenticates");
-        assert!(auth.allowed_models.is_empty(), "and still allows nothing");
     }
 
     #[test]
@@ -1116,15 +1428,30 @@ mod tests {
                 id(),
             ),
             (
-                "an allow-list that is not a JSON array",
-                "UPDATE api_keys SET allowed_models='gpt-4o' WHERE id=?1",
-                id(),
+                "a blank model name in a partner's price list",
+                "INSERT INTO partner_models (consumer_id, model, \
+                 input_price_micro_usd_per_million, \
+                 cached_input_price_micro_usd_per_million, \
+                 output_price_micro_usd_per_million, created_at, updated_at) \
+                 VALUES ('acme', '   ', 0, 0, 0, '2026-01-01T00:00:00.000000000Z', \
+                         '2026-01-01T00:00:00.000000000Z')",
+                Vec::new(),
+            ),
+            (
+                "a negative price",
+                "INSERT INTO partner_models (consumer_id, model, \
+                 input_price_micro_usd_per_million, \
+                 cached_input_price_micro_usd_per_million, \
+                 output_price_micro_usd_per_million, created_at, updated_at) \
+                 VALUES ('acme', 'gpt-4o', -1, 0, 0, '2026-01-01T00:00:00.000000000Z', \
+                         '2026-01-01T00:00:00.000000000Z')",
+                Vec::new(),
             ),
             (
                 "a duplicated key hash",
                 "INSERT INTO api_keys (name, consumer_id, key_prefix, key_hash, \
-                 allowed_models, created_at, updated_at) \
-                 SELECT 'dup', consumer_id, 'pp_dup', key_hash, '[]', created_at, created_at \
+                 created_at, updated_at) \
+                 SELECT 'dup', consumer_id, 'pp_dup', key_hash, created_at, created_at \
                  FROM api_keys WHERE id = ?1",
                 id(),
             ),
@@ -1147,30 +1474,74 @@ mod tests {
     fn test_two_keys_for_one_consumer_share_the_identity_but_not_the_secret() {
         let (_dir, store) = loaded();
         let (primary, primary_plaintext) = create(&store, "primary", "shared");
-        let (secondary, secondary_plaintext) = create(&store, "secondary", "shared");
-
         let a = store.authenticate(&primary_plaintext).unwrap();
-        let b = store.authenticate(&secondary_plaintext).unwrap();
-        assert_eq!(a.consumer_id, b.consumer_id, "one consumer, two keys");
-        assert_ne!(a.name, b.name, "but they are distinguishable");
-        assert_eq!(store.active_count(), 2);
+        assert_eq!(a.consumer_id, "shared");
 
-        // Revoking one leaves the other working — they are separate credentials
-        // that happen to name the same consumer.
-        store.revoke(primary.id).unwrap();
-        assert!(store.authenticate(&primary_plaintext).is_none());
-        assert!(store.authenticate(&secondary_plaintext).is_some());
-        assert_eq!(
-            store.get(secondary.id).unwrap().unwrap().consumer_id,
-            "shared"
+        // A second active key for one consumer is now a database error, not a
+        // supported pattern: a partner is a commercial account with one
+        // credential, and two live ones would mean two keys that share an
+        // invoice and no way to say which is the partner's. What the old
+        // behaviour enabled — revoking one and keeping the other working — is
+        // exactly what `rotate` does, in one transaction.
+        let err = store
+            .create("secondary", "shared", None)
+            .expect_err("a partner may not have two active keys");
+        assert!(
+            matches!(
+                err,
+                ApiKeyError::AlreadyActive(PartnerKeyExists { ref consumer_id })
+                    if consumer_id == "shared"
+            ),
+            "the conflict must name the consumer, not leak a SQLite message: {err}"
+        );
+
+        // And the refusal changed nothing: the first key still works.
+        assert!(store.authenticate(&primary_plaintext).is_some());
+        assert_eq!(store.active_count(), 1);
+
+        // The supported path: rotate. Exactly one active key survives, the new
+        // plaintext authenticates and the old one does not.
+        let (rotated, rotated_plaintext) = store.rotate(primary.id).unwrap();
+        assert_eq!(rotated.consumer_id, "shared");
+        assert!(store.authenticate(&rotated_plaintext).is_some());
+        assert!(
+            store.authenticate(&primary_plaintext).is_none(),
+            "rotation must retire the predecessor"
+        );
+        assert_eq!(store.active_count(), 1);
+    }
+
+    #[test]
+    fn test_revoking_a_key_frees_the_partner_slot_for_a_new_one() {
+        // The counterpart to the refusal above: the constraint is about
+        // *active* keys, so the history of every key a partner ever had is
+        // kept and a new credential can be issued in its place.
+        let (_dir, store) = loaded();
+        let (first, _) = create(&store, "first", "acme");
+        store.revoke(first.id).unwrap();
+
+        let (second, plaintext) = create(&store, "second", "acme");
+        assert_eq!(second.consumer_id, "acme");
+        assert!(store.authenticate(&plaintext).is_some());
+        assert_eq!(store.active_count(), 1);
+
+        // Both rows are still there: the revoked one is history, not garbage.
+        let all = store.list().unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(
+            all.iter()
+                .any(|k| k.id == first.id && k.status == KeyStatus::Revoked)
         );
     }
 
     #[test]
     fn test_snapshot_is_replaced_wholesale_never_merged() {
         let (_dir, store) = loaded();
+        // Two keys for two different partners: the shape of the dataset is
+        // irrelevant to what this test is about, which is replacement and not
+        // accumulation.
         create(&store, "a", "acme");
-        create(&store, "b", "acme");
+        create(&store, "b", "globex");
         store.refresh().unwrap();
         assert_eq!(store.active_count(), 2);
 

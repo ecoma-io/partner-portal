@@ -186,8 +186,71 @@ impl ConfigLoader {
         // passed, so 0 means "commit as soon as anything is queued" rather than
         // a stall (src/ledger/writer.rs).
 
+        validate_billing(&config.billing)?;
+
         Ok(())
     }
+}
+
+/// Validate the billing block.
+///
+/// Three checks, and each is a configuration that would otherwise run while
+/// meaning something other than what it says. None of them is about the *product*
+/// — a partner's prices, their mode and their address are data, and none of it is
+/// in this file.
+fn validate_billing(billing: &crate::config::BillingConfig) -> Result<(), ConfigError> {
+    // The range is the world's real civil offsets, and the check is the one the
+    // billing calendar itself applies — so an offset that passes here cannot
+    // panic or silently fall back to UTC when a day is named. Refusing it at
+    // start-up rather than at the first statement is the difference between an
+    // operator seeing the mistake and a month of statements landing on the wrong
+    // day.
+    if crate::billing::period::BillingTimezone::from_offset_minutes(billing.timezone_offset_minutes)
+        .is_err()
+    {
+        return Err(ConfigError::Invalid(format!(
+            "billing.timezone_offset_minutes is {}; it must be a whole number of minutes \
+             between {} and {}",
+            billing.timezone_offset_minutes,
+            crate::billing::period::BillingTimezone::MIN_OFFSET_MINUTES,
+            crate::billing::period::BillingTimezone::MAX_OFFSET_MINUTES,
+        )));
+    }
+
+    // A negative delay would close a day before it ended, which is a systematic
+    // under-bill at the boundary rather than a surprising-but-valid setting. The
+    // generator clamps to zero as a defence; this is where an operator is told,
+    // because the clamp would otherwise turn a typo into a silent policy.
+    if billing.close_delay_minutes < 0 {
+        return Err(ConfigError::Invalid(format!(
+            "billing.close_delay_minutes is {}; it cannot be negative, because a day \
+             closed before it ends loses the requests at its boundary",
+            billing.close_delay_minutes
+        )));
+    }
+
+    // `enabled: true` with nowhere to send is an operator asking for statements
+    // to be emailed and getting silence. Both halves are named, and the address
+    // is deliberately not defaulted anywhere: a statement from an address nobody
+    // owns looks delivered, which is the worse failure.
+    if billing.email.enabled {
+        if billing.email.smtp_host.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "billing.email.enabled is true but billing.email.smtp_host is empty; \
+                 there is no relay to send through"
+                    .to_string(),
+            ));
+        }
+        if billing.email.from_address.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "billing.email.enabled is true but billing.email.from_address is empty; \
+                 a statement needs a sender a reply could reach"
+                    .to_string(),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Validate `upstream.base_url` as what it is used for: a prefix the request
@@ -417,82 +480,6 @@ upstream:
         );
     }
 
-    /// A blank entry in `allowed_models` is a typo that silently lists nothing
-    /// useful, so it is refused (ADR 0012). The check is no longer a *config*
-    /// validation, and deleting the config keys must not have deleted the rule
-    /// with them: the enforcement point moved to [`ApiKeyStore`], and this
-    /// stands as the assertion that it is still enforced.
-    ///
-    /// Model names are not credentials, so the message may — and this test
-    /// already relies on it — name the offending entry without echoing a
-    /// secret.
-    #[test]
-    fn test_a_blank_allowed_models_entry_is_still_refused() {
-        use crate::apikeys::ApiKeyStore;
-        use crate::ledger::LedgerPool;
-        use std::sync::Arc;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = ApiKeyStore::new(
-            Arc::new(LedgerPool::new(dir.path().join("ledger.db")).unwrap()),
-            b"a-blank-model-test-secret-32-byt".to_vec(),
-        );
-
-        for (label, models) in [
-            ("empty", vec![String::new()]),
-            ("whitespace", vec!["gpt-4o".to_string(), "   ".to_string()]),
-        ] {
-            let err = store
-                .create("blank", "acme", models, None)
-                .err()
-                .unwrap_or_else(|| panic!("a {label} allowed_models entry must be refused"));
-            assert!(
-                err.to_string().contains("allowed_models"),
-                "the error must name the offending field: {err}"
-            );
-        }
-    }
-
-    /// The strict-by-default allow-list moved out of configuration with the
-    /// keys themselves, and the contract moved with it: an empty list is
-    /// `[]` in the database, not an omitted field in a file. This is the shape
-    /// the admin API stores and the proxy reads, so the row is the assertion.
-    #[test]
-    fn test_the_allow_list_is_a_database_column_not_a_config_field() {
-        use crate::apikeys::ApiKeyStore;
-        use crate::ledger::LedgerPool;
-        use std::sync::Arc;
-
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = ApiKeyStore::new(
-            Arc::new(LedgerPool::new(dir.path().join("ledger.db")).unwrap()),
-            b"an-allow-list-test-secret-32-bytes".to_vec(),
-        );
-
-        let (listed, _) = store
-            .create(
-                "listed",
-                "acme",
-                vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            listed.allowed_models,
-            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
-        );
-
-        // The strict default: no list means no model, and it survives a
-        // round trip through storage as an empty list rather than as `null` or
-        // as an absent value.
-        let (strict, _) = store.create("strict", "acme", Vec::new(), None).unwrap();
-        assert!(strict.allowed_models.is_empty());
-        assert_eq!(
-            store.get(strict.id).unwrap().unwrap().allowed_models,
-            Vec::<String>::new()
-        );
-    }
-
     /// A fully-specified manager block loads, and the password stays out of
     /// every error rendering even when the manager block is *valid*.
     #[test]
@@ -574,6 +561,135 @@ manager:
         }
     }
 
+    /// The billing block's defaults are the product's defaults, and each is a
+    /// value that means something rather than a placeholder.
+    #[test]
+    fn test_absent_billing_block_takes_documented_defaults() {
+        let config = ConfigLoader::parse_yaml(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n",
+        )
+        .unwrap();
+        assert_eq!(config.billing.timezone_offset_minutes, 0, "UTC");
+        assert_eq!(config.billing.close_delay_minutes, 5);
+        assert_eq!(config.billing.scheduler_interval_secs, 30);
+        assert!(!config.billing.email.enabled, "off until configured");
+        assert_eq!(config.billing.email.smtp_port, 587);
+        assert!(
+            !config.sends_statement_email(),
+            "a default config sends no email, and the accessor must agree"
+        );
+    }
+
+    /// `sends_statement_email` is the single answer to "will statements be
+    /// emailed", so each of its conditions is pinned separately — a conjunction
+    /// that lost one would still be `true` for the common deployment and wrong
+    /// only for the one that has the fault.
+    ///
+    /// The values are knocked out of a *parsed* config rather than written as
+    /// YAML, because `validate_billing` refuses three of these four shapes at
+    /// load time: the accessor's job is to be right for a `Config` that reached
+    /// this process some other way — a test fixture, or a future caller that
+    /// builds one — and testing it through the front door would only test the
+    /// door.
+    #[test]
+    fn test_sending_needs_the_relay_the_sender_and_the_switch() {
+        fn complete() -> Config {
+            ConfigLoader::parse_yaml("upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nbilling:\n  email:\n    enabled: true\n    smtp_host: relay.acme.test\n    from_address: billing@acme.test\n")
+                .expect("a complete mail path loads")
+        }
+
+        assert!(complete().sends_statement_email());
+
+        let mut off = complete();
+        off.billing.email.enabled = false;
+        assert!(!off.sends_statement_email(), "the switch is off");
+
+        let mut no_host = complete();
+        no_host.billing.email.smtp_host = "   ".to_string();
+        assert!(
+            !no_host.sends_statement_email(),
+            "a blank host is not a relay"
+        );
+
+        let mut no_sender = complete();
+        no_sender.billing.email.from_address = "   ".to_string();
+        assert!(
+            !no_sender.sends_statement_email(),
+            "a blank sender is not an address"
+        );
+    }
+
+    /// `enabled: true` with nowhere to send is an operator asking for email and
+    /// getting silence, so it is refused at start-up and both halves are named.
+    #[test]
+    fn test_enabling_email_without_a_relay_or_a_sender_is_refused() {
+        for (field, yaml) in [
+            (
+                "smtp_host",
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nbilling:\n  email:\n    enabled: true\n    from_address: billing@acme.test\n",
+            ),
+            (
+                "from_address",
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nbilling:\n  email:\n    enabled: true\n    smtp_host: relay.acme.test\n",
+            ),
+        ] {
+            let err =
+                ConfigLoader::parse_yaml(yaml).expect_err("an enabled mail path must be complete");
+            assert!(
+                err.to_string().contains(field),
+                "the error must name {field}: {err}"
+            );
+        }
+
+        // And an SMTP credential in the file is not a field at all — it is an
+        // environment property, so a config carrying one must not load.
+        let err = ConfigLoader::parse_yaml("upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\nbilling:\n  email:\n    enabled: true\n    smtp_host: relay.acme.test\n    from_address: billing@acme.test\n    smtp_password: hunter2\n")
+            .expect_err("a password in the config file must be refused, not ignored");
+        assert!(err.to_string().contains("smtp_password"), "{err}");
+    }
+
+    /// An offset outside the world's civil range would land statements on the
+    /// wrong day for a partner who can see it, so it is a start-up refusal
+    /// rather than a fallback to UTC.
+    #[test]
+    fn test_an_impossible_billing_offset_is_refused() {
+        for offset in [900, -800, i32::MAX] {
+            let err = ConfigLoader::parse_yaml(&format!(
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n\
+                 billing:\n  timezone_offset_minutes: {offset}\n"
+            ))
+            .expect_err("an offset outside -720..=840 must be refused");
+            assert!(err.to_string().contains("timezone_offset_minutes"), "{err}");
+        }
+        // The two ends of the real range are accepted.
+        for offset in [840, -720, 330] {
+            ConfigLoader::parse_yaml(&format!(
+                "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n\
+                 billing:\n  timezone_offset_minutes: {offset}\n"
+            ))
+            .unwrap_or_else(|e| panic!("{offset} is a real civil offset: {e}"));
+        }
+    }
+
+    /// A negative delay is a typo with a consequence: the day would close before
+    /// it ended.
+    #[test]
+    fn test_a_negative_close_delay_is_refused() {
+        let err = ConfigLoader::parse_yaml(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n\
+             billing:\n  close_delay_minutes: -1\n",
+        )
+        .expect_err("a day cannot close before it ends");
+        assert!(err.to_string().contains("close_delay_minutes"), "{err}");
+
+        // Zero is legitimate: "close it the moment it ends".
+        ConfigLoader::parse_yaml(
+            "upstream:\n  base_url: https://api.openai.com\n  api_key: sk-test\n\
+             billing:\n  close_delay_minutes: 0\n",
+        )
+        .expect("a zero delay is a real policy, not a missing value");
+    }
+
     /// The reference configuration is part of the contract, not documentation
     /// that happens to be nearby: it is what an operator copies. A field that
     /// lands in one and not the other is a defect, and an unknown key is now a
@@ -592,6 +708,33 @@ manager:
             "config.example.yaml must not carry a keys block; keys are issued \
              through /api/admin/api-keys"
         );
+    }
+
+    /// Every configuration this repository ships must load.
+    ///
+    /// The example is the one an operator copies; the other three are read by
+    /// `scripts/dev-up.sh` and by the two compose stacks, and *nothing else
+    /// parses them*. A fixture that has drifted — a field renamed here and not
+    /// there, a `billing:` block added to one and forgotten in another, a value
+    /// the new validation refuses — is otherwise discovered by a failed deploy,
+    /// on the machine that was trying to deploy.
+    ///
+    /// A test rather than a shell check for the same reason `Config` is
+    /// `deny_unknown_fields`: this is the cheapest place for a stale fixture to
+    /// be caught, and it is the only place it is caught before an operator runs
+    /// into it.
+    #[test]
+    fn test_every_shipped_configuration_loads() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for relative in [
+            "config.example.yaml",
+            "dev/partner-portal.dev.yaml",
+            "deploy/config/partner-portal.yaml",
+            "deploy/config/partner-portal.smoke.yaml",
+        ] {
+            ConfigLoader::from_file(&root.join(relative))
+                .unwrap_or_else(|e| panic!("{relative} must load: {e}"));
+        }
     }
 
     /// The hard contract: an error for a config holding credentials must never
