@@ -157,55 +157,57 @@ async fn a_revocation_on_one_instance_reaches_the_other_without_a_restart() {
     let _ = mock.models_seen();
 }
 
-/// A key issued on one instance starts working on the other within one refresh
+/// A key rotated on one instance starts working on the other within one refresh
 /// interval — the ordering a rolling update depends on.
 ///
-/// The new instance of a rolling update is the one that must be provisioned
-/// *first*: it starts against the database and loads whatever keys exist. This
-/// is the same property from the other direction — a key that exists in the
-/// database becomes usable everywhere without a redeploy.
+/// Rotation is deliberately the successor-key operation: a partner has one
+/// active credential, so issuing a second one for an existing partner is a
+/// database-level conflict rather than an alternate refresh path to test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_key_issued_on_one_instance_starts_working_on_the_other() {
+async fn a_key_rotated_on_one_instance_starts_working_on_the_other() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("ledger.db");
     let (mock, upstream) = start_mock_upstream().await;
 
-    let (a, b, _seeded, client) = pair(&dir, &db_path, &upstream).await;
+    let (a, b, predecessor, client) = pair(&dir, &db_path, &upstream).await;
+    let id = key_id_for(&client, &a, &predecessor).await;
 
     let (status, body) = client
         .request_json(
             "POST",
             &a.base_url(),
-            "/api/admin/api-keys",
+            &format!("/api/admin/api-keys/{id}/rotate"),
             Some(MANAGER_PASSWORD),
-            json!({
-                "name": "issued-on-a",
-                "consumer_id": "tester",
-                "allowed_models": ["e2e-ring"],
-            }),
+            json!({}),
         )
         .await;
-    assert_eq!(status, 201, "issuing a key failed: {body}");
-    let issued: Value = serde_json::from_str(&body).expect("JSON");
-    let plaintext = issued["key_secret"]
+    assert_eq!(status, 201, "rotating a key failed: {body}");
+    let rotated: Value = serde_json::from_str(&body).expect("JSON");
+    let successor = rotated["key_secret"]
         .as_str()
-        .expect("create returns the plaintext once")
+        .expect("rotation returns the successor plaintext once")
         .to_string();
 
-    // A knows it at once.
+    // A committed and refreshed its own snapshot before replying. The successor
+    // must work immediately and its predecessor must already be unusable.
     assert_eq!(
-        client.chat(&a.base_url(), "e2e-ring", &plaintext).await,
+        client.chat(&a.base_url(), "e2e-ring", &successor).await,
         Ok(200),
-        "the issuing instance must accept its own key immediately"
+        "the rotating instance must accept its successor immediately"
+    );
+    assert_eq!(
+        client.chat(&a.base_url(), "e2e-ring", &predecessor).await,
+        Ok(401),
+        "the rotating instance must refuse its predecessor immediately"
     );
 
-    // B picks it up from the database, within the interval and without a
-    // restart.
+    // B picks up the successor from the database, within the interval and
+    // without a restart.
     let pid = b.pid();
     let started = Instant::now();
     let mut accepted_at = None;
     while started.elapsed() < Duration::from_secs(10) {
-        if client.chat(&b.base_url(), "e2e-ring", &plaintext).await == Ok(200) {
+        if client.chat(&b.base_url(), "e2e-ring", &successor).await == Ok(200) {
             accepted_at = Some(started.elapsed());
             break;
         }
@@ -213,11 +215,11 @@ async fn a_key_issued_on_one_instance_starts_working_on_the_other() {
     }
 
     let accepted_at = accepted_at.expect(
-        "a key issued on one instance never reached the other; a rolling update \
-         that provisions a key on the new instance would serve 401s",
+        "a key rotated on one instance never reached the other; a rolling update \
+         would serve 401s for a partner whose credential was rotated",
     );
     eprintln!(
-        "sibling accepted the new key after {} ms",
+        "sibling accepted the rotated key after {} ms",
         accepted_at.as_millis()
     );
     assert!(
@@ -231,13 +233,12 @@ async fn a_key_issued_on_one_instance_starts_working_on_the_other() {
         "the sibling must not need a restart to see it"
     );
 
-    // The identity the sibling applies is the row's, whichever instance issued
+    // The identity the sibling applies is the row's, whichever instance rotated
     // it — the credential carries the consumer, the caller does not.
-    let (status, body) = client.get(&b.base_url(), "/api/me", Some(&plaintext)).await;
+    let (status, body) = client.get(&b.base_url(), "/api/me", Some(&successor)).await;
     assert_eq!(status, 200, "{body}");
     let me: Value = serde_json::from_str(&body).expect("JSON");
     assert_eq!(me["consumer_id"], "tester");
-    assert_eq!(me["key_name"], "issued-on-a");
 
     drop(a);
     drop(b);

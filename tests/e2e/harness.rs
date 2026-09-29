@@ -440,7 +440,15 @@ database:
     write_raw(path, &yaml);
 }
 
-/// One API key to seed into `api_keys` before an instance starts.
+/// One API key to seed into `api_keys` before an instance starts, together with
+/// the partner it authenticates as.
+///
+/// The models live on the *partner* now, not on the key (ADR 0015), so seeding
+/// writes three things in order: the partner row, its `partner_models` prices,
+/// and then the credential. The list is still spelled on the fixture because a
+/// test that says "this instance may call `e2e-ring`" means it once, and
+/// expressing it as a price table would be a rewrite of every e2e test that
+/// never asks about money.
 #[derive(Clone, Debug)]
 pub struct SeedKey {
     pub name: String,
@@ -466,36 +474,91 @@ pub struct SeededKey {
     pub plaintext: String,
 }
 
-/// Insert `keys` into the `api_keys` table of `db_path` and return what was
-/// issued.
+/// The prices a seeded partner's models are metered at, in dollars per million
+/// tokens. The three the specification names, and enough that a statement built
+/// from a seeded instance has a non-zero total.
+const SEEDED_INPUT_PER_MILLION: &str = "0.095";
+const SEEDED_CACHED_PER_MILLION: &str = "0.002375";
+const SEEDED_OUTPUT_PER_MILLION: &str = "0.475";
+
+/// Insert `keys` into the `api_keys` table of `db_path` — and their partners and
+/// prices — and return what was issued.
 ///
-/// The rows go in through the product's own `ApiKeyStore`, so the schema is
-/// applied by the same call the product makes and the plaintext is *generated*
-/// rather than written down — no e2e fixture carries a credential in source.
+/// The rows go in through the product's own `ApiKeyStore` and `BillingStore`, so
+/// the schema is applied by the same call the product makes and the plaintext is
+/// *generated* rather than written down — no e2e fixture carries a credential in
+/// source.
 ///
-/// Idempotent on the key hash, because a rolling-update test starts a second
-/// instance against the database the first one left behind, and that call
-/// re-seeds the same rows. There is no key hash to re-issue from (a real
-/// plaintext is never stored), so a restart test must reuse the plaintext the
-/// first seed returned rather than seeding again; a genuine duplicate is a
-/// fixture bug and fails loudly here.
+/// Idempotent, because a rolling-update test starts a second instance against
+/// the database the first one left behind, and that call re-seeds the same rows.
+/// A partner that already exists is left alone, a price list is replaced, and a
+/// key whose hash is present is re-used. There is no key hash to re-issue from
+/// (a real plaintext is never stored), so a restart test must reuse the
+/// plaintext the first seed returned rather than seeding again; a genuine
+/// duplicate is a fixture bug and fails loudly here.
 pub fn seed_keys(db_path: &Path, keys: &[SeedKey]) -> Vec<SeededKey> {
     use partner_portal::apikeys::ApiKeyStore;
+    use partner_portal::billing::partner::{BillingMode, ModelPrice};
+    use partner_portal::billing::pricing::{PricePerMillion, PricingSnapshot};
+    use partner_portal::billing::store::{BillingStore, NewPartner};
     use partner_portal::ledger::LedgerPool;
     use std::sync::Arc;
 
     let pool = Arc::new(LedgerPool::new(db_path.to_path_buf()).expect("open ledger for seeding"));
-    let store = ApiKeyStore::new(pool, TEST_SECRET.to_vec());
+    let store = ApiKeyStore::new(pool.clone(), TEST_SECRET.to_vec());
+    let billing = BillingStore::new(pool);
+
+    let price = |raw: &str| {
+        PricePerMillion::parse(raw).unwrap_or_else(|e| panic!("{raw:?} is not a price: {e}"))
+    };
+
+    let mut partners: Vec<&str> = Vec::new();
+    for key in keys {
+        if !partners.contains(&key.consumer_id.as_str()) {
+            partners.push(&key.consumer_id);
+        }
+    }
+    for consumer_id in &partners {
+        if billing
+            .get_partner(consumer_id)
+            .expect("read partner")
+            .is_some()
+        {
+            continue;
+        }
+        billing
+            .create_partner(NewPartner {
+                consumer_id: consumer_id.to_string(),
+                name: consumer_id.to_string(),
+                billing_email: String::new(),
+                billing_mode: BillingMode::Invoice,
+                payment_terms_minutes: partner_portal::billing::DEFAULT_PAYMENT_TERMS_MINUTES,
+            })
+            .expect("seed the partner row");
+    }
 
     keys.iter()
         .map(|key| {
+            if !key.allowed_models.is_empty() {
+                let priced = key
+                    .allowed_models
+                    .iter()
+                    .map(|model| ModelPrice {
+                        model: model.clone(),
+                        prices: PricingSnapshot::new(
+                            price(SEEDED_INPUT_PER_MILLION),
+                            price(SEEDED_CACHED_PER_MILLION),
+                            price(SEEDED_OUTPUT_PER_MILLION),
+                        ),
+                    })
+                    .collect::<Vec<_>>();
+                billing
+                    .replace_models(&key.consumer_id, &priced)
+                    .expect("seed the partner's models and prices");
+            }
+
             let (row, plaintext) = store
-                .create(
-                    &key.name,
-                    &key.consumer_id,
-                    key.allowed_models.clone(),
-                    None,
-                )
+                .create(&key.name, &key.consumer_id, None)
                 .unwrap_or_else(|e| {
                     panic!(
                         "seeding {} into {} failed: {e}",
