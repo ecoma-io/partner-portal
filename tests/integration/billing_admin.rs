@@ -344,10 +344,8 @@ async fn a_partner_is_opened_with_its_prices_and_a_second_create_is_refused() {
         again.json()["error"]["message"]
             .as_str()
             .unwrap_or_default(),
-        format!(
-            "a partner with consumer_id beta already exists; use \
-             PATCH /api/admin/partners/beta to change it"
-        ),
+        "a partner with consumer_id beta already exists; use \
+         PATCH /api/admin/partners/beta to change it",
         "the refusal names the call that does the job instead"
     );
 
