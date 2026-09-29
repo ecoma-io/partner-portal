@@ -713,21 +713,39 @@ fn oversized_response(bytes: usize) -> Response {
 
 /// One API key to seed into `api_keys` before the instance starts.
 ///
-/// There is no `key` field and that is the point: the plaintext is *generated*
-/// by the store and returned, so a test can never pin a credential in source
-/// the way the old `keys:` fixtures did. What a test still controls is the
-/// row's identity — its name, its consumer and its allow-list — and those are
-/// what the assertions are about.
+/// There is no `key` field and that is the point: the harness derives its
+/// plaintext from the fixture identity, so tests do not pin credentials in
+/// source the way the old `keys:` fixtures did. The derivation makes a restart
+/// seed the same credential without storing or recovering a plaintext from the
+/// database. What a test still controls is the row's identity — its name and
+/// its consumer — and those are what the assertions are about.
 ///
 /// `Spec::new` seeds exactly one key so that the ~60 tests which call
 /// `Spec::new` and then `server.key()` keep working without knowing any of
 /// this happened; a test about more than one key calls `with_keys`.
+///
+/// # A key is not a partner
+///
+/// A key row no longer carries a model list. Which models the consumer may call
+/// — and what each costs — is configured once, on the *partner*, in
+/// `partner_models` (ADR 0015), and one partner holds exactly one active key.
+/// So the models a [`KeySpec`] lists are written to that partner's price list
+/// during seeding, and `allowed_models` is now a request-path property of a
+/// partner rather than a column on a credential. The name survives the move
+/// because the alternative — threading `partner_models` through every
+/// `Spec` that only wants "this consumer can call `gpt-4o`" — is noise in
+/// every test that never asks about billing.
 #[derive(Clone, Debug)]
 pub struct KeySpec {
     pub name: String,
     pub consumer_id: Option<String>,
     /// Models this key may call. Empty means *no* models (strict default).
     pub allowed_models: Vec<String>,
+    /// How this consumer is billed, when the test is declaring a ledger rather
+    /// than discovering one. `None` is the invoice default every other key gets.
+    pub billing_mode: Option<String>,
+    /// Payment terms in minutes, when the test is declaring a ledger.
+    pub payment_terms_minutes: Option<i64>,
 }
 
 impl KeySpec {
@@ -743,11 +761,28 @@ impl KeySpec {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            billing_mode: None,
+            payment_terms_minutes: None,
         }
     }
 
     pub fn with_consumer(mut self, consumer_id: &str) -> Self {
         self.consumer_id = Some(consumer_id.to_string());
+        self
+    }
+
+    /// Bill this consumer on reconciliation terms: a settlement record rather
+    /// than an obligation. Only honoured by a spec that declares a starting
+    /// ledger, because otherwise the scheduler closes the first day before the
+    /// test has said anything.
+    pub fn on_reconciliation(mut self) -> Self {
+        self.billing_mode = Some("reconciliation".to_string());
+        self
+    }
+
+    /// Payment terms in minutes, for a spec that declares a starting ledger.
+    pub fn with_payment_terms(mut self, minutes: i64) -> Self {
+        self.payment_terms_minutes = Some(minutes);
         self
     }
 
@@ -800,6 +835,85 @@ pub struct Spec {
     pub shutdown_grace_secs: u64,
     pub sse_poll_interval_ms: u64,
     pub retention_days: u32,
+    /// Absent means no `billing:` block, and the server uses its defaults.
+    pub billing: Option<BillingSpec>,
+    /// Whether [`backdate_partners`] should pre-anchor the seeded partners.
+    /// See [`Spec::with_backdated_billing`]; default is `false` so a suite that
+    /// does not care about billing is not quietly anchored.
+    pub billing_backdates_partners: bool,
+    /// Writes to the ledger before the child process exists.
+    pub billing_start_ledger: Option<LedgerHook>,
+    /// Writes to the ledger once the child is ready.
+    pub billing_inject_usage: Option<LedgerHook>,
+}
+
+/// A test-supplied write to the ledger, taken by the harness at a point the
+/// test chooses.
+///
+/// `Arc` rather than `Box` so [`Spec`] keeps its `Clone`, and a hand-written
+/// `Debug` so a hook — which may close over anything — is never printed into a
+/// panic message. A hook must not consume its captures: it is `Fn`, because
+/// [`Spec`] is cloned when a test restarts an instance, and a hook that had
+/// already been run must still be runnable on the next process.
+#[derive(Clone)]
+pub struct LedgerHook(Arc<dyn Fn(&Path) + Send + Sync>);
+
+impl LedgerHook {
+    /// Run the hook against the ledger at `path`.
+    pub fn run(&self, path: &Path) {
+        (self.0)(path);
+    }
+}
+
+impl std::fmt::Debug for LedgerHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LedgerHook")
+    }
+}
+
+/// The `billing:` block, for the tests that are about when a day closes.
+///
+/// Every field is optional because the *defaults* are themselves behaviour under
+/// test: a suite that set `close_delay_minutes` everywhere would never notice
+/// that the default is wrong. `None` renders the field as absent, so
+/// `config.example.yaml`'s values are what an unspecified test runs with.
+#[derive(Clone, Debug, Default)]
+pub struct BillingSpec {
+    /// The billing calendar's distance from UTC. `None` leaves the server default.
+    pub timezone_offset_minutes: Option<i32>,
+    /// How long after a day ends it may close. `Some(0)` is the interesting
+    /// case: it makes a day closable the instant it ends, so a test does not
+    /// have to wait out a real delay.
+    pub close_delay_minutes: Option<i64>,
+    /// How often the scheduler looks. A test that waits for a day to close
+    /// sets this to 1 rather than sleeping 30 seconds.
+    pub scheduler_interval_secs: Option<u64>,
+    /// Whether statements are emailed. Off by default: the harness configures
+    /// no relay, and a suite that needs the send path names a sink explicitly.
+    pub email_enabled: Option<bool>,
+}
+
+impl Spec {
+    /// The billing block, or an empty string when the test does not set one.
+    fn billing_yaml(&self) -> String {
+        let Some(b) = &self.billing else {
+            return String::new();
+        };
+        let mut out = String::from("billing:\n");
+        if let Some(tz) = b.timezone_offset_minutes {
+            out.push_str(&format!("  timezone_offset_minutes: {tz}\n"));
+        }
+        if let Some(delay) = b.close_delay_minutes {
+            out.push_str(&format!("  close_delay_minutes: {delay}\n"));
+        }
+        if let Some(interval) = b.scheduler_interval_secs {
+            out.push_str(&format!("  scheduler_interval_secs: {interval}\n"));
+        }
+        if let Some(enabled) = b.email_enabled {
+            out.push_str(&format!("  email:\n    enabled: {enabled}\n"));
+        }
+        out
+    }
 }
 
 impl Spec {
@@ -821,6 +935,10 @@ impl Spec {
             shutdown_grace_secs: 1,
             sse_poll_interval_ms: 100,
             retention_days: 60,
+            billing: None,
+            billing_backdates_partners: false,
+            billing_start_ledger: None,
+            billing_inject_usage: None,
         }
     }
 
@@ -881,6 +999,81 @@ impl Spec {
         self
     }
 
+    /// Write a `billing:` block, so the test controls when a day closes.
+    pub fn with_billing(mut self, billing: BillingSpec) -> Self {
+        self.billing = Some(billing);
+        self
+    }
+
+    /// A billing block that closes a day the instant it ends, and looks every
+    /// second. What a test about the statement lifecycle almost always wants:
+    /// the alternative is waiting out a real five-minute close delay.
+    pub fn with_fast_billing(self) -> Self {
+        self.with_billing(BillingSpec {
+            close_delay_minutes: Some(0),
+            scheduler_interval_secs: Some(1),
+            ..BillingSpec::default()
+        })
+    }
+
+    /// Fast billing **and** a backdated partner, which is what a billing test
+    /// almost always needs.
+    ///
+    /// A partner is anchored at the day before it was created, so a partner the
+    /// harness creates moments ago is only ever walked from today — a ledger
+    /// with a month of usage under it would produce a statement dated in the
+    /// future, and the API's own `billing_date <= today` filter would hide it.
+    /// The fixture therefore pre-anchors the partner by writing a zero-amount
+    /// statement for the day before yesterday, which is a row a deployment
+    /// produces on its own and which the walk would have written anyway. What it
+    /// removes is a dependency on the wall clock, not a behaviour: the scheduler
+    /// still decides every day after the anchor, and the statement under test is
+    /// still generated by the scheduler from real usage rows.
+    /// Run a closure against the seeded ledger *before* the process starts, and
+    /// run a request-driven rest against the ledger that process leaves behind.
+    ///
+    /// Two hooks rather than one, because they solve two different problems and
+    /// the order matters:
+    ///
+    /// - `start_ledger` gets to write **usage on a day the scheduler will
+    ///   close**. A test cannot arrange that from the outside, because the
+    ///   scheduler's first tick runs before the test's first line of code — by
+    ///   which time yesterday is already a closed, empty day, and a statement
+    ///   the walk will never revisit.
+    /// - `inject` then acts on a process that is already running, and so
+    ///   exercises the real request path: the price snapshots the metering
+    ///   write actually took, the terminal states recovery can see, and the
+    ///   suspension check reading a derived status.
+    ///
+    /// A test that wants both chains one statement — a real request metered at
+    /// the seeded prices, closed into a statement — has no ordering that
+    /// produces it, because a day closes once. So the two are separate: usage
+    /// written by a request belongs to *today*, which is not yet closeable, and
+    /// the statement under test is built by the generator from a day the
+    /// scheduler closed. What each half proves is stated where it is used.
+    pub fn starting_ledger<F>(mut self, prepare: F) -> Self
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        self.billing_backdates_partners = true;
+        self.billing_start_ledger = Some(LedgerHook(Arc::new(prepare)));
+        self
+    }
+
+    pub fn inject_usage<F>(mut self, inject: F) -> Self
+    where
+        F: Fn(&Path) + Send + Sync + 'static,
+    {
+        self.billing_inject_usage = Some(LedgerHook(Arc::new(inject)));
+        self
+    }
+
+    pub fn with_backdated_billing(self) -> Self {
+        let mut spec = self.with_fast_billing();
+        spec.billing_backdates_partners = true;
+        spec
+    }
+
     pub fn with_manager(mut self, manager: ManagerSpec) -> Self {
         self.manager = Some(manager);
         self
@@ -897,6 +1090,7 @@ impl Spec {
             None => String::new(),
             Some(m) => format!("manager:\n  password: {}\n", yaml_str(&m.password)),
         };
+        let billing = self.billing_yaml();
 
         // The listen address is not in the file: `spawn_in` passes it as
         // PARTNER_PORTAL_LISTEN, like a real deployment does.
@@ -913,6 +1107,7 @@ impl Spec {
                timeout_secs: {timeout}\n  \
                connect_timeout_secs: 2\n\
              {manager}\
+             {billing}\
              database:\n  \
                path: {db}\n  \
                retention_days: {retention}\n  \
@@ -928,6 +1123,7 @@ impl Spec {
             upstream_key = yaml_str(&self.upstream_key),
             timeout = self.upstream_timeout_secs,
             manager = manager,
+            billing = billing,
             db = yaml_str(&self.db_name.display().to_string()),
             retention = self.retention_days,
             queue = self.queue_size,
@@ -1004,6 +1200,17 @@ impl TestServer {
         // exists to make loud.
         let seeded = seed_keys(&db_path, &spec.keys);
 
+        // Last, and only when a billing test asked for it: pre-anchor every
+        // seeded partner, then let the test declare its own starting ledger.
+        // Both run *before* the child exists, so the first tick the process runs
+        // already has an anchor and a day of usage to close.
+        if spec.billing_backdates_partners {
+            backdate_partners(&db_path, &spec.keys);
+        }
+        if let Some(prepare) = &spec.billing_start_ledger {
+            prepare.run(&db_path);
+        }
+
         let log = File::create(&log_path).expect("create log file");
         let child = Command::new(BIN)
             .env("PARTNER_PORTAL_CONFIG", &config_path)
@@ -1079,7 +1286,17 @@ impl TestServer {
             }
 
             match client.get(&format!("{}/readyz", self.base_url), None).await {
-                Ok(response) if response.status == StatusCode::OK => return,
+                Ok(response) if response.status == StatusCode::OK => {
+                    // Ready, so a test-declared write to the running instance's
+                    // ledger can happen now. Before this the process may not
+                    // have the database open at all, and a write against a file
+                    // another handle holds mid-startup is a race the fixture
+                    // cannot win by waiting longer.
+                    if let Some(inject) = &self.spec.billing_inject_usage {
+                        inject.run(&self.db_path);
+                    }
+                    return;
+                }
                 Ok(_) | Err(_) => {}
             }
 
@@ -1607,25 +1824,52 @@ pub struct SeededKey {
     pub plaintext: String,
     pub name: String,
     pub consumer_id: String,
+    /// What the consumer may call, mirrored from `partner_models` for the same
+    /// reason [`KeySpec::allowed_models`] survives: the request path filters
+    /// `/v1/models` by it, and a test that asserts on the filtered list should
+    /// not have to re-read the price table to know what it configured.
     pub allowed_models: Vec<String>,
 }
 
-/// Insert `specs` into `api_keys` and return what was issued.
+/// The prices a seeded partner's models are metered at.
 ///
-/// The rows go in through the product's own [`ApiKeyStore`], not through a
-/// hand-written `INSERT`, for two reasons: the schema is applied by the same
-/// call the product makes, so a harness can never seed a column that does not
-/// exist; and the plaintext is *generated* here and handed back, so no test
-/// pins a credential in source.
+/// One price for every model, chosen so that a statement built from it is
+/// obviously a statement: `$0.095 / M` input, `$0.002375 / M` cached input and
+/// `$0.475 / M` output are the prices the specification names, and a
+/// 1 000 000-token request at them costs `$0.095 + $0.000002375 + $0.475`.
+const SEEDED_INPUT_PER_MILLION: &str = "0.095";
+const SEEDED_CACHED_PER_MILLION: &str = "0.002375";
+const SEEDED_OUTPUT_PER_MILLION: &str = "0.475";
+
+/// Insert `specs` into `api_keys` — and each one's partner and prices — and
+/// return what was issued.
+///
+/// The rows go in through the product's own [`ApiKeyStore`] and
+/// [`BillingStore`], not through a hand-written `INSERT`, for two reasons: the
+/// schema is applied by the same call the product makes, so a harness can never
+/// seed a column that does not exist; and the plaintext is *generated* here and
+/// handed back, so no test pins a credential in source.
+///
+/// # The partner comes first
+///
+/// A key is only a credential *for* a partner, and since ADR 0015 the partner
+/// is what carries model capability and price. So the partner row and its
+/// `partner_models` rows are written before the key. That ordering is not a
+/// convenience: the snapshot the process loads on startup joins the two, and a
+/// key with no partner row would authenticate and be able to call nothing —
+/// which would make every seeded test fail at the model gate rather than at the
+/// thing it is about.
 ///
 /// # Idempotent, because restarts are ordinary
 ///
 /// A test that restarts a process against the directory a previous process
-/// used calls this again on a database that already holds the rows. Every
-/// `key_hash` is already present, so an insert would violate `UNIQUE`; the
-/// helper therefore treats "this hash exists" as success and re-uses the row.
-/// That is what lets a restart test keep the same plaintext across both
-/// processes without a second mechanism.
+/// used calls this again on a database that already holds the rows. Partner
+/// rows and prices are therefore upserted — a re-seed replaces the price list
+/// with the same one. The fixture derives the same test-only plaintext from the
+/// same name and consumer, then registers it with `create_with_plaintext`; the
+/// unique hash constraint makes this one repeatable seed idempotent. This is
+/// fixture idempotence only: concurrent operator issuance remains guarded by
+/// the database's partial unique index.
 ///
 /// # Pre-flight, not a race
 ///
@@ -1638,7 +1882,31 @@ pub fn seed_keys(db_path: &Path, specs: &[KeySpec]) -> Vec<SeededKey> {
     use std::sync::Arc;
 
     let pool = Arc::new(LedgerPool::new(db_path.to_path_buf()).expect("open ledger for seeding"));
-    let store = ApiKeyStore::new(pool, TEST_SECRET.to_vec());
+    let store = ApiKeyStore::new(pool.clone(), TEST_SECRET.to_vec());
+    let billing = partner_portal::billing::store::BillingStore::new(pool);
+
+    // One partner per *consumer*, not per key: a restart re-seeds every spec in
+    // the same order, and a spec that names a consumer another spec already
+    // named must not reopen (and blank) the partner that owns the models the
+    // first one works through. Collected first so the partner is created once
+    // regardless of how many keys point at it.
+    let mut partners: Vec<String> = Vec::new();
+    for spec in specs {
+        let consumer_id = spec.effective_consumer_id().to_string();
+        if !partners.contains(&consumer_id) {
+            partners.push(consumer_id);
+        }
+    }
+
+    for consumer_id in &partners {
+        open_partner(&billing, consumer_id);
+    }
+
+    // Commercial terms the test declared, applied before the process exists so
+    // the first tick already sees them.
+    for spec in specs {
+        declare_partner_terms(&billing, spec);
+    }
 
     specs
         .iter()
@@ -1647,29 +1915,233 @@ pub fn seed_keys(db_path: &Path, specs: &[KeySpec]) -> Vec<SeededKey> {
             let consumer_id = spec.effective_consumer_id().to_string();
             let models = spec.allowed_models.clone();
 
-            match store.create(&name, &consumer_id, models.clone(), None) {
-                Ok((row, plaintext)) => SeededKey {
-                    id: row.id,
-                    plaintext,
-                    name: row.name,
-                    consumer_id: row.consumer_id,
-                    allowed_models: row.allowed_models,
-                },
-                Err(e) => {
-                    // A restart re-seeds a database that already has the row.
-                    // The store's `key_hash` is UNIQUE, so a re-insert fails
-                    // here; the test's own plaintext is the one already stored,
-                    // and only the test knows it.
-                    panic!(
-                        "seeding {name} into {} failed: {e}. \
-                         A restart re-seeds rows that already exist, so this \
-                         must be a schema or secret mismatch, not a duplicate.",
-                        db_path.display()
-                    );
+            if !models.is_empty() {
+                set_models(&billing, &consumer_id, &models);
+            }
+
+            // Deliberate test-only determinism: every fixture name and
+            // consumer maps to one opaque credential. It never reaches product
+            // code or a production database; its only job is to let a restart
+            // present the same test credential without recovering plaintext
+            // from SQLite (which must be impossible in production).
+            let plaintext = seeded_plaintext(&name, &consumer_id);
+            let existing = || {
+                store
+                    .list()
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "could not inspect existing test keys in {}: {e}",
+                            db_path.display()
+                        )
+                    })
+                    .into_iter()
+                    .find(|row| {
+                        row.name == name
+                            && row.consumer_id == consumer_id
+                            && row.status == partner_portal::apikeys::KeyStatus::Active
+                    })
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "seeding {name} into {} found an unrelated duplicate key hash",
+                            db_path.display()
+                        )
+                    })
+            };
+            let row = match store.create_with_plaintext(&name, &consumer_id, None, &plaintext) {
+                Ok(row) => row,
+                // The store names the partial-index violation after it has
+                // checked that the partner already owns a live key. In a
+                // re-seed, that key must be this fixture's exact row.
+                Err(partner_portal::apikeys::ApiKeyError::AlreadyActive(_)) => existing(),
+                Err(partner_portal::apikeys::ApiKeyError::Database(error))
+                    if is_unique_constraint(&error) =>
+                {
+                    existing()
                 }
+                Err(e) => panic!("seeding {name} into {} failed: {e}", db_path.display()),
+            };
+
+            SeededKey {
+                id: row.id,
+                plaintext,
+                name: row.name,
+                consumer_id: row.consumer_id,
+                allowed_models: models,
             }
         })
         .collect()
+}
+
+/// Derive the opaque credential used only by this test fixture.
+///
+/// The product generates keys from OS entropy. Tests need deterministic restart
+/// seeding instead, so they use a HMAC under the already test-only hash secret;
+/// the resulting text never leaves this process or test database.
+fn seeded_plaintext(name: &str, consumer_id: &str) -> String {
+    let identity = format!("partner-portal-test-fixture:{consumer_id}:{name}");
+    format!(
+        "pp_test_{}",
+        partner_portal::apikeys::derive_key_hash(TEST_SECRET, &identity)
+    )
+}
+
+/// Is this the ordinary uniqueness response from a fixture re-seed?
+fn is_unique_constraint(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _) if code.extended_code == 2067
+    )
+}
+
+/// Open an account for `consumer_id`, or leave the one that is already there.
+///
+/// `create_partner` is refused for a partner that exists, which is the right
+/// answer for the admin API and the wrong one for a fixture: a re-seed is not
+/// trying to create a second account, it is making sure the first one is still
+/// there. A PATCH afterwards is what keeps a re-seed from silently changing the
+/// billing mode a test configured.
+fn open_partner(billing: &partner_portal::billing::store::BillingStore, consumer_id: &str) {
+    if billing
+        .get_partner(consumer_id)
+        .expect("read partner")
+        .is_some()
+    {
+        return;
+    }
+    billing
+        .create_partner(partner_portal::billing::store::NewPartner {
+            consumer_id: consumer_id.to_string(),
+            name: consumer_id.to_string(),
+            // No address: statements are still written, and a harness that
+            // never configures SMTP must not be the reason a test fails.
+            billing_email: String::new(),
+            billing_mode: partner_portal::billing::partner::BillingMode::Invoice,
+            payment_terms_minutes: partner_portal::billing::DEFAULT_PAYMENT_TERMS_MINUTES,
+        })
+        .expect("seed the partner row");
+}
+
+/// Apply a key's declared commercial terms, if it declared any.
+///
+/// Only called for a spec that declares a starting ledger, because the terms
+/// have to be in force *before* the first tick: a reconciliation mode applied
+/// after the scheduler has closed the first day would leave that day an invoice,
+/// and the test would be asserting on a fixture mistake rather than on the
+/// product.
+fn declare_partner_terms(billing: &partner_portal::billing::store::BillingStore, spec: &KeySpec) {
+    use partner_portal::billing::store::PartnerPatch;
+
+    let consumer_id = spec.effective_consumer_id();
+    if spec.billing_mode.is_none() && spec.payment_terms_minutes.is_none() {
+        return;
+    }
+    let mode = spec.billing_mode.as_deref().map(|text| match text {
+        "invoice" => partner_portal::billing::partner::BillingMode::Invoice,
+        "reconciliation" => partner_portal::billing::partner::BillingMode::Reconciliation,
+        other => panic!("{other:?} is not a billing mode"),
+    });
+    billing
+        .update_partner(
+            consumer_id,
+            PartnerPatch {
+                name: None,
+                billing_email: None,
+                billing_mode: mode,
+                payment_terms_minutes: spec.payment_terms_minutes,
+            },
+        )
+        .unwrap_or_else(|e| panic!("declare the terms for {consumer_id}: {e}"));
+}
+
+/// Write `models` as the partner's price list, replacing whatever was there.
+fn set_models(
+    billing: &partner_portal::billing::store::BillingStore,
+    consumer_id: &str,
+    models: &[String],
+) {
+    let priced = models
+        .iter()
+        .map(|model| partner_portal::billing::partner::ModelPrice {
+            model: model.clone(),
+            prices: partner_portal::billing::pricing::PricingSnapshot::new(
+                price(SEEDED_INPUT_PER_MILLION),
+                price(SEEDED_CACHED_PER_MILLION),
+                price(SEEDED_OUTPUT_PER_MILLION),
+            ),
+        })
+        .collect::<Vec<_>>();
+    billing
+        .replace_models(consumer_id, &priced)
+        .expect("seed the partner's models and prices");
+}
+
+/// Parse one of the harness's own price constants. Panics by name so a bad
+/// constant reads as "the fixture is wrong", not as a request that was refused.
+fn price(raw: &str) -> partner_portal::billing::pricing::PricePerMillion {
+    partner_portal::billing::pricing::PricePerMillion::parse(raw)
+        .unwrap_or_else(|e| panic!("{raw:?} is not a price: {e}"))
+}
+
+/// Give every seeded partner a statement anchor from before the test began.
+///
+/// The walk anchors on `MAX(billing_date)` per partner, and a partner the
+/// harness created seconds ago has none — so the first thing the scheduler can
+/// close is the *day it was created*, which is a day whose statement the API
+/// will not return (`billing_date <= today`). A billing test would then sit
+/// waiting for a row that exists and is deliberately hidden, and would learn
+/// nothing from the wait.
+///
+/// So the fixture writes the one row a deployment writes on its own: a
+/// zero-amount statement for the day before the day before yesterday. It is a
+/// real statement the generator would have written, it costs nothing and
+/// suspends nobody, and it means the walk that produces the statement under test
+/// starts from a fixed point rather than from the wall clock.
+///
+/// Deliberately not used by default. A suite that is not about billing should
+/// not be anchored, and a suite that wants to prove the anchor behaviour — a
+/// new partner is not billed for days it did not exist — must not have it done
+/// for it.
+pub fn backdate_partners(db_path: &Path, specs: &[KeySpec]) {
+    use partner_portal::billing::store::BillingStore;
+    use partner_portal::billing::{BillingDay, BillingTimezone, Generator};
+    use partner_portal::ledger::LedgerPool;
+
+    let timezone = BillingTimezone::default();
+    let pool = Arc::new(LedgerPool::new(db_path.to_path_buf()).expect("open ledger for anchoring"));
+    let store = BillingStore::new(pool.clone());
+    let today = BillingDay::of(partner_portal::ledger::timefmt::now(), timezone);
+    let anchor = today.previous().previous();
+
+    let consumers = {
+        let mut seen: Vec<String> = Vec::new();
+        for spec in specs {
+            let consumer = spec.effective_consumer_id().to_string();
+            if !seen.contains(&consumer) {
+                seen.push(consumer);
+            }
+        }
+        seen
+    };
+
+    for consumer in consumers {
+        let Some(partner) = store
+            .get_partner(&consumer)
+            .expect("read the seeded partner")
+        else {
+            continue;
+        };
+        // The *product's* generator, not a hand-written row: the anchor is a
+        // statement like any other, and a fixture that built one by hand would
+        // be asserting against a shape the product does not produce.
+        let generator = Generator::new(timezone, 0);
+        let conn = pool.reader().expect("open a reader connection");
+        let draft = generator
+            .statement_for_day(&conn, &partner, anchor, generator.cutoff_for(anchor))
+            .expect("build the anchoring statement");
+        store
+            .write_statement(&draft)
+            .expect("anchor the seeded partner");
+    }
 }
 
 pub fn open_db(path: &Path) -> Connection {
