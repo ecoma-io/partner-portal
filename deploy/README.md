@@ -57,7 +57,8 @@ echo "PARTNER_PORTAL_API_KEY_SECRET=$(openssl rand -base64 32)" >> .env
 #    any endpoint, so capture it now.
 PARTNER_PORTAL_IMAGE=ghcr.io/owner/partner-portal@sha256:... docker compose up -d --wait
 docker compose exec portal-a partner-portal keygen \
-    --name acme-production --consumer-id acme --allowed-model gpt-4o
+    --name acme-production --consumer-id acme \
+    --model 'gpt-4o:2.50:1.25:10.00'
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
@@ -76,6 +77,13 @@ curl -fsS -X POST http://127.0.0.1:8080/api/admin/api-keys \
   -H "Authorization: Bearer $MANAGER_PASSWORD" -H 'Content-Type: application/json' \
   -d '{"name":"acme-staging","consumer_id":"acme","allowed_models":["gpt-4o-mini"]}'
 ```
+
+`--model` takes `NAME:INPUT:CACHED:OUTPUT` with the prices in dollars
+per million tokens, because which models a partner may call and what each costs
+are one list: a model with no price is a model the partner cannot call. A second
+`keygen` for a consumer that already exists is refused rather than reconfiguring
+them from a command line — use `PUT /api/admin/partners/{consumer_id}/models`
+for that.
 
 `POST .../{id}/rotate` replaces a key's secret (the old row is revoked and the
 new one inserted in one transaction), `PATCH .../{id}` renames it or changes its

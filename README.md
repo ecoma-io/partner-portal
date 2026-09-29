@@ -141,7 +141,8 @@ export PARTNER_PORTAL_API_KEY_SECRET="$(openssl rand -base64 32)"
 #    it now — no endpoint can show it again. (An operator with the config file
 #    can also issue keys over the admin API; `keygen` is the first-run path.)
 ./target/release/partner-portal keygen --database ./partner-portal.db \
-    --name acme-production --consumer-id acme --allowed-model gpt-4o
+    --name acme-production --consumer-id acme \
+    --model 'gpt-4o:2.50:1.25:10.00'
 
 # 5. Run. The listen address is the PARTNER_PORTAL_LISTEN environment
 #    variable (default 0.0.0.0:8080) — a port belongs to the deployment, so it

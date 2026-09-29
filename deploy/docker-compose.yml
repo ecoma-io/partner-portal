@@ -191,6 +191,18 @@ services:
     expose:
       - "9000"
 
+networks:
+  # An explicit subnet, for the same reason `scripts/docker-smoke-test.sh` gives
+  # its network one: a daemon whose default address pool is exhausted — a shared
+  # build host that has run out of 172.18.0.0/16 — cannot create a bridge network
+  # at all, and neither this gate nor a real deployment of this file should fail
+  # for a reason that has nothing to do with the image. Override it with
+  # `PARTNER_PORTAL_SUBNET` when 10.252.0.0/24 is already taken.
+  default:
+    ipam:
+      config:
+        - subnet: ${PARTNER_PORTAL_SUBNET:-10.252.0.0/24}
+
 volumes:
   portal-data:
     name: partner-portal-deploy_portal-data
