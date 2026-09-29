@@ -30,6 +30,12 @@ pub struct EmbeddedAsset {
 include!(concat!(env!("OUT_DIR"), "/dashboard_assets.rs"));
 
 /// Look up an asset by its URL path.
+///
+/// Returns `None` for a path that names no file *and is asking for one* — a
+/// missing `.js` is a 404. A path with no file behind it but no file extension is
+/// a client-side route: the router resolves it in the browser, so it gets the
+/// entry document here. Without that, an operator who bookmarks `/manager/billing`
+/// gets the "no dashboard was built" placeholder from a binary that embedded one.
 fn lookup(path: &str) -> Option<&'static EmbeddedAsset> {
     // Requests are always rooted. Trimming *all* leading slashes would quietly
     // accept `//index.html` as `index.html`, so exactly one is removed and any
@@ -47,7 +53,18 @@ fn lookup(path: &str) -> Option<&'static EmbeddedAsset> {
         return None;
     }
 
-    ASSETS.iter().find(|a| a.path == key)
+    let exact = ASSETS.iter().find(|a| a.path == key);
+    if exact.is_some() {
+        return exact;
+    }
+
+    // The same test `serve` applies before it calls a request a genuine miss, so
+    // the two cannot disagree about which paths are files.
+    if looks_like_asset(key) {
+        None
+    } else {
+        ASSETS.iter().find(|a| a.path == "index.html")
+    }
 }
 
 /// Build a response for an embedded asset.
@@ -263,5 +280,34 @@ mod tests {
         // With no dashboard embedded this is the placeholder; with one it is the
         // SPA entry. Either way it must not be a bare 404.
         assert_ne!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_a_deep_link_gets_the_spa_whenever_the_root_does() {
+        // The existing test above passes for a deep link *and* for `/` at the
+        // same time, so it stays green while a route the router added later
+        // answers with the "no dashboard was built" placeholder. That is not a
+        // subtle failure: an operator who bookmarks `/manager/billing` gets a
+        // page telling them to run a build that has already run.
+        //
+        // The two answers are now compared against each other. Every client-side
+        // route is a deep link, so the list is the router's route table, and
+        // adding a route without adding it here is a test failure rather than a
+        // page nobody can open.
+        let root = serve(Uri::from_static("/")).await;
+        for route in [
+            "/login",
+            "/billing",
+            "/partners",
+            "/manager/billing",
+            "/a/route/that/does/not/exist",
+        ] {
+            let response = serve(Uri::from_static(route)).await;
+            assert_eq!(
+                response.status(),
+                root.status(),
+                "{route} answers differently from /"
+            );
+        }
     }
 }
