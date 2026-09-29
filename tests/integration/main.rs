@@ -14,6 +14,7 @@ mod common;
 mod api_key_admin;
 mod auth;
 mod billing;
+mod billing_admin;
 mod dashboard;
 mod hot_reload;
 mod ledger_durability;
